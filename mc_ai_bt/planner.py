@@ -1,0 +1,606 @@
+from __future__ import annotations
+
+import json
+import re
+from typing import Any, Protocol
+
+from .policy_guard import LOOK_AT_DIRECTIONS, POLICY_ENABLED_SKILLS, PolicyLimits
+from .skill_registry import SkillRegistry
+from .visual_check import visual_check_goal_spec
+
+
+_CHINESE_PLACE_ALIASES = {
+    "厨房": "kitchen",
+    "客厅": "living_room",
+    "门口": "door",
+    "入口": "entrance",
+    "办公室": "office",
+    "实验室": "lab",
+}
+
+_CHINESE_OBJECT_ALIASES = {
+    "杯子": "cup",
+    "水杯": "cup",
+    "马克杯": "cup",
+    "人": "person",
+    "某人": "person",
+    "一个人": "person",
+}
+
+
+class Planner(Protocol):
+    def plan(self, intent_text: str, context_json: str = "") -> str:
+        ...
+
+
+class BootstrapPlanner:
+    """Deterministic planner used until the production LLM planner is enabled."""
+
+    def plan(self, intent_text: str, context_json: str = "") -> str:
+        text = intent_text.strip()
+        lowered = text.lower()
+        root = self._route_intent(text, lowered)
+        goal_spec = self._goal_spec_for(root, text)
+        plan = {
+            "schema": "mc_ai_bt.plan.v1",
+            "root": root,
+            "goal_spec": goal_spec,
+            "context_json": context_json or "{}",
+        }
+        return json.dumps(plan, sort_keys=True, separators=(",", ":"))
+
+    def _route_intent(self, text: str, lowered: str) -> dict:
+        steps = _split_compound_intent(lowered)
+        if len(steps) > 1:
+            children: list[dict] = []
+            for step in steps:
+                child = self._route_single_intent(step, step)
+                if child.get("type") == "Sequence":
+                    children.extend(child.get("children", []))
+                else:
+                    children.append(child)
+            return {"type": "Sequence", "children": children}
+        return self._route_single_intent(text, lowered)
+
+    def _route_single_intent(self, text: str, lowered: str) -> dict:
+        if self._looks_like_come_to_me(lowered):
+            return self._sequence(
+                self._say("I'm coming to you."),
+                {"type": "Action", "skill": "come_to_me", "args": {}, "timeout_sec": 300},
+            )
+
+        visual_query = self._extract_visual_query(lowered)
+        if visual_query:
+            return self._sequence(
+                self._say("I'll check what I can see."),
+                {
+                    "type": "VisualCheck",
+                    "check": {"query": visual_query},
+                    "timeout_sec": 30,
+                },
+            )
+
+        look_direction = self._extract_look_at(lowered)
+        if look_direction:
+            return {
+                "type": "Action",
+                "skill": "look_at",
+                "args": {"direction": look_direction},
+                "timeout_sec": 120,
+            }
+
+        point_args = self._extract_point_at(lowered)
+        if point_args:
+            return {
+                "type": "Action",
+                "skill": "point_at",
+                "args": point_args,
+                "timeout_sec": 120,
+            }
+
+        place = self._extract_place(lowered)
+        if place:
+            return self._sequence(
+                self._say(f"I'm going to {place}."),
+                {
+                    "type": "Action",
+                    "skill": "go_to_place",
+                    "args": {"name": place},
+                    "timeout_sec": 300,
+                },
+            )
+
+        move = self._extract_simple_move(lowered)
+        if move is not None:
+            action, value = move
+            return self._sequence(
+                self._say(f"Moving {action}."),
+                {
+                    "type": "Action",
+                    "skill": "simple_move",
+                    "args": {"action": action, "value": value},
+                    "timeout_sec": 120,
+                },
+            )
+
+        animation = self._extract_animation(lowered)
+        if animation:
+            return {
+                "type": "Action",
+                "skill": "play_animation",
+                "args": {"animation": animation},
+                "timeout_sec": 120,
+            }
+
+        return self._say(text)
+
+    @staticmethod
+    def _looks_like_come_to_me(lowered: str) -> bool:
+        phrases = (
+            "come to me",
+            "come here",
+            "come over",
+            "come closer",
+            "walk to me",
+            "过来",
+            "来我这",
+            "来我这里",
+            "靠近我",
+        )
+        return any(phrase in lowered for phrase in phrases)
+
+    @staticmethod
+    def _extract_place(lowered: str) -> str:
+        patterns = (
+            r"\bgo to (?P<place>[a-z0-9 _-]+)$",
+            r"\bnavigate to (?P<place>[a-z0-9 _-]+)$",
+            r"\btake me to (?P<place>[a-z0-9 _-]+)$",
+            r"\bdrive to (?P<place>[a-z0-9 _-]+)$",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, lowered)
+            if match:
+                return _slug(match.group("place"))
+        chinese_patterns = (
+            r"(?:带我去|带我到|去|到|开到|走到|移动到)(?P<place>[\u4e00-\u9fffA-Za-z0-9 _-]+)$",
+        )
+        for pattern in chinese_patterns:
+            match = re.search(pattern, lowered)
+            if match:
+                return _normalise_place(match.group("place"))
+        return ""
+
+    @staticmethod
+    def _extract_simple_move(lowered: str) -> tuple[str, float] | None:
+        match = re.search(
+            r"\b(?:move|drive|go) (?P<action>forward|backward|left|right)"
+            r"(?: (?P<value>[0-9]+(?:\.[0-9]+)?))?",
+            lowered,
+        )
+        if not match:
+            chinese_move = _extract_chinese_simple_move(lowered)
+            if chinese_move is not None:
+                return chinese_move
+            return None
+        action = match.group("action")
+        raw_value = match.group("value")
+        if raw_value is not None:
+            return action, float(raw_value)
+        return action, 0.5 if action in {"forward", "backward"} else 90.0
+
+    @staticmethod
+    def _extract_animation(lowered: str) -> str:
+        if "wave" in lowered or "挥手" in lowered:
+            return "wave"
+        match = re.search(r"\bplay animation (?P<name>[a-z0-9 _-]+)$", lowered)
+        if match:
+            return _slug(match.group("name"))
+        return ""
+
+    @staticmethod
+    def _extract_look_at(lowered: str) -> str:
+        direction_pattern = (
+            r"front(?:[_ -]?(?:up|down))?|"
+            r"left(?:[_ -]?(?:up|down))?|"
+            r"right(?:[_ -]?(?:up|down))?|"
+            r"up|down|ahead|forward|straight"
+        )
+        patterns = (
+            rf"\blook (?P<direction>{direction_pattern})$",
+            rf"\blook at (?P<direction>{direction_pattern})$",
+            rf"\bglance (?P<direction>{direction_pattern})$",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, lowered)
+            if not match:
+                continue
+            direction = _normalize_look_direction(match.group("direction"))
+            if direction in LOOK_AT_DIRECTIONS:
+                return direction
+        for fragment, direction in (
+            ("看左边", "left"),
+            ("看右边", "right"),
+            ("往左看", "left"),
+            ("往右看", "right"),
+            ("向左看", "left"),
+            ("向右看", "right"),
+            ("往上看", "front_up"),
+            ("向上看", "front_up"),
+            ("往下看", "front_down"),
+            ("向下看", "front_down"),
+            ("向前看", "front"),
+            ("往前看", "front"),
+        ):
+            if fragment in lowered:
+                return direction
+        return ""
+
+    @staticmethod
+    def _extract_point_at(lowered: str) -> dict[str, Any]:
+        patterns = (
+            r"\bpoint (?:at|to) (?P<target2>[a-z0-9 _-]+?) with (?P<arm2>left|right) (?:hand|arm)$",
+            r"\bpoint (?:(?P<arm1>left|right) (?:hand|arm) )?(?:at|to) (?P<target1>[a-z0-9 _-]+)$",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, lowered)
+            if not match:
+                continue
+            groups = match.groupdict()
+            raw_target = groups.get("target1") or groups.get("target2") or ""
+            target = _clean_point_target(raw_target)
+            if not target:
+                return {}
+            args: dict[str, Any] = {"arm": groups.get("arm1") or groups.get("arm2") or "right"}
+            if target.startswith("place "):
+                args["place"] = _slug(target.removeprefix("place "))
+            else:
+                args["object"] = target
+            return args
+        chinese_match = re.search(
+            r"(?:用(?P<arm>左|右)(?:手|胳膊|手臂))?(?:指一下|指向|指)(?P<target>[\u4e00-\u9fffA-Za-z0-9 _-]+)$",
+            lowered,
+        )
+        if chinese_match:
+            target = _normalise_object(chinese_match.group("target"))
+            if not target:
+                return {}
+            arm = "left" if chinese_match.group("arm") == "左" else "right"
+            return {"arm": arm, "object": target}
+        return {}
+
+    @staticmethod
+    def _extract_visual_query(lowered: str) -> str:
+        patterns = (
+            r"\bfind (?P<target>[a-z0-9 _-]+)$",
+            r"\blook for (?P<target>[a-z0-9 _-]+)$",
+            r"\bcheck for (?P<target>[a-z0-9 _-]+)$",
+            r"\bcheck (?:if|whether) (?:you )?(?:can )?see (?P<target>[a-z0-9 _-]+)$",
+            r"\bsee if (?:you )?(?:can )?see (?P<target>[a-z0-9 _-]+)$",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, lowered)
+            if not match:
+                continue
+            target = _clean_visual_target(match.group("target"))
+            if not target:
+                return ""
+            if target in {"anyone", "someone", "person", "a person", "people"}:
+                return "do you see anyone?"
+            return f"do you see the {target}?"
+        chinese_patterns = (
+            r"(?:寻找|找一下|找|看看有没有|检查有没有)(?P<target>[\u4e00-\u9fffA-Za-z0-9 _-]+)$",
+        )
+        for pattern in chinese_patterns:
+            match = re.search(pattern, lowered)
+            if not match:
+                continue
+            target = _normalise_object(match.group("target"))
+            if not target:
+                return ""
+            if target == "person":
+                return "do you see anyone?"
+            return f"do you see the {target}?"
+        return ""
+
+    @staticmethod
+    def _say(text: str) -> dict:
+        return {
+            "type": "Action",
+            "skill": "say",
+            "args": {"text": text},
+            "timeout_sec": 30,
+        }
+
+    @staticmethod
+    def _sequence(*children: dict) -> dict:
+        return {"type": "Sequence", "children": list(children)}
+
+    @staticmethod
+    def _goal_spec_for(root: dict, text: str) -> dict:
+        kind, node = _last_goal_relevant_node(root)
+        if kind == "action":
+            goal = _goal_spec_for_action(node, text)
+            if goal:
+                return goal
+        if kind == "visual":
+            check = node.get("check") if isinstance(node.get("check"), dict) else {}
+            goal = visual_check_goal_spec(check)
+            if goal:
+                goal["summary"] = text
+                return goal
+        return {
+            "type": "human",
+            "verification": {"mode": "implicit_conversation"},
+            "summary": text,
+        }
+
+
+class LlmJsonPlanner:
+    """Prompt an injected chat model for a constrained JSON BT plan.
+
+    The node does not instantiate this by default. It exists so the production
+    LLM caller can be wired without changing the planner/validator contract.
+    """
+
+    def __init__(
+        self,
+        model: Any,
+        *,
+        skill_registry: SkillRegistry | None = None,
+    ) -> None:
+        self._model = model
+        self._skills = skill_registry or SkillRegistry()
+
+    def plan(self, intent_text: str, context_json: str = "") -> str:
+        messages = build_planner_messages(
+            intent_text,
+            context_json,
+            skill_registry=self._skills,
+        )
+        raw = self._invoke(messages)
+        plan = _extract_json_object(raw)
+        plan.setdefault("schema", "mc_ai_bt.plan.v1")
+        plan.setdefault("context_json", context_json or "{}")
+        return json.dumps(plan, sort_keys=True, separators=(",", ":"))
+
+    def _invoke(self, messages: list[tuple[str, str]]) -> str:
+        invoke = getattr(self._model, "invoke", None)
+        if not callable(invoke):
+            raise TypeError("planner model must expose invoke(messages)")
+        result = invoke(messages)
+        content = getattr(result, "content", result)
+        return str(content)
+
+
+def build_planner_messages(
+    intent_text: str,
+    context_json: str,
+    *,
+    skill_registry: SkillRegistry | None = None,
+) -> list[tuple[str, str]]:
+    skills = skill_registry or SkillRegistry()
+    limits = PolicyLimits()
+    skill_lines = []
+    for name in skills.names():
+        if name not in POLICY_ENABLED_SKILLS:
+            continue
+        spec = skills.get(name)
+        resources = ",".join(spec.resources) if spec.resources else "none"
+        skill_lines.append(f"- {spec.name}: resources=[{resources}] {spec.description}")
+
+    system = "\n".join(
+        [
+            "You are the mc_ai_bt planner.",
+            "Return only one JSON object. Do not include markdown.",
+            "The JSON object must use schema mc_ai_bt.plan.v1.",
+            "Top-level keys: schema, root, goal_spec, context_json.",
+            "root must be a Behavior Tree made only from executable node types.",
+            "Executable node types: Sequence, Fallback, Action, Wait, Retry, Condition, GoalCheck, VisualCheck.",
+            "VisualCheck is currently limited to object/person visibility queries backed by world state.",
+            "Unsupported VisualCheck queries block as UNKNOWN; do not use VisualCheck for open-ended scene description.",
+            "Visual goal_spec is also limited to object/person visibility queries.",
+            (
+                "look_at may use only direction={front,front_up,front_down,left,left_up,left_down,"
+                "right,right_up,right_down} and optional hold seconds."
+            ),
+            (
+                "point_at must use exactly one target form: object/target name, place name, "
+                "or explicit x/y/z coordinates; optional arm is left or right."
+            ),
+            "Do not invent ROS topics, action names, Python code, frames, joint commands or expressions.",
+            "For physical actions, use only skills from the skill catalog.",
+            (
+                "Sequential multi-step plans are allowed, but stay within policy budgets: "
+                f"max_total_nodes={limits.max_total_nodes}, "
+                f"max_total_actions={limits.max_total_actions}, "
+                f"max_physical_actions={limits.max_physical_actions}, "
+                f"max_base_actions={limits.max_base_actions}, "
+                f"max_body_actions={limits.max_body_actions}, "
+                f"max_visual_checks={limits.max_visual_checks}."
+            ),
+            "For multi-step plans, goal_spec must describe the final desired outcome, not an intermediate step.",
+            "A missing or uncertain condition is UNKNOWN, not FALSE.",
+            "Skill catalog:",
+            "\n".join(skill_lines),
+        ]
+    )
+    user = json.dumps(
+        {
+            "intent_text": intent_text,
+            "context_json": context_json or "{}",
+            "required_output_example": {
+                "schema": "mc_ai_bt.plan.v1",
+                "root": {
+                    "type": "Action",
+                    "skill": "say",
+                    "args": {"text": "I will do that."},
+                    "timeout_sec": 30,
+                },
+                "goal_spec": {
+                    "type": "human",
+                    "verification": {"mode": "implicit_conversation"},
+                    "summary": intent_text,
+                },
+                "context_json": context_json or "{}",
+            },
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return [("system", system), ("human", user)]
+
+
+def _extract_json_object(raw: str) -> dict[str, Any]:
+    text = raw.strip()
+    if text.startswith("```"):
+        text = _strip_markdown_fence(text)
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("{")
+        if start < 0:
+            raise
+        decoder = json.JSONDecoder()
+        value, _end = decoder.raw_decode(text[start:])
+    if not isinstance(value, dict):
+        raise ValueError("planner output must be a JSON object")
+    return value
+
+
+def _strip_markdown_fence(text: str) -> str:
+    lines = text.splitlines()
+    if lines and lines[0].strip().startswith("```"):
+        lines = lines[1:]
+    if lines and lines[-1].strip() == "```":
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
+
+
+def _last_goal_relevant_node(node: dict) -> tuple[str, dict]:
+    found: tuple[str, dict] = ("", {})
+    if node.get("type") == "Action" and node.get("skill") != "say":
+        found = ("action", node)
+    if node.get("type") == "VisualCheck":
+        found = ("visual", node)
+    for key in ("children",):
+        for child in node.get(key, []) or []:
+            child_found = _last_goal_relevant_node(child)
+            if child_found[0]:
+                found = child_found
+    child = node.get("child")
+    if isinstance(child, dict):
+        child_found = _last_goal_relevant_node(child)
+        if child_found[0]:
+            found = child_found
+    return found
+
+
+def _goal_spec_for_action(action: dict, text: str) -> dict[str, Any]:
+    skill = action.get("skill")
+    args = action.get("args") if isinstance(action.get("args"), dict) else {}
+    if skill == "go_to_place":
+        return {
+            "type": "structured",
+            "predicate": "robot_at_place",
+            "args": {"name": args.get("name", "")},
+            "verification": {"mode": "world_state_or_nav_result"},
+            "summary": text,
+        }
+    if skill == "come_to_me":
+        return {
+            "type": "structured",
+            "predicate": "robot_near_interaction_owner",
+            "verification": {"mode": "world_state_or_nav_result"},
+            "summary": text,
+        }
+    if skill == "simple_move":
+        return {
+            "type": "structured",
+            "predicate": "relative_motion_completed",
+            "args": args,
+            "verification": {"mode": "action_result_then_world_state"},
+            "summary": text,
+        }
+    if skill in {"play_animation", "look_at", "point_at"}:
+        animation = args.get("animation") or args.get("name") or ""
+        if skill == "look_at":
+            animation = "look_at"
+        elif skill == "point_at":
+            animation = "point_at"
+        return {
+            "type": "structured",
+            "predicate": "animation_played",
+            "args": {"animation": animation},
+            "verification": {"mode": "action_result"},
+            "summary": text,
+        }
+    return {}
+
+
+def _slug(raw: str) -> str:
+    return re.sub(r"[^a-z0-9_-]+", "_", raw.strip().lower()).strip("_")
+
+
+def _split_compound_intent(lowered: str) -> list[str]:
+    parts = re.split(r"\s+(?:and\s+then|then)\s+|(?:然后|再)", lowered)
+    return [part.strip() for part in parts if part.strip()]
+
+
+def _clean_visual_target(raw: str) -> str:
+    cleaned = re.sub(r"\b(the|a|an|right now|nearby|around|please)\b", " ", raw)
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return _normalise_object(cleaned)
+
+
+def _normalize_look_direction(raw: str) -> str:
+    cleaned = re.sub(r"[\s-]+", "_", raw.strip().lower())
+    aliases = {
+        "up": "front_up",
+        "down": "front_down",
+        "ahead": "front",
+        "forward": "front",
+        "straight": "front",
+    }
+    return aliases.get(cleaned, cleaned)
+
+
+def _clean_point_target(raw: str) -> str:
+    cleaned = re.sub(r"\b(the|a|an|nearby|around|please)\b", " ", raw)
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return _normalise_object(cleaned)
+
+
+def _normalise_place(raw: str) -> str:
+    cleaned = re.sub(r"(这里|那里|那边|这边|一下|吧|请)", "", raw)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" _-")
+    if cleaned in _CHINESE_PLACE_ALIASES:
+        return _CHINESE_PLACE_ALIASES[cleaned]
+    return _slug(cleaned)
+
+
+def _normalise_object(raw: str) -> str:
+    cleaned = re.sub(r"(这里|那里|那边|这边|一下|吧|请)", "", raw)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" _-")
+    if cleaned in _CHINESE_OBJECT_ALIASES:
+        return _CHINESE_OBJECT_ALIASES[cleaned]
+    return cleaned
+
+
+def _extract_chinese_simple_move(lowered: str) -> tuple[str, float] | None:
+    value = _extract_first_number(lowered)
+    if any(fragment in lowered for fragment in ("左转", "向左转", "往左转", "向左", "往左")):
+        return "left", value if value is not None else 90.0
+    if any(fragment in lowered for fragment in ("右转", "向右转", "往右转", "向右", "往右")):
+        return "right", value if value is not None else 90.0
+    if any(fragment in lowered for fragment in ("前进", "向前", "往前")):
+        return "forward", value if value is not None else 0.5
+    if any(fragment in lowered for fragment in ("后退", "向后", "往后")):
+        return "backward", value if value is not None else 0.5
+    return None
+
+
+def _extract_first_number(text: str) -> float | None:
+    match = re.search(r"(?P<value>[0-9]+(?:\.[0-9]+)?)", text)
+    if not match:
+        return None
+    return float(match.group("value"))
