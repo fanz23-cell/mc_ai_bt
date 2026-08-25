@@ -4,11 +4,7 @@ import re
 from typing import Any
 
 
-_CHINESE_OBJECT_ALIASES = {
-    "杯子": "cup",
-    "水杯": "cup",
-    "马克杯": "cup",
-}
+PERSON_WORDS = {"person", "people", "someone", "anyone", "人", "某人", "一个人"}
 
 
 def visual_check_goal_spec(check: dict[str, Any]) -> dict[str, Any]:
@@ -104,11 +100,11 @@ def _looks_like_people_query(text: str) -> bool:
 
 def _extract_object_name(text: str) -> str:
     patterns = (
-        r"\bdo you see (?:the )?(?P<object>[a-z0-9 _-]+)$",
-        r"\bcan you see (?:the )?(?P<object>[a-z0-9 _-]+)$",
-        r"\bis (?:the )?(?P<object>[a-z0-9 _-]+) visible$",
-        r"\bis (?:the )?(?P<object>[a-z0-9 _-]+) here$",
-        r"\bwhere is (?:the )?(?P<object>[a-z0-9 _-]+)$",
+        r"\bdo you see (?:the )?(?P<object>[\u4e00-\u9fffA-Za-z0-9 _-]+)$",
+        r"\bcan you see (?:the )?(?P<object>[\u4e00-\u9fffA-Za-z0-9 _-]+)$",
+        r"\bis (?:the )?(?P<object>[\u4e00-\u9fffA-Za-z0-9 _-]+) visible$",
+        r"\bis (?:the )?(?P<object>[\u4e00-\u9fffA-Za-z0-9 _-]+) here$",
+        r"\bwhere is (?:the )?(?P<object>[\u4e00-\u9fffA-Za-z0-9 _-]+)$",
         r"(?:你)?(?:看到|看见)(?:了)?(?P<object>[\u4e00-\u9fffA-Za-z0-9 _-]+?)(?:了吗|吗)?$",
         r"有没有(?P<object>[\u4e00-\u9fffA-Za-z0-9 _-]+?)(?:吗)?$",
     )
@@ -124,4 +120,6 @@ def _clean_object_name(raw: str) -> str:
     cleaned = re.sub(r"(这个|那个|这里|那里|附近|周围|吗|了)", " ", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned)
     cleaned = cleaned.strip(" _-")
-    return _CHINESE_OBJECT_ALIASES.get(cleaned, cleaned)
+    if cleaned in PERSON_WORDS:
+        return "person"
+    return cleaned

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import dataclass, field
 from threading import Event
 from typing import Any, Callable, Protocol
@@ -40,6 +41,7 @@ ProgressCallback = Callable[[str, float], None]
 class _ProgressState:
     total: int
     completed: int = 0
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
 
 class BtExecutor:
@@ -147,6 +149,35 @@ class BtExecutor:
                 _progress_state,
                 _path,
             )
+        if node_type == "Parallel":
+            return self._execute_parallel(
+                node,
+                skills,
+                cancel_event,
+                checks,
+                facts,
+                progress_callback,
+                _progress_state,
+                _path,
+            )
+        if node_type == "Timeout":
+            return self._execute_timeout(
+                node,
+                skills,
+                cancel_event,
+                checks,
+                facts,
+                progress_callback,
+                _progress_state,
+                _path,
+            )
+        if node_type == "NoAction":
+            return self._execute_progress_leaf(
+                _node_label(node, _path),
+                lambda: ExecutionResult(True, str(node.get("reason") or "no action"), facts),
+                progress_callback,
+                _progress_state,
+            )
         if node_type == "Condition":
             return self._execute_progress_leaf(
                 _node_label(node, _path),
@@ -178,11 +209,15 @@ class BtExecutor:
         progress_state: _ProgressState | None,
     ) -> ExecutionResult:
         if progress_callback is not None and progress_state is not None:
-            progress_callback(label, _progress_fraction(progress_state))
+            with progress_state.lock:
+                start_progress = _progress_fraction(progress_state)
+            progress_callback(label, start_progress)
         result = run()
         if progress_callback is not None and progress_state is not None:
-            progress_state.completed += 1
-            progress_callback(label, _progress_fraction(progress_state))
+            with progress_state.lock:
+                progress_state.completed += 1
+                end_progress = _progress_fraction(progress_state)
+            progress_callback(label, end_progress)
         return result
 
     def _execute_action(
@@ -267,6 +302,108 @@ class BtExecutor:
             facts,
         )
 
+    def _execute_parallel(
+        self,
+        node: dict[str, Any],
+        skills: SkillExecutor,
+        cancel_event: Event | None,
+        checks: CheckExecutor | None,
+        blackboard: dict[str, Any],
+        progress_callback: ProgressCallback | None,
+        progress_state: _ProgressState | None,
+        path: str,
+    ) -> ExecutionResult:
+        children = node.get("children")
+        if not isinstance(children, list) or not children:
+            return ExecutionResult(False, "parallel children must be a non-empty list")
+        cancel_on_failure = bool(node.get("cancel_on_failure", True))
+        child_cancel = _LinkedCancelEvent(cancel_event)
+        results: list[ExecutionResult | None] = [None] * len(children)
+
+        def _run(idx: int, child: dict[str, Any]) -> None:
+            result = self.execute(
+                child,
+                skills,
+                cancel_event=child_cancel,
+                checks=checks,
+                blackboard=dict(blackboard),
+                progress_callback=progress_callback,
+                _path=f"{path}.children[{idx}]",
+                _progress_state=progress_state,
+            )
+            results[idx] = result
+            if cancel_on_failure and not result.success:
+                child_cancel.set()
+
+        threads = [
+            threading.Thread(target=_run, args=(idx, child), name=f"bt-parallel-{idx}", daemon=True)
+            for idx, child in enumerate(children)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        facts: dict[str, Any] = dict(blackboard)
+        failures: list[ExecutionResult] = []
+        blocked = False
+        for result in results:
+            if result is None:
+                failures.append(ExecutionResult(False, "parallel child did not report a result", {}, True))
+                blocked = True
+                continue
+            facts.update(result.facts)
+            if not result.success:
+                failures.append(result)
+                blocked = blocked or result.blocked
+        if failures:
+            message = "; ".join(result.message for result in failures)
+            return ExecutionResult(False, f"parallel failed: {message}", facts, blocked)
+        return ExecutionResult(True, "parallel succeeded", facts)
+
+    def _execute_timeout(
+        self,
+        node: dict[str, Any],
+        skills: SkillExecutor,
+        cancel_event: Event | None,
+        checks: CheckExecutor | None,
+        blackboard: dict[str, Any],
+        progress_callback: ProgressCallback | None,
+        progress_state: _ProgressState | None,
+        path: str,
+    ) -> ExecutionResult:
+        child = node.get("child")
+        if not isinstance(child, dict):
+            return ExecutionResult(False, "timeout child must be an object")
+        try:
+            timeout_sec = float(node.get("timeout_sec"))
+        except (TypeError, ValueError):
+            return ExecutionResult(False, "timeout timeout_sec must be numeric")
+        if timeout_sec <= 0 or timeout_sec > 600:
+            return ExecutionResult(False, "timeout timeout_sec must be in (0, 600]")
+        child_cancel = _LinkedCancelEvent(cancel_event)
+        box: dict[str, ExecutionResult] = {}
+
+        def _run() -> None:
+            box["result"] = self.execute(
+                child,
+                skills,
+                cancel_event=child_cancel,
+                checks=checks,
+                blackboard=dict(blackboard),
+                progress_callback=progress_callback,
+                _path=f"{path}.child",
+                _progress_state=progress_state,
+            )
+
+        thread = threading.Thread(target=_run, name="bt-timeout-child", daemon=True)
+        thread.start()
+        thread.join(timeout=timeout_sec)
+        if thread.is_alive():
+            child_cancel.set()
+            return ExecutionResult(False, f"timeout after {timeout_sec:g}s", dict(blackboard), True)
+        return box.get("result", ExecutionResult(False, "timeout child produced no result", dict(blackboard), True))
+
     def _execute_condition(
         self,
         node: dict[str, Any],
@@ -303,14 +440,15 @@ class BtExecutor:
         if not isinstance(check, dict):
             return ExecutionResult(False, "visual check requires check object")
         goal_spec = visual_check_goal_spec(check)
-        if not goal_spec:
-            return ExecutionResult(
-                False,
-                "visual check query is not supported by the local checker",
-                facts,
-                True,
-            )
-        return _check_as_execution_result(checks, goal_spec, facts, label="visual check")
+        if goal_spec and goal_spec.get("type") != "visual":
+            structured = _check_as_execution_result(checks, goal_spec, facts, label="visual check")
+            if not structured.blocked:
+                return structured
+
+        visual_check = getattr(checks, "visual_check", None)
+        if callable(visual_check):
+            return _visual_check_as_execution_result(visual_check, check, facts)
+        return ExecutionResult(False, "visual check UNKNOWN: VisualCheck service is not configured", facts, True)
 
 
 def _check_as_execution_result(
@@ -330,6 +468,21 @@ def _check_as_execution_result(
     if state == "FALSE":
         return ExecutionResult(False, f"{label} FALSE: {message}", facts)
     return ExecutionResult(False, f"{label} UNKNOWN: {message}", facts, True)
+
+
+def _visual_check_as_execution_result(
+    visual_check,
+    check: dict[str, Any],
+    facts: dict[str, Any],
+) -> ExecutionResult:
+    result = visual_check(check, facts)
+    state = _tri_state_value(getattr(result, "state", "UNKNOWN"))
+    message = str(getattr(result, "message", ""))
+    if state == "TRUE":
+        return ExecutionResult(True, f"visual check TRUE: {message}", facts)
+    if state == "FALSE":
+        return ExecutionResult(False, f"visual check FALSE: {message}", facts)
+    return ExecutionResult(False, f"visual check UNKNOWN: {message}", facts, True)
 
 
 def _normalise_goal_check_spec(check: dict[str, Any]) -> dict[str, Any]:
@@ -361,9 +514,9 @@ def _count_progress_leaves(node: Any) -> int:
     if not isinstance(node, dict):
         return 0
     node_type = node.get("type")
-    if node_type in {"Action", "Wait", "Condition", "GoalCheck", "VisualCheck"}:
+    if node_type in {"Action", "Wait", "Condition", "GoalCheck", "VisualCheck", "NoAction"}:
         return 1
-    if node_type in {"Sequence", "Fallback"}:
+    if node_type in {"Sequence", "Fallback", "Parallel"}:
         return sum(_count_progress_leaves(child) for child in node.get("children", []) or [])
     if node_type == "Retry":
         try:
@@ -371,6 +524,8 @@ def _count_progress_leaves(node: Any) -> int:
         except (TypeError, ValueError):
             attempts = 1
         return max(1, attempts) * _count_progress_leaves(node.get("child"))
+    if node_type == "Timeout":
+        return _count_progress_leaves(node.get("child"))
     return 0
 
 
@@ -393,3 +548,30 @@ def _progress_fraction(progress_state: _ProgressState) -> float:
     if progress_state.total <= 0:
         return 0.0
     return max(0.0, min(1.0, progress_state.completed / progress_state.total))
+
+
+class _LinkedCancelEvent:
+    def __init__(self, parent: Event | None = None) -> None:
+        self._local = Event()
+        self._parent = parent
+
+    def is_set(self) -> bool:
+        return self._local.is_set() or (self._parent is not None and self._parent.is_set())
+
+    def set(self) -> None:
+        self._local.set()
+
+    def wait(self, timeout: float | None = None) -> bool:
+        step = 0.05
+        if timeout is None:
+            while not self.is_set():
+                self._local.wait(step)
+            return True
+        remaining = max(0.0, float(timeout))
+        while remaining > 0:
+            if self.is_set():
+                return True
+            slice_sec = min(step, remaining)
+            self._local.wait(slice_sec)
+            remaining -= slice_sec
+        return self.is_set()

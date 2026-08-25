@@ -6,8 +6,15 @@ from typing import Any
 
 
 ACTION_NO_ACTION = "NO_ACTION"
-ACTION_BLOCK_ACTIVE = "BLOCK_ACTIVE"
-ACTION_REPLAN_ACTIVE = "REPLAN_ACTIVE"
+ACTION_LOCAL_HANDLED = "LOCAL_HANDLED"
+ACTION_REPLAN = "REPLAN"
+ACTION_PLAN_NEW_MISSION = "PLAN_NEW_MISSION"
+ACTION_ASK_CLARIFICATION = "ASK_CLARIFICATION"
+ACTION_BLOCKED = "BLOCKED"
+
+# Compatibility aliases for older in-branch callers/tests.
+ACTION_BLOCK_ACTIVE = ACTION_BLOCKED
+ACTION_REPLAN_ACTIVE = ACTION_REPLAN
 
 SAFETY_EVENT_TYPES = {
     "SAFETY_STOP_OCCURRED",
@@ -19,6 +26,20 @@ SAFETY_EVENT_TYPES = {
 REPLAN_EVENT_TYPES = {
     "MISSION_RELEVANT_FACT_CHANGED",
     "GOAL_EVIDENCE_CHANGED",
+    "ACTIVE_PARTICIPANT_LEFT",
+}
+
+NEW_MISSION_EVENT_TYPES = {
+    "PERSON_APPROACHED",
+    "PERSON_HAND_OFFERED",
+}
+
+CLARIFICATION_EVENT_TYPES = {
+    "AMBIGUOUS_USER_INTENT",
+    "MISSING_REQUIRED_ENTITY",
+    "MISSING_REQUIRED_PLACE",
+    "MISSING_REQUIRED_TARGET",
+    "LOW_CONFIDENCE_TASK_CONTEXT",
 }
 
 
@@ -47,13 +68,14 @@ class TriggerManager:
         event_type: str,
         snapshot_id: str = "",
         payload_json: str = "",
+        has_active_mission: bool = False,
     ) -> TriggerDecision:
         event_type = event_type.strip()
         payload = _loads_object(payload_json)
 
         if event_type in SAFETY_EVENT_TYPES:
             return TriggerDecision(
-                ACTION_BLOCK_ACTIVE,
+                ACTION_BLOCKED,
                 "safety stop event blocked active mission",
                 reason=event_type,
                 details={"snapshot_id": snapshot_id, "payload": payload},
@@ -64,16 +86,39 @@ class TriggerManager:
             and payload.get("replan_recommended") is False
         ):
             return TriggerDecision(
-                ACTION_NO_ACTION,
-                "goal evidence changed without replan recommendation",
+                ACTION_LOCAL_HANDLED,
+                "goal evidence changed handled locally without replan",
                 reason=event_type,
                 details={"snapshot_id": snapshot_id, "payload": payload},
             )
 
         if event_type in REPLAN_EVENT_TYPES:
             return TriggerDecision(
-                ACTION_REPLAN_ACTIVE,
+                ACTION_REPLAN,
                 "mission-relevant world event requests replan",
+                reason=event_type,
+                details={"snapshot_id": snapshot_id, "payload": payload},
+            )
+
+        if event_type in NEW_MISSION_EVENT_TYPES:
+            if has_active_mission:
+                return TriggerDecision(
+                    ACTION_LOCAL_HANDLED,
+                    "social world event recorded while a mission is active",
+                    reason=event_type,
+                    details={"snapshot_id": snapshot_id, "payload": payload},
+                )
+            return TriggerDecision(
+                ACTION_PLAN_NEW_MISSION,
+                "social world event may need a new mission",
+                reason=event_type,
+                details={"snapshot_id": snapshot_id, "payload": payload},
+            )
+
+        if event_type in CLARIFICATION_EVENT_TYPES:
+            return TriggerDecision(
+                ACTION_ASK_CLARIFICATION,
+                "world event requires operator clarification before planning can continue",
                 reason=event_type,
                 details={"snapshot_id": snapshot_id, "payload": payload},
             )

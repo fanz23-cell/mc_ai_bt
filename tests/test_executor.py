@@ -1,5 +1,6 @@
 import json
 import threading
+import time
 
 from mc_ai_bt.executor import BtExecutor, ExecutionResult
 from mc_ai_bt.goal_check import CheckResult, TriState
@@ -37,6 +38,39 @@ class FakeChecks:
     def check(self, goal_spec: dict, execution: ExecutionResult):
         self.requests.append((goal_spec, execution))
         return CheckResult(self.state, f"{self.state.value.lower()} check")
+
+
+class FakeChecksWithVisual(FakeChecks):
+    def __init__(
+        self,
+        state: TriState = TriState.TRUE,
+        visual_state: TriState = TriState.TRUE,
+    ):
+        super().__init__(state)
+        self.visual_state = visual_state
+        self.visual_requests = []
+
+    def visual_check(self, check: dict, facts: dict):
+        self.visual_requests.append((check, facts))
+        return CheckResult(self.visual_state, f"{self.visual_state.value.lower()} visual")
+
+
+class FactSkills:
+    def __init__(self):
+        self.calls = []
+
+    def execute_skill(
+        self,
+        name: str,
+        args: dict,
+        cancel_event=None,
+        *,
+        timeout_sec=None,
+    ) -> ExecutionResult:
+        self.calls.append((name, args, timeout_sec))
+        if name == "fact":
+            return ExecutionResult(True, "fact", {str(args["key"]): args["value"]})
+        return ExecutionResult(False, f"unsupported skill: {name}")
 
 
 def test_executor_runs_say_action():
@@ -88,7 +122,7 @@ def test_executor_stops_sequence_on_failure():
         "type": "Sequence",
         "children": [
             {"type": "Action", "skill": "say", "args": {"text": "first"}},
-            {"type": "Action", "skill": "go_to_place", "args": {"name": "kitchen"}},
+            {"type": "Action", "skill": "go_to_place", "args": {"name": "test_place"}},
             {"type": "Action", "skill": "say", "args": {"text": "third"}},
         ],
     }
@@ -156,6 +190,73 @@ def test_executor_wait_can_be_canceled():
     assert result.message == "mission canceled"
 
 
+def test_executor_noaction_succeeds_without_skill_call():
+    skills = FakeSkills()
+
+    result = BtExecutor().execute(
+        {"type": "NoAction", "reason": "already satisfied"},
+        skills,
+    )
+
+    assert result.success
+    assert result.message == "already satisfied"
+    assert skills.said == []
+
+
+def test_executor_parallel_runs_all_children_and_merges_facts():
+    skills = FactSkills()
+
+    result = BtExecutor().execute(
+        {
+            "type": "Parallel",
+            "children": [
+                {"type": "Action", "skill": "fact", "args": {"key": "left", "value": 1}},
+                {"type": "Action", "skill": "fact", "args": {"key": "right", "value": 2}},
+            ],
+        },
+        skills,
+    )
+
+    assert result.success
+    assert result.facts == {"left": 1, "right": 2}
+    assert sorted(call[1]["key"] for call in skills.calls) == ["left", "right"]
+
+
+def test_executor_timeout_returns_child_result_when_child_finishes():
+    skills = FakeSkills()
+
+    result = BtExecutor().execute(
+        {
+            "type": "Timeout",
+            "timeout_sec": 1.0,
+            "child": {"type": "Action", "skill": "say", "args": {"text": "quick"}},
+        },
+        skills,
+    )
+
+    assert result.success
+    assert result.facts == {"said": "quick"}
+
+
+def test_executor_timeout_blocks_and_cancels_slow_child():
+    skills = FakeSkills()
+    started = time.monotonic()
+
+    result = BtExecutor().execute(
+        {
+            "type": "Timeout",
+            "timeout_sec": 0.01,
+            "child": {"type": "Wait", "duration_sec": 1.0},
+        },
+        skills,
+    )
+
+    assert not result.success
+    assert result.blocked
+    assert "timeout after" in result.message
+    assert time.monotonic() - started < 0.5
+
+
 def test_executor_condition_true_continues_sequence():
     skills = FakeSkills()
     checks = FakeChecks(TriState.TRUE)
@@ -165,7 +266,7 @@ def test_executor_condition_true_continues_sequence():
             {
                 "type": "Condition",
                 "predicate": "robot_at_place",
-                "args": {"name": "kitchen"},
+                "args": {"name": "test_place"},
             },
             {"type": "Action", "skill": "say", "args": {"text": "done"}},
         ],
@@ -186,7 +287,7 @@ def test_executor_condition_unknown_blocks_instead_of_failing_false():
         {
             "type": "Condition",
             "predicate": "robot_at_place",
-            "args": {"name": "kitchen"},
+            "args": {"name": "test_place"},
         },
         skills,
         checks=checks,
@@ -225,14 +326,14 @@ def test_visual_check_query_runs_as_structured_object_check():
     checks = FakeChecks(TriState.TRUE)
 
     result = BtExecutor().execute(
-        {"type": "VisualCheck", "check": {"query": "do you see the cup?"}},
+        {"type": "VisualCheck", "check": {"query": "do you see the test_object?"}},
         skills,
         checks=checks,
     )
 
     assert result.success
     assert checks.requests[0][0]["predicate"] == "object_visible"
-    assert checks.requests[0][0]["args"] == {"name": "cup"}
+    assert checks.requests[0][0]["args"] == {"name": "test_object"}
 
 
 def test_visual_check_people_query_runs_as_structured_person_check():
@@ -263,6 +364,36 @@ def test_visual_check_unknown_query_blocks_without_calling_checker():
     assert not result.success
     assert result.blocked
     assert checks.requests == []
+
+
+def test_visual_check_unknown_query_uses_visual_service_when_configured():
+    skills = FakeSkills()
+    checks = FakeChecksWithVisual()
+
+    result = BtExecutor().execute(
+        {"type": "VisualCheck", "check": {"query": "is the room tidy?"}},
+        skills,
+        checks=checks,
+    )
+
+    assert result.success
+    assert checks.requests == []
+    assert checks.visual_requests == [({"query": "is the room tidy?"}, {})]
+
+
+def test_visual_check_structured_unknown_falls_back_to_visual_service():
+    skills = FakeSkills()
+    checks = FakeChecksWithVisual(state=TriState.UNKNOWN, visual_state=TriState.TRUE)
+
+    result = BtExecutor().execute(
+        {"type": "VisualCheck", "check": {"query": "do you see the test_object?"}},
+        skills,
+        checks=checks,
+    )
+
+    assert result.success
+    assert checks.requests[0][0]["predicate"] == "object_visible"
+    assert checks.visual_requests == [({"query": "do you see the test_object?"}, {})]
 
 
 def test_executor_reports_progress_for_sequence_leaves():

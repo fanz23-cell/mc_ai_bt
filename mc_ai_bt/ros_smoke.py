@@ -73,7 +73,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--intent",
-        default="go to kitchen then point at the cup",
+        default="go to test_place then point at the test_object",
         help="Task intent submitted to /mc_ai_bt/submit_task.",
     )
     parser.add_argument(
@@ -213,7 +213,7 @@ def _run_smoke(node, args: argparse.Namespace) -> SmokeSummary:
 
     answers: list[dict[str, Any]] = []
     if not args.skip_query_world:
-        for question in ("where are you?", "do you see the cup?"):
+        for question in ("where are you?", "do you see the test_object?"):
             answer = _query_world(node, query, question, deadline)
             answers.append(answer)
             if not answer.get("success"):

@@ -4,6 +4,7 @@ from mc_ai_bt.mission import (
     MissionManager,
     STATE_CANCELED,
     STATE_PAUSED,
+    STATE_QUEUED,
     STATE_PLANNING,
     STATE_RUNNING,
     STATE_SUCCEEDED,
@@ -14,7 +15,7 @@ def test_submit_sets_first_mission_active_planning():
     manager = MissionManager()
 
     accepted, message, mission, _event = manager.submit(
-        intent_text="go to the kitchen",
+        intent_text="go to the test_place",
         source="voice",
         operator_id="user",
         parent_mission_id="",
@@ -51,7 +52,7 @@ def test_set_plan_increments_plan_version_and_runs():
 def test_replan_invalidates_old_execution_before_new_plan_runs():
     manager = MissionManager()
     _accepted, _message, mission, _event = manager.submit(
-        intent_text="go to the kitchen",
+        intent_text="go to the test_place",
         source="voice",
         operator_id="user",
         parent_mission_id="",
@@ -80,7 +81,7 @@ def test_replan_invalidates_old_execution_before_new_plan_runs():
 def test_set_plan_after_replan_uses_reserved_plan_version():
     manager = MissionManager()
     _accepted, _message, mission, _event = manager.submit(
-        intent_text="go to the kitchen",
+        intent_text="go to the test_place",
         source="voice",
         operator_id="user",
         parent_mission_id="",
@@ -104,7 +105,7 @@ def test_set_plan_after_replan_uses_reserved_plan_version():
 def test_set_plan_rejects_stale_planning_identity_after_replan():
     manager = MissionManager()
     _accepted, _message, mission, _event = manager.submit(
-        intent_text="go to the kitchen",
+        intent_text="go to the test_place",
         source="voice",
         operator_id="user",
         parent_mission_id="",
@@ -131,7 +132,7 @@ def test_set_plan_rejects_stale_planning_identity_after_replan():
 def test_planning_failure_rejects_stale_identity_after_replan():
     manager = MissionManager()
     _accepted, _message, mission, _event = manager.submit(
-        intent_text="go to the kitchen",
+        intent_text="go to the test_place",
         source="voice",
         operator_id="user",
         parent_mission_id="",
@@ -287,6 +288,76 @@ def test_terminal_promotes_next_queued_mission():
 
     assert len(promoted) == 1
     assert promoted[0].intent_text == "second"
+
+
+def test_reprioritize_updates_queued_priority():
+    manager = MissionManager()
+    manager.submit(
+        intent_text="first",
+        source="voice",
+        operator_id="user",
+        parent_mission_id="",
+        priority=1,
+        allow_queue=True,
+        context_json="{}",
+    )
+    _accepted, _message, queued, _event = manager.submit(
+        intent_text="second",
+        source="voice",
+        operator_id="user",
+        parent_mission_id="",
+        priority=2,
+        allow_queue=True,
+        context_json="{}",
+    )
+
+    event = manager.reprioritize(
+        queued.identity.mission_id,
+        priority=42,
+        preempt_if_needed=False,
+        reason="operator priority",
+    )
+
+    assert event.mission.priority == 42
+    assert event.mission.status_text == "operator priority"
+
+
+def test_reprioritize_can_preempt_active_with_higher_priority_queued_mission():
+    manager = MissionManager()
+    _accepted, _message, first, _event = manager.submit(
+        intent_text="first",
+        source="voice",
+        operator_id="user",
+        parent_mission_id="",
+        priority=1,
+        allow_queue=True,
+        context_json="{}",
+    )
+    running = manager.set_plan(first.identity.mission_id, "bt", "goal").mission
+    _accepted, _message, queued, _event = manager.submit(
+        intent_text="second",
+        source="voice",
+        operator_id="user",
+        parent_mission_id="",
+        priority=2,
+        allow_queue=True,
+        context_json="{}",
+    )
+
+    event = manager.reprioritize(
+        queued.identity.mission_id,
+        priority=50,
+        preempt_if_needed=True,
+        reason="urgent",
+    )
+
+    assert event.event == EVENT_PREEMPTED
+    assert event.mission.state == STATE_PLANNING
+    assert event.mission.intent_text == "second"
+    assert not manager.accepts_async_result(running.identity)
+    demoted = manager.get(first.identity.mission_id)
+    assert demoted is not None
+    assert demoted.state == STATE_QUEUED
 
 
 def test_empty_control_id_targets_current_active_mission():

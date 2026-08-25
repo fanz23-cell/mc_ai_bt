@@ -23,6 +23,7 @@ setup(
     entry_points={
         "console_scripts": [
             "ai_bt = mc_ai_bt.node:main",
+            "ai_bt_confirmation = mc_ai_bt.confirmation_server:main",
             "ai_bt_doctor = mc_ai_bt.ros_doctor:main",
             "ai_bt_local_smoke = mc_ai_bt.local_smoke:main",
             "ai_bt_local_fake_ros_smoke = mc_ai_bt.ros_smoke:main",

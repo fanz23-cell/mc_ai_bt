@@ -6,6 +6,7 @@ from enum import Enum
 from typing import Any, Callable
 
 from .entity_facts import (
+    fact_value,
     find_object_fact,
     min_score_from_args,
     min_count_from_args,
@@ -15,6 +16,7 @@ from .entity_facts import (
     person_id_from_args,
 )
 from .executor import ExecutionResult
+from .place_predicates import TRI_FALSE, TRI_TRUE, evaluate_place_predicate
 from .visual_check import visual_check_goal_spec
 
 
@@ -35,6 +37,42 @@ class CheckResult:
 
 
 SnapshotProvider = Callable[[tuple[str, ...], float], str]
+
+
+@dataclass(frozen=True)
+class PredicateSpec:
+    name: str
+    scopes: tuple[str, ...]
+    snapshot_scope: str = "robot"
+
+
+PREDICATE_REGISTRY: dict[str, PredicateSpec] = {
+    "robot_at_place": PredicateSpec("robot_at_place", ("navigation",), "navigation"),
+    "robot_near_interaction_owner": PredicateSpec(
+        "robot_near_interaction_owner",
+        ("people", "robot"),
+        "robot",
+    ),
+    "relative_motion_completed": PredicateSpec("relative_motion_completed", ("robot",), "robot"),
+    "animation_played": PredicateSpec("animation_played", ("robot",), "robot"),
+    "object_visible": PredicateSpec("object_visible", ("objects",), "objects"),
+    "person_visible": PredicateSpec("person_visible", ("people",), "people"),
+    "person_at_place": PredicateSpec("person_at_place", ("people", "places", "place_regions"), "people"),
+    "object_at_place": PredicateSpec("object_at_place", ("objects", "places", "place_regions"), "objects"),
+    "entity_following": PredicateSpec("entity_following", ("entities", "people", "objects"), "entities"),
+    "person_following": PredicateSpec("person_following", ("people",), "people"),
+    "entity_at_place": PredicateSpec("entity_at_place", ("entities", "people", "places", "place_regions"), "entities"),
+    "reach_completed": PredicateSpec("reach_completed", ("robot", "objects", "people", "interactions"), "robot"),
+    "contact_detected": PredicateSpec("contact_detected", ("robot", "objects", "people", "interactions"), "robot"),
+    "target_state_changed": PredicateSpec("target_state_changed", ("robot", "objects", "interactions"), "robot"),
+    "axis_aligned": PredicateSpec("axis_aligned", ("robot", "objects", "interactions"), "robot"),
+    "axis_motion_completed": PredicateSpec("axis_motion_completed", ("robot", "objects", "interactions"), "robot"),
+    "distance_maintained": PredicateSpec("distance_maintained", ("robot", "entities", "people", "objects"), "robot"),
+    "pose_held": PredicateSpec("pose_held", ("robot", "objects", "people", "interactions"), "robot"),
+    "oscillation_completed": PredicateSpec("oscillation_completed", ("robot", "objects", "people", "interactions"), "robot"),
+    "retracted": PredicateSpec("retracted", ("robot",), "robot"),
+    "human_confirmation": PredicateSpec("human_confirmation", ("tasks",), "tasks"),
+}
 
 
 class GoalChecker:
@@ -58,7 +96,7 @@ class GoalChecker:
 
         goal_type = goal_spec.get("type")
         if goal_type == "human":
-            return CheckResult(TriState.TRUE, "human/implicit goal accepted after execution")
+            return self._check_human(goal_spec, execution)
         if goal_type == "visual":
             parsed = visual_check_goal_spec(goal_spec)
             if parsed and parsed.get("type") != "visual":
@@ -69,6 +107,36 @@ class GoalChecker:
         if goal_type == "structured":
             return self._check_structured(goal_spec, execution)
         return CheckResult(TriState.FALSE, f"unknown goal type: {goal_type}")
+
+    def _check_human(
+        self,
+        goal_spec: dict[str, Any],
+        execution: ExecutionResult,
+    ) -> CheckResult:
+        verification = goal_spec.get("verification") if isinstance(goal_spec.get("verification"), dict) else {}
+        mode = str(verification.get("mode") or "implicit").strip().lower()
+        if mode.startswith("implicit"):
+            return CheckResult(TriState.TRUE, "human/implicit goal accepted after execution")
+        if mode in {"confirmation", "human_confirmation", "operator_confirmation", "explicit"}:
+            direct = _human_confirmation_result(
+                execution.facts.get("human_confirmation"),
+                goal_spec,
+                source="execution facts",
+            )
+            if direct.state is not TriState.UNKNOWN:
+                return direct
+            snapshot = self._snapshot("human_confirmation")
+            if snapshot:
+                tasks = snapshot.get("facts", {}).get("tasks", {})
+                snapshot_result = _human_confirmation_result(
+                    _snapshot_value(tasks.get("last_human_confirmation")),
+                    goal_spec,
+                    source="world state",
+                )
+                if snapshot_result.state is not TriState.UNKNOWN:
+                    return snapshot_result
+            return CheckResult(TriState.UNKNOWN, "human confirmation evidence missing")
+        return CheckResult(TriState.UNKNOWN, f"unknown human verification mode: {mode}")
 
     def _check_structured(
         self,
@@ -140,6 +208,33 @@ class GoalChecker:
             )
             return _people_visibility_result(evidence, source="execution facts")
 
+        if predicate in {"person_at_place", "object_at_place"}:
+            direct = _direct_predicate_result(
+                predicate,
+                args,
+                facts.get(predicate),
+                source="execution facts",
+            )
+            if direct.state is not TriState.UNKNOWN:
+                return direct
+            place_result = evaluate_place_predicate(facts, predicate, args)
+            return _place_predicate_check_result(place_result, predicate, source="execution facts")
+
+        if predicate in {"entity_following", "person_following"}:
+            return _person_following_result(
+                _execution_following_entry(facts, predicate),
+                args,
+                source="execution facts",
+            )
+
+        if predicate in PREDICATE_REGISTRY:
+            return _direct_predicate_result(
+                predicate,
+                args,
+                facts.get(predicate),
+                source="execution facts",
+            )
+
         return CheckResult(TriState.UNKNOWN, f"unknown structured predicate: {predicate}")
 
     def _snapshot(self, predicate: str) -> dict[str, Any]:
@@ -209,29 +304,260 @@ class GoalChecker:
                 min_count=min_count_from_args(args),
             )
             return _people_visibility_result(evidence, source="world state")
+        if predicate in {"person_at_place", "object_at_place"}:
+            scope_name = "people" if predicate == "person_at_place" else "objects"
+            scoped = facts.get(scope_name) if isinstance(facts.get(scope_name), dict) else {}
+            direct = _direct_predicate_result(
+                predicate,
+                args,
+                scoped.get(predicate),
+                source="world state",
+            )
+            if direct.state is not TriState.UNKNOWN:
+                return direct
+            place_result = evaluate_place_predicate(facts, predicate, args)
+            return _place_predicate_check_result(place_result, predicate, source="world state")
+        if predicate in {"entity_following", "person_following"}:
+            scope_name = "entities" if predicate == "entity_following" else "people"
+            scope = facts.get(scope_name) if isinstance(facts.get(scope_name), dict) else {}
+            return _person_following_result(
+                scope.get("following"),
+                args,
+                source="world state",
+            )
+        if predicate in PREDICATE_REGISTRY:
+            spec = PREDICATE_REGISTRY[predicate]
+            scope = facts.get(spec.snapshot_scope) if isinstance(facts.get(spec.snapshot_scope), dict) else {}
+            return _direct_predicate_result(
+                predicate,
+                args,
+                scope.get(predicate),
+                source="world state",
+            )
         return CheckResult(TriState.UNKNOWN, f"world state has no evidence for {predicate}")
 
 
 def _scopes_for_predicate(predicate: str) -> tuple[str, ...]:
-    if predicate == "robot_at_place":
-        return ("navigation",)
-    if predicate == "robot_near_interaction_owner":
-        return ("people", "robot")
-    if predicate == "relative_motion_completed":
-        return ("robot",)
-    if predicate == "animation_played":
-        return ("robot",)
-    if predicate == "object_visible":
-        return ("objects",)
-    if predicate == "person_visible":
-        return ("people",)
-    return ()
+    spec = PREDICATE_REGISTRY.get(predicate)
+    return spec.scopes if spec is not None else ()
 
 
 def _snapshot_value(entry: Any) -> Any:
     if isinstance(entry, dict) and "value" in entry:
         return entry["value"]
     return entry
+
+
+def _direct_predicate_result(
+    predicate: str,
+    args: dict[str, Any],
+    entry: Any,
+    *,
+    source: str,
+) -> CheckResult:
+    if entry is None:
+        return CheckResult(TriState.UNKNOWN, f"{predicate} fact missing")
+    value = fact_value(entry)
+    if isinstance(value, bool):
+        return CheckResult(
+            TriState.TRUE if value else TriState.FALSE,
+            f"{source} {'confirms' if value else 'contradicts'} {predicate}",
+        )
+    if not isinstance(value, dict):
+        return CheckResult(TriState.UNKNOWN, f"{source} {predicate} fact has unknown shape")
+
+    if value.get("semantic_verified") is False:
+        return CheckResult(
+            TriState.UNKNOWN,
+            f"{source} {predicate} action completed but semantic verification is missing",
+        )
+
+    if predicate == "contact_detected" and not _contact_verified(value):
+        return CheckResult(
+            TriState.UNKNOWN,
+            f"{source} contact_detected lacks verified contact evidence",
+        )
+    if predicate == "target_state_changed" and not _target_state_change_verified(value):
+        return CheckResult(
+            TriState.UNKNOWN,
+            f"{source} target_state_changed lacks target-state verification",
+        )
+
+    expected_place = str(args.get("place") or args.get("place_name") or "").strip()
+    actual_place = str(value.get("place") or value.get("place_name") or "").strip()
+    if expected_place and actual_place and actual_place != expected_place:
+        return CheckResult(
+            TriState.FALSE,
+            f"{source} {predicate} place mismatch: {actual_place} != {expected_place}",
+        )
+
+    state = _truthy_state(value, "at_place", "inside", "matched", "state", "value")
+    if state is True:
+        return CheckResult(TriState.TRUE, f"{source} confirms {predicate}")
+    if state is False:
+        return CheckResult(TriState.FALSE, f"{source} contradicts {predicate}")
+    return CheckResult(TriState.UNKNOWN, f"{source} {predicate} fact is inconclusive")
+
+
+def _place_predicate_check_result(
+    result,
+    predicate: str,
+    *,
+    source: str,
+) -> CheckResult:
+    if result.state == TRI_TRUE:
+        return CheckResult(TriState.TRUE, f"{source} confirms {predicate}: {result.reason}")
+    if result.state == TRI_FALSE:
+        return CheckResult(TriState.FALSE, f"{source} contradicts {predicate}: {result.reason}")
+    return CheckResult(TriState.UNKNOWN, f"{source} has no conclusive {predicate} evidence: {result.reason}")
+
+
+def _execution_following_entry(facts: dict[str, Any], predicate: str) -> Any:
+    if predicate == "entity_following" and "entity_following" in facts:
+        return facts.get("entity_following")
+    if "person_following" in facts:
+        return facts.get("person_following")
+    entities = facts.get("entities")
+    if isinstance(entities, dict):
+        return entities.get("following")
+    people = facts.get("people")
+    if isinstance(people, dict):
+        return people.get("following")
+    return facts.get("following")
+
+
+def _person_following_result(
+    entry: Any,
+    args: dict[str, Any],
+    *,
+    source: str,
+) -> CheckResult:
+    if entry is None:
+        return CheckResult(TriState.UNKNOWN, "following fact missing")
+    value = fact_value(entry)
+    if isinstance(value, bool):
+        return CheckResult(
+            TriState.TRUE if value else TriState.FALSE,
+            f"{source} {'confirms' if value else 'contradicts'} person_following",
+        )
+    if not isinstance(value, dict):
+        return CheckResult(TriState.UNKNOWN, f"{source} following fact has unknown shape")
+
+    if value.get("semantic_verified") is False:
+        return CheckResult(
+            TriState.UNKNOWN,
+            f"{source} following action completed but semantic verification is missing",
+        )
+
+    expected_entity = str(
+        args.get("entity")
+        or args.get("entity_id")
+        or args.get("person_id")
+        or args.get("id")
+        or args.get("person")
+        or ""
+    ).strip()
+    actual_entity = str(
+        value.get("entity")
+        or value.get("entity_id")
+        or value.get("person_id")
+        or value.get("id")
+        or value.get("person")
+        or ""
+    ).strip()
+    if expected_entity and actual_entity and actual_entity != expected_entity:
+        return CheckResult(
+            TriState.FALSE,
+            f"{source} following entity mismatch: {actual_entity} != {expected_entity}",
+        )
+    state = _truthy_state(value, "following", "active", "matched", "state", "value")
+    if state is True:
+        return CheckResult(TriState.TRUE, f"{source} confirms following")
+    if state is False:
+        return CheckResult(TriState.FALSE, f"{source} contradicts following")
+    return CheckResult(TriState.UNKNOWN, f"{source} following fact is inconclusive")
+
+
+def _contact_verified(value: dict[str, Any]) -> bool:
+    return (
+        _truthy_state(value, "semantic_verified") is True
+        and _truthy_state(value, "contact_verified", "contact", "contact_detected", "touched") is True
+        and _number_field(value, "contact_duration_sec") >= 0.05
+    )
+
+
+def _target_state_change_verified(value: dict[str, Any]) -> bool:
+    return (
+        _truthy_state(value, "semantic_verified") is True
+        and _truthy_state(value, "state_verified", "target_state_verified") is True
+        and _truthy_state(value, "changed", "state_changed", "active", "value") is True
+    )
+
+
+def _number_field(value: dict[str, Any], key: str) -> float:
+    try:
+        return float(value.get(key))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _human_confirmation_result(
+    entry: Any,
+    goal_spec: dict[str, Any],
+    *,
+    source: str,
+) -> CheckResult:
+    if entry is None:
+        return CheckResult(TriState.UNKNOWN, "human confirmation fact missing")
+    value = fact_value(entry)
+    if not isinstance(value, dict):
+        return CheckResult(TriState.UNKNOWN, f"{source} human confirmation fact has unknown shape")
+
+    expected = str(goal_spec.get("request_id") or "").strip()
+    verification = goal_spec.get("verification") if isinstance(goal_spec.get("verification"), dict) else {}
+    expected = expected or str(verification.get("request_id") or "").strip()
+    actual = str(value.get("request_id") or "").strip()
+    if expected and actual and actual != expected:
+        return CheckResult(
+            TriState.FALSE,
+            f"{source} human confirmation request mismatch: {actual} != {expected}",
+        )
+    approved = value.get("approved")
+    if isinstance(approved, bool):
+        if approved:
+            return CheckResult(TriState.TRUE, f"{source} confirms human approval")
+        return CheckResult(TriState.FALSE, f"{source} says human confirmation was not approved")
+    decision = str(value.get("decision") or "").strip().upper()
+    if decision in {"1", "APPROVED"}:
+        return CheckResult(TriState.TRUE, f"{source} confirms human approval")
+    if decision in {"2", "DENIED", "3", "TIMEOUT", "4", "CANCELED"}:
+        return CheckResult(TriState.FALSE, f"{source} says human confirmation was {decision}")
+    return CheckResult(TriState.UNKNOWN, f"{source} human confirmation fact is inconclusive")
+
+
+def _truthy_state(value: dict[str, Any], *keys: str) -> bool | None:
+    for key in keys:
+        if key not in value:
+            continue
+        raw = value.get(key)
+        if isinstance(raw, bool):
+            return raw
+        if isinstance(raw, str):
+            lowered = raw.strip().lower()
+            if lowered in {
+                "true",
+                "yes",
+                "active",
+                "matched",
+                "inside",
+                "following",
+                "complete",
+                "completed",
+            }:
+                return True
+            if lowered in {"false", "no", "inactive", "unmatched", "outside", "not_following", "failed"}:
+                return False
+    return None
 
 
 def _relative_motion_result(

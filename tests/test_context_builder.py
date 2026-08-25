@@ -7,7 +7,7 @@ from mc_ai_bt.mission import MissionManager
 def test_context_builder_includes_world_missions_and_skills():
     manager = MissionManager()
     _accepted, _message, mission, _event = manager.submit(
-        intent_text="go to kitchen",
+        intent_text="go to test_place",
         source="voice",
         operator_id="user",
         parent_mission_id="",
@@ -21,7 +21,7 @@ def test_context_builder_includes_world_missions_and_skills():
     context = json.loads(builder.build_json(mission, manager.all()))
 
     assert context["schema"] == "mc_ai_bt.context.v1"
-    assert context["mission"]["intent_text"] == "go to kitchen"
+    assert context["mission"]["intent_text"] == "go to test_place"
     assert context["caller_context"] == {"locale": "en-US"}
     assert context["world"]["facts"]["navigation"]["current_place"]["value"] == "hall"
     assert context["missions"][0]["mission_id"] == mission.identity.mission_id

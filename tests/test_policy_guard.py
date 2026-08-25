@@ -18,13 +18,13 @@ def test_policy_accepts_bootstrap_nav_shape():
             "type": "Sequence",
             "children": [
                 {"type": "Action", "skill": "say", "args": {"text": "Going."}},
-                {"type": "Action", "skill": "go_to_place", "args": {"name": "kitchen"}},
+                {"type": "Action", "skill": "go_to_place", "args": {"name": "test_place"}},
             ],
         },
         {
             "type": "structured",
             "predicate": "robot_at_place",
-            "args": {"name": "kitchen"},
+            "args": {"name": "test_place"},
             "verification": {"mode": "world_state_or_nav_result"},
         },
     )
@@ -40,8 +40,8 @@ def test_policy_accepts_bounded_multi_step_embodied_plan():
             "type": "Sequence",
             "children": [
                 {"type": "Action", "skill": "say", "args": {"text": "Starting."}},
-                {"type": "Action", "skill": "go_to_place", "args": {"name": "kitchen"}},
-                {"type": "VisualCheck", "check": {"query": "do you see the cup?"}},
+                {"type": "Action", "skill": "go_to_place", "args": {"name": "test_place"}},
+                {"type": "VisualCheck", "check": {"query": "do you see the test_object?"}},
                 {"type": "Action", "skill": "play_animation", "args": {"animation": "wave"}},
             ],
         },
@@ -132,7 +132,7 @@ def test_policy_rejects_too_many_visual_checks():
         {
             "type": "Sequence",
             "children": [
-                {"type": "VisualCheck", "check": {"query": "do you see the cup?"}},
+                {"type": "VisualCheck", "check": {"query": "do you see the test_object?"}},
                 {"type": "VisualCheck", "check": {"query": "do you see the bottle?"}},
                 {"type": "VisualCheck", "check": {"query": "do you see the book?"}},
                 {"type": "VisualCheck", "check": {"query": "do you see the pen?"}},
@@ -153,7 +153,7 @@ def test_policy_rejects_goal_action_mismatch():
         {
             "type": "structured",
             "predicate": "robot_at_place",
-            "args": {"name": "kitchen"},
+            "args": {"name": "test_place"},
             "verification": {"mode": "world_state_or_nav_result"},
         },
     )
@@ -162,6 +162,45 @@ def test_policy_rejects_goal_action_mismatch():
 
     assert not result.ok
     assert any("does not match" in error for error in result.errors)
+
+
+def test_policy_accepts_bounded_human_confirmation():
+    plan = _plan(
+        {
+            "type": "Action",
+            "skill": "request_human_confirmation",
+            "args": {
+                "prompt": "Approve opening the demo interaction?",
+                "required_role": "operator",
+                "timeout_sec": 30,
+            },
+        },
+    )
+
+    result = PolicyGuard().check(plan)
+
+    assert result.ok
+
+
+def test_policy_rejects_unbounded_human_confirmation():
+    plan = _plan(
+        {
+            "type": "Action",
+            "skill": "request_human_confirmation",
+            "args": {
+                "prompt": "x" * 300,
+                "required_role": "stranger",
+                "timeout_sec": 1000,
+            },
+        },
+    )
+
+    result = PolicyGuard().check(plan)
+
+    assert not result.ok
+    assert any("prompt exceeds" in error for error in result.errors)
+    assert any("required_role" in error for error in result.errors)
+    assert any("timeout_sec" in error for error in result.errors)
 
 
 def test_policy_accepts_look_at_and_point_at_skills():
@@ -175,7 +214,7 @@ def test_policy_accepts_look_at_and_point_at_skills():
         },
     )
     point = _plan(
-        {"type": "Action", "skill": "point_at", "args": {"object": "cup", "arm": "right", "hold": 2.0}},
+        {"type": "Action", "skill": "point_at", "args": {"object": "test_object", "arm": "right", "hold": 2.0}},
         {
             "type": "structured",
             "predicate": "animation_played",
@@ -210,6 +249,33 @@ def test_policy_rejects_invalid_point_at_target():
     assert any("x exceeds" in error for error in huge_result.errors)
 
 
+def test_policy_accepts_bounded_embodied_skills():
+    reach = _plan({"type": "Action", "skill": "reach_to", "args": {"object": "test_object", "arm": "right"}})
+    contact = _plan({"type": "Action", "skill": "wait_for_contact", "args": {"target": "generic_target"}})
+    follow = _plan({"type": "Action", "skill": "follow_entity", "args": {"entity": "person:subject"}})
+    guide = _plan(
+        {
+            "type": "Action",
+            "skill": "guide_entity_to_place",
+            "args": {"entity": "person:subject", "place": "target_place"},
+        }
+    )
+
+    assert PolicyGuard().check(reach).ok
+    assert PolicyGuard().check(contact).ok
+    assert PolicyGuard().check(follow).ok
+    assert PolicyGuard().check(guide).ok
+
+
+def test_policy_rejects_embodied_skill_without_required_target():
+    plan = _plan({"type": "Action", "skill": "reach_to", "args": {"arm": "right"}})
+
+    result = PolicyGuard().check(plan)
+
+    assert not result.ok
+    assert any("reach target" in error for error in result.errors)
+
+
 def test_policy_rejects_unsafe_visual_check_predicate():
     plan = _plan(
         {
@@ -222,3 +288,52 @@ def test_policy_rejects_unsafe_visual_check_predicate():
 
     assert not result.ok
     assert any("policy-safe" in error for error in result.errors)
+
+
+def test_policy_accepts_noaction_node():
+    plan = _plan({"type": "NoAction", "reason": "already handled"})
+
+    result = PolicyGuard().check(plan)
+
+    assert result.ok
+
+
+def test_policy_counts_actions_inside_parallel_and_timeout():
+    plan = _plan(
+        {
+            "type": "Parallel",
+            "children": [
+                {
+                    "type": "Timeout",
+                    "timeout_sec": 5.0,
+                    "child": {"type": "Action", "skill": "say", "args": {"text": "one"}},
+                },
+                {
+                    "type": "Sequence",
+                    "children": [
+                        {"type": "Action", "skill": "say", "args": {"text": "two"}},
+                        {"type": "Action", "skill": "say", "args": {"text": "three"}},
+                    ],
+                },
+            ],
+        },
+    )
+
+    result = PolicyGuard().check(plan)
+
+    assert result.ok
+
+
+def test_policy_rejects_wait_budget_inside_timeout():
+    plan = _plan(
+        {
+            "type": "Timeout",
+            "timeout_sec": 60.0,
+            "child": {"type": "Wait", "duration_sec": 31.0},
+        },
+    )
+
+    result = PolicyGuard().check(plan)
+
+    assert not result.ok
+    assert any("wait budget" in error for error in result.errors)

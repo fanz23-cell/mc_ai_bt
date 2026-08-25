@@ -12,7 +12,7 @@ from mc_ai_bt.mission_journal import MissionJournal
 def _mission():
     manager = MissionManager()
     _accepted, _message, mission, event = manager.submit(
-        intent_text="go to kitchen",
+        intent_text="go to test_place",
         source="voice",
         operator_id="user",
         parent_mission_id="",

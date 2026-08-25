@@ -72,6 +72,24 @@ def run_doctor(node, args: argparse.Namespace) -> list[DoctorCheck]:
             detail = name if ready else f"{name} unavailable after {args.timeout_sec:g}s"
             results.append(DoctorCheck(label, ready, detail, "action"))
 
+    if args.require_visual_check:
+        from rclpy.action import ActionClient
+
+        for label, action_type, name in _visual_check_actions():
+            client = ActionClient(node, action_type, name)
+            ready = _wait_for_action(client, timeout_sec=args.timeout_sec)
+            detail = name if ready else f"{name} unavailable after {args.timeout_sec:g}s"
+            results.append(DoctorCheck(label, ready, detail, "action"))
+
+    if args.require_human_confirmation:
+        from rclpy.action import ActionClient
+
+        for label, action_type, name in _human_confirmation_actions():
+            client = ActionClient(node, action_type, name)
+            ready = _wait_for_action(client, timeout_sec=args.timeout_sec)
+            detail = name if ready else f"{name} unavailable after {args.timeout_sec:g}s"
+            results.append(DoctorCheck(label, ready, detail, "action"))
+
     return results
 
 
@@ -147,7 +165,17 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--require-skill-actions",
         action="store_true",
-        help="Also require navigation and animator action servers used by skill adapters.",
+        help="Also require navigation, animator, and embodied action servers used by skill adapters.",
+    )
+    parser.add_argument(
+        "--require-visual-check",
+        action="store_true",
+        help="Also require the mc_multimodal VisualCheck action server.",
+    )
+    parser.add_argument(
+        "--require-human-confirmation",
+        action="store_true",
+        help="Also require the AI-BT human confirmation action server.",
     )
     parser.add_argument(
         "--skip-read-only-calls",
@@ -170,7 +198,10 @@ def _core_services() -> tuple[ServiceSpec, ...]:
         ListResourceLeases,
         PauseMission,
         QueryWorld,
+        ReprioritizeMission,
+        RespondHumanConfirmation,
         ResumeMission,
+        SetPolicyState,
         SubmitTaskIntent,
         UpdateWorldFacts,
     )
@@ -180,8 +211,11 @@ def _core_services() -> tuple[ServiceSpec, ...]:
         ("ai_bt.cancel_mission", CancelMission, "/mc_ai_bt/cancel_mission"),
         ("ai_bt.pause_mission", PauseMission, "/mc_ai_bt/pause_mission"),
         ("ai_bt.resume_mission", ResumeMission, "/mc_ai_bt/resume_mission"),
+        ("ai_bt.reprioritize_mission", ReprioritizeMission, "/mc_ai_bt/reprioritize_mission"),
+        ("ai_bt.respond_human_confirmation", RespondHumanConfirmation, "/mc_ai_bt/respond_human_confirmation"),
         ("ai_bt.list_missions", ListMissions, "/mc_ai_bt/list_missions"),
         ("ai_bt.query_world", QueryWorld, "/mc_ai_bt/query_world"),
+        ("ai_bt.set_policy_state", SetPolicyState, "/mc_ai_bt/set_policy_state"),
         ("world_state.get_snapshot", GetWorldSnapshot, "/mc_world_state/get_snapshot"),
         ("world_state.update_facts", UpdateWorldFacts, "/mc_world_state/update_facts"),
         ("resource_authority.list", ListResourceLeases, "/mc_resource_authority/list"),
@@ -189,13 +223,30 @@ def _core_services() -> tuple[ServiceSpec, ...]:
 
 
 def _skill_actions() -> tuple[ActionSpec, ...]:
-    from mc_one.action import ComeToMe, GoToPlace, PlayAnimation, SimpleMove
+    from mc_one.action import ComeToMe, EmbodiedSkill, GoToPlace, PlayAnimation, SimpleMove
 
     return (
         ("skill.go_to_place", GoToPlace, "/mc_navigation/go_to_place"),
         ("skill.come_to_me", ComeToMe, "/mc_navigation/come_to_me"),
         ("skill.simple_move", SimpleMove, "/mc_navigation/simple_move"),
         ("skill.play_animation", PlayAnimation, "/mc_animator/play"),
+        ("skill.embodied", EmbodiedSkill, "/mc_embodied_skills/execute"),
+    )
+
+
+def _visual_check_actions() -> tuple[ActionSpec, ...]:
+    from mc_one.action import VisualCheck
+
+    return (
+        ("visual.visual_check", VisualCheck, "/mc_multimodal/visual_check"),
+    )
+
+
+def _human_confirmation_actions() -> tuple[ActionSpec, ...]:
+    from mc_one.action import RequestHumanConfirmation
+
+    return (
+        ("human.request_confirmation", RequestHumanConfirmation, "/mc_ai_bt/request_human_confirmation"),
     )
 
 

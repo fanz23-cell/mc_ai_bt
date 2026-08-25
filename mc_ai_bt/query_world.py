@@ -8,10 +8,13 @@ from typing import Any
 from .entity_facts import (
     fact_value,
     find_object_fact,
+    normalise_entity_name,
+    object_fact_key,
     object_name_from_args,
     object_visibility_evidence,
     people_visibility_evidence,
 )
+from .place_predicates import TRI_FALSE, TRI_TRUE, evaluate_place_predicate
 from .visual_check import visual_query_goal_spec
 
 
@@ -38,6 +41,12 @@ class QueryWorldEngine:
             return ("tasks",)
         if _looks_like_safety_query(text):
             return ("safety",)
+        at_place = _extract_at_place_query(text)
+        if at_place:
+            predicate, _args = at_place
+            if predicate == "person_at_place":
+                return ("people", "places", "place_regions")
+            return ("objects", "places", "place_regions")
         visual_goal = visual_query_goal_spec(query_text)
         predicate = str(visual_goal.get("predicate") or "")
         if predicate == "person_visible":
@@ -73,6 +82,11 @@ class QueryWorldEngine:
             return self._answer_current_task(facts)
         if _looks_like_safety_query(text):
             return self._answer_safety(facts)
+
+        at_place = _extract_at_place_query(text)
+        if at_place:
+            predicate, args = at_place
+            return self._answer_at_place_query(facts, predicate, args)
 
         visual_goal = visual_query_goal_spec(query_text)
         predicate = str(visual_goal.get("predicate") or "")
@@ -164,7 +178,14 @@ class QueryWorldEngine:
                 "object_not_visible",
                 CERTAINTY_FALSE,
                 f"I do not currently have reliable visible evidence for {object_name}.",
-                _evidence({"route": "object_query", "object": object_name, "fact": entry, "evidence": evidence}),
+                _evidence(
+                    {
+                        "route": "object_query",
+                        "object": object_name,
+                        "fact": entry,
+                        "evidence": evidence,
+                    }
+                ),
             )
 
         value = fact_value(entry)
@@ -221,6 +242,40 @@ class QueryWorldEngine:
             CERTAINTY_UNKNOWN,
             "I do not have fresh visible-people evidence right now.",
             _evidence({"route": "people_query", "fact": entry, "evidence": evidence}),
+        )
+
+    def _answer_at_place_query(
+        self,
+        facts: dict[str, Any],
+        predicate: str,
+        args: dict[str, Any],
+    ) -> WorldQueryAnswer:
+        result = evaluate_place_predicate(facts, predicate, args)
+        place = str(args.get("place") or "").strip()
+        entity = str(args.get("person_id") or args.get("object_id") or "").strip()
+        label = entity or "that entity"
+        if result.state == TRI_TRUE:
+            return WorldQueryAnswer(
+                True,
+                predicate,
+                CERTAINTY_TRUE,
+                f"Yes. {label} is at {place}.",
+                _evidence({"route": predicate, "args": args, "result": result.__dict__}),
+            )
+        if result.state == TRI_FALSE:
+            return WorldQueryAnswer(
+                True,
+                predicate,
+                CERTAINTY_FALSE,
+                f"No. I have evidence that {label} is not at {place}.",
+                _evidence({"route": predicate, "args": args, "result": result.__dict__}),
+            )
+        return WorldQueryAnswer(
+            True,
+            f"{predicate}_unknown",
+            CERTAINTY_UNKNOWN,
+            f"I do not have reliable place evidence for {label} at {place}.",
+            _evidence({"route": predicate, "args": args, "result": result.__dict__}),
         )
 
     def _answer_safety(self, facts: dict[str, Any]) -> WorldQueryAnswer:
@@ -311,6 +366,64 @@ def _looks_like_safety_query(text: str) -> bool:
         "安全停止",
     )
     return any(phrase in text for phrase in phrases)
+
+
+def _extract_at_place_query(text: str) -> tuple[str, dict[str, Any]] | None:
+    person_patterns = (
+        r"\bis person (?P<entity>[a-z0-9:_-]+) (?:at|in|inside) (?:the )?(?P<place>[a-z0-9 _-]+)$",
+        r"\bis (?P<entity>person:[a-z0-9:_-]+) (?:at|in|inside) (?:the )?(?P<place>[a-z0-9 _-]+)$",
+    )
+    for pattern in person_patterns:
+        match = re.search(pattern, text)
+        if match:
+            return (
+                "person_at_place",
+                {
+                    "person_id": _normalise_person_id(match.group("entity")),
+                    "place": _clean_place(match.group("place")),
+                },
+            )
+
+    object_patterns = (
+        r"\bis object (?P<entity>[a-z0-9:_-]+) (?:at|in|inside) (?:the )?(?P<place>[a-z0-9 _-]+)$",
+        r"\bis (?:the )?(?P<entity>[a-z0-9:_-]+) (?:at|in|inside) (?:the )?(?P<place>[a-z0-9 _-]+)$",
+    )
+    for pattern in object_patterns:
+        match = re.search(pattern, text)
+        if match:
+            entity = match.group("entity")
+            if entity in {"you", "we", "i", "it", "safe", "safety"}:
+                return None
+            return (
+                "object_at_place",
+                {
+                    "object_id": _normalise_object_id(entity),
+                    "place": _clean_place(match.group("place")),
+                },
+            )
+    return None
+
+
+def _normalise_person_id(raw: str) -> str:
+    value = raw.strip()
+    if not value:
+        return ""
+    if value.startswith("person:"):
+        return value
+    return "person:" + normalise_entity_name(value)
+
+
+def _normalise_object_id(raw: str) -> str:
+    value = raw.strip()
+    if not value:
+        return ""
+    if value.startswith("object:"):
+        return value
+    return object_fact_key(value)
+
+
+def _clean_place(raw: str) -> str:
+    return re.sub(r"\b(the|a|an|please)\b", " ", raw).strip(" _-")
 
 
 def _safety_active(value: Any) -> bool | None:

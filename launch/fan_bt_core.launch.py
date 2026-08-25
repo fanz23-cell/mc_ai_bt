@@ -1,5 +1,6 @@
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
+from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
@@ -32,6 +33,16 @@ def generate_launch_description():
                 default_value="",
                 description="Optional JSONL path for mission event snapshots.",
             ),
+            DeclareLaunchArgument(
+                "start_embodied_skills",
+                default_value="true",
+                description="Start the closed-loop embodied skill action server from seattle_lab.",
+            ),
+            DeclareLaunchArgument(
+                "embodied_allow_fake_success",
+                default_value="false",
+                description="Allow mc_embodied_skills to return smoke-test success without a real closed-loop provider.",
+            ),
             Node(
                 package="mc_resource_authority",
                 executable="resource_authority",
@@ -42,6 +53,24 @@ def generate_launch_description():
                 package="mc_world_state",
                 executable="world_state",
                 name="mc_world_state",
+                output="screen",
+            ),
+            Node(
+                package="seattle_lab",
+                executable="mc_embodied_skills",
+                name="mc_embodied_skills",
+                output="screen",
+                condition=IfCondition(LaunchConfiguration("start_embodied_skills")),
+                parameters=[
+                    {
+                        "allow_fake_success": LaunchConfiguration("embodied_allow_fake_success"),
+                    }
+                ],
+            ),
+            Node(
+                package="mc_ai_bt",
+                executable="ai_bt_confirmation",
+                name="mc_ai_bt_human_confirmation",
                 output="screen",
             ),
             Node(

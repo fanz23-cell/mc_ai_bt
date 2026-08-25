@@ -6,7 +6,7 @@ line.
 Local lightweight build:
 
 ```bash
-colcon build --base-paths mc_one mc_resource_authority mc_world_state mc_ai_bt mc_voice_pipeline_legacy --packages-select mc_one mc_resource_authority mc_world_state mc_ai_bt mc_voice_pipeline_legacy --symlink-install --cmake-args -DPython3_EXECUTABLE=/usr/bin/python3
+colcon build --base-paths mc_one mc_multimodal mc_resource_authority mc_world_state mc_ai_bt mc_voice_pipeline_legacy --packages-select mc_one mc_multimodal mc_resource_authority mc_world_state mc_ai_bt mc_voice_pipeline_legacy --symlink-install --cmake-args -DPython3_EXECUTABLE=/usr/bin/python3
 ```
 
 For local Docker images without pushing first, run
@@ -203,7 +203,7 @@ missions are published as startup `TaskStatus` snapshots three times and task
 projection facts are refreshed, without appending new journal events.
 
 During BT execution, `BtExecutor` reports progress at leaf nodes
-(`Action`, `Wait`, `Condition`, `VisualCheck`, `GoalCheck`). `AiBtNode` stores
+(`Action`, `Wait`, `Condition`, `VisualCheck`, `GoalCheck`, `NoAction`). `AiBtNode` stores
 that label in `TaskStatus.active_node` and publishes updated `progress` without
 creating extra lifecycle `TaskEvent` records. This makes multi-step local and
 simulation runs inspectable while keeping the event journal compact.
@@ -219,15 +219,19 @@ The first deterministic query engine answers current-place, current-task,
 simple object-visibility, visible-people, and safety-stop questions from
 `mc_world_state`. Unknown evidence is returned as `CERTAINTY_UNKNOWN`, not made up.
 
-`mc_ai_bt` subscribes to `/mc_world_state/events`. Regular `FACT_UPDATED`
-events are ignored for mission control; safety-stop event types block the
-active mission; replan-worthy event types cancel the current runner, reserve a
-new `plan_version`, clear the old execution id, and run the planning pipeline
-again. Late planner/action results whose identity no longer matches are
-ignored. For `GOAL_EVIDENCE_CHANGED`, a payload with
-`"replan_recommended": false` is treated as no-op. If that payload carries
-`mission_id` and `plan_version`, they must match the current active mission or
-the replan trigger is ignored as stale.
+`mc_ai_bt` subscribes to `/mc_world_state/events`. Every world event first goes
+through `TriggerManager`, which returns one of the frozen decisions:
+`NO_ACTION`, `LOCAL_HANDLED`, `REPLAN`, `PLAN_NEW_MISSION`, or `BLOCKED`.
+Regular `FACT_UPDATED` events are ignored for mission control; safety-stop
+event types block the active mission; replan-worthy event types cancel the
+current runner, reserve a new `plan_version`, clear the old execution id, and
+run the planning pipeline again. Idle social events such as
+`PERSON_APPROACHED` may create a low-priority world-event mission only after
+TriggerManager chooses `PLAN_NEW_MISSION`. Late planner/action results whose
+identity no longer matches are ignored. For `GOAL_EVIDENCE_CHANGED`, a payload
+with `"replan_recommended": false` is handled locally without replanning. If
+that payload carries `mission_id` and `plan_version`, they must match the
+current active mission or the replan trigger is ignored as stale.
 
 When the legacy voice node has `ai_bt_route_final_utterances=true`, its
 conservative world-query classifier calls this service for questions such as
@@ -242,16 +246,24 @@ Implemented BT runtime nodes:
 - `Action`
 - `Wait`
 - `Retry`
+- `Parallel`
+- `Timeout`
 - `Condition`
 - `VisualCheck`
 - `GoalCheck`
+- `NoAction`
 
 `Condition`, `VisualCheck`, and `GoalCheck` use the shared `GoalChecker` and
 preserve `TRUE/FALSE/UNKNOWN`: `UNKNOWN` blocks the mission instead of being
-treated as ordinary failure. The current VisualCheck implementation is
-world-state-backed and limited to `object_visible` and `person_visible`; open
-ended scene questions remain blocked until a real visual checker/VLM service is
-wired.
+treated as ordinary failure. `VisualCheck` first uses structured world-state
+evidence for recognized object/person predicates, then falls back to the
+configured `mc_multimodal` visual-check action for concise true/false visual
+queries.
+
+Structured `GoalCheck` also verifies `person_at_place` and `object_at_place`
+through the same PlaceRegion evaluator used by `mc_world_state`, plus explicit
+`person_following` facts from execution or world state. Missing evidence stays
+`UNKNOWN`.
 
 Planner context is built by `ContextBuilder` before planning. It includes the
 incoming mission, caller context, a bounded world snapshot, current mission
@@ -260,10 +272,11 @@ the injectable JSON-planner interface for the later production LLM route, while
 the node still defaults to `BootstrapPlanner`.
 
 After JSON schema validation, `PolicyGuard` enforces robot execution policy:
-bounded BT nodes, sequential multi-step embodied actions, capped physical/base/
+bounded BT nodes, bounded multi-step embodied actions, capped physical/base/
 body/VisualCheck counts, bounded wait/retry budget, conservative `simple_move`
 ranges, bounded `look_at` directions/holds, bounded `point_at` target forms,
-short `say` text, and alignment between structured goals and the
+short `say` text, static rejection of overlapping skill resources in `Parallel`
+branches, and alignment between structured goals and the
 physical action that is supposed to satisfy them. Current defaults allow up to
 32 BT nodes, 12 actions, 4 physical actions, 3 base actions, 3 body actions,
 and 4 VisualCheck nodes per plan.

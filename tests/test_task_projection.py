@@ -21,7 +21,7 @@ def _mission(mission_id: str, state: int, *, priority: int = 1) -> Mission:
             {
                 "type": "structured",
                 "predicate": "robot_at_place",
-                "args": {"name": "kitchen"},
+                "args": {"name": "test_place"},
                 "verification": {"mode": "world_state_or_nav_result"},
             }
         ),
@@ -60,7 +60,7 @@ def test_task_projection_includes_compact_goal_summary():
     assert active.value["goal"] == {
         "type": "structured",
         "predicate": "robot_at_place",
-        "args": {"name": "kitchen"},
+        "args": {"name": "test_place"},
         "verification": {"mode": "world_state_or_nav_result"},
     }
 
@@ -68,19 +68,19 @@ def test_task_projection_includes_compact_goal_summary():
 def test_task_projection_normalizes_visual_goal_for_world_events():
     running = Mission(
         identity=Identity(mission_id="running", plan_version=1, execution_id="exec"),
-        intent_text="find cup",
+        intent_text="find test_object",
         source="test",
         operator_id="user",
         priority=1,
         allow_queue=True,
         context_json="{}",
         state=STATE_RUNNING,
-        title="find cup",
+        title="find test_object",
         status_text="running",
         goal_spec_json=json.dumps(
             {
                 "type": "visual",
-                "query": "do you see the cup?",
+                "query": "do you see the test_object?",
                 "verification": {"mode": "world_state_or_visual_check"},
             }
         ),
@@ -91,6 +91,6 @@ def test_task_projection_normalizes_visual_goal_for_world_events():
 
     assert active.value["goal"]["type"] == "structured"
     assert active.value["goal"]["predicate"] == "object_visible"
-    assert active.value["goal"]["args"] == {"name": "cup"}
+    assert active.value["goal"]["args"] == {"name": "test_object"}
     assert active.value["goal"]["original_type"] == "visual"
-    assert active.value["goal"]["query"] == "do you see the cup?"
+    assert active.value["goal"]["query"] == "do you see the test_object?"

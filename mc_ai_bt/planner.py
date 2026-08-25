@@ -9,23 +9,7 @@ from .skill_registry import SkillRegistry
 from .visual_check import visual_check_goal_spec
 
 
-_CHINESE_PLACE_ALIASES = {
-    "厨房": "kitchen",
-    "客厅": "living_room",
-    "门口": "door",
-    "入口": "entrance",
-    "办公室": "office",
-    "实验室": "lab",
-}
-
-_CHINESE_OBJECT_ALIASES = {
-    "杯子": "cup",
-    "水杯": "cup",
-    "马克杯": "cup",
-    "人": "person",
-    "某人": "person",
-    "一个人": "person",
-}
+PERSON_WORDS = {"person", "people", "someone", "anyone", "人", "某人", "一个人"}
 
 
 class Planner(Protocol):
@@ -96,6 +80,16 @@ class BootstrapPlanner:
                 "skill": "point_at",
                 "args": point_args,
                 "timeout_sec": 120,
+            }
+
+        embodied = self._extract_embodied_skill(lowered)
+        if embodied:
+            skill, args = embodied
+            return {
+                "type": "Action",
+                "skill": skill,
+                "args": args,
+                "timeout_sec": 180,
             }
 
         place = self._extract_place(lowered)
@@ -269,6 +263,24 @@ class BootstrapPlanner:
         return {}
 
     @staticmethod
+    def _extract_embodied_skill(lowered: str) -> tuple[str, dict[str, Any]] | None:
+        reach = re.search(r"\breach (?:to|for) (?:the )?(?P<object>[a-z0-9 _-]+)$", lowered)
+        if reach:
+            return "reach_to", {"object": _clean_point_target(reach.group("object"))}
+        if "follow me" in lowered or "跟着我" in lowered or "跟我走" in lowered:
+            return "follow_entity", {"entity": "interaction_owner"}
+        guide = re.search(r"\bguide (?:me|person|someone)? ?(?:to )(?P<place>[a-z0-9 _-]+)$", lowered)
+        if guide:
+            return "guide_entity_to_place", {"entity": "interaction_owner", "place": _slug(guide.group("place"))}
+        chinese_guide = re.search(r"(?:带人去|带我去|引导.*去)(?P<place>[\u4e00-\u9fffA-Za-z0-9 _-]+)$", lowered)
+        if chinese_guide:
+            return "guide_entity_to_place", {
+                "entity": "interaction_owner",
+                "place": _normalise_place(chinese_guide.group("place")),
+            }
+        return None
+
+    @staticmethod
     def _extract_visual_query(lowered: str) -> str:
         patterns = (
             r"\bfind (?P<target>[a-z0-9 _-]+)$",
@@ -297,7 +309,7 @@ class BootstrapPlanner:
             target = _normalise_object(match.group("target"))
             if not target:
                 return ""
-            if target == "person":
+            if target in PERSON_WORDS:
                 return "do you see anyone?"
             return f"do you see the {target}?"
         return ""
@@ -395,10 +407,18 @@ def build_planner_messages(
             "The JSON object must use schema mc_ai_bt.plan.v1.",
             "Top-level keys: schema, root, goal_spec, context_json.",
             "root must be a Behavior Tree made only from executable node types.",
-            "Executable node types: Sequence, Fallback, Action, Wait, Retry, Condition, GoalCheck, VisualCheck.",
-            "VisualCheck is currently limited to object/person visibility queries backed by world state.",
-            "Unsupported VisualCheck queries block as UNKNOWN; do not use VisualCheck for open-ended scene description.",
-            "Visual goal_spec is also limited to object/person visibility queries.",
+            (
+                "Executable node types: Sequence, Fallback, Parallel, Timeout, Action, Wait, Retry, "
+                "Condition, GoalCheck, VisualCheck, NoAction."
+            ),
+            "Parallel children must be independently safe and must not require overlapping skill resources.",
+            "Timeout wraps exactly one child and must set timeout_sec in seconds.",
+            "NoAction is only for an explicit already-satisfied/no-op plan with a short reason.",
+            (
+                "VisualCheck must be a concise true/false visual query. It may use structured world-state "
+                "evidence or the configured visual checker; UNKNOWN blocks instead of being guessed."
+            ),
+            "Do not use VisualCheck for unrestricted scene description or hidden-state inference.",
             (
                 "look_at may use only direction={front,front_up,front_down,left,left_up,left_down,"
                 "right,right_up,right_down} and optional hold seconds."
@@ -534,11 +554,42 @@ def _goal_spec_for_action(action: dict, text: str) -> dict[str, Any]:
             "verification": {"mode": "action_result"},
             "summary": text,
         }
+    if skill == "reach_to":
+        return {
+            "type": "structured",
+            "predicate": "reach_completed",
+            "args": args,
+            "verification": {"mode": "action_result"},
+            "summary": text,
+        }
+    if skill == "follow_entity":
+        return {
+            "type": "structured",
+            "predicate": "entity_following",
+            "args": args,
+            "verification": {"mode": "world_state_or_action_result"},
+            "summary": text,
+        }
+    if skill == "guide_entity_to_place":
+        return {
+            "type": "structured",
+            "predicate": "entity_at_place",
+            "args": args,
+            "verification": {"mode": "world_state_or_action_result"},
+            "summary": text,
+        }
     return {}
 
 
 def _slug(raw: str) -> str:
     return re.sub(r"[^a-z0-9_-]+", "_", raw.strip().lower()).strip("_")
+
+
+def _generic_label(raw: str) -> str:
+    cleaned = re.sub(r"\s+", " ", str(raw or "").strip())
+    if re.search(r"[\u4e00-\u9fff]", cleaned):
+        return cleaned.replace(" ", "_")
+    return _slug(cleaned)
 
 
 def _split_compound_intent(lowered: str) -> list[str]:
@@ -573,16 +624,12 @@ def _clean_point_target(raw: str) -> str:
 def _normalise_place(raw: str) -> str:
     cleaned = re.sub(r"(这里|那里|那边|这边|一下|吧|请)", "", raw)
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" _-")
-    if cleaned in _CHINESE_PLACE_ALIASES:
-        return _CHINESE_PLACE_ALIASES[cleaned]
-    return _slug(cleaned)
+    return _generic_label(cleaned)
 
 
 def _normalise_object(raw: str) -> str:
     cleaned = re.sub(r"(这里|那里|那边|这边|一下|吧|请)", "", raw)
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" _-")
-    if cleaned in _CHINESE_OBJECT_ALIASES:
-        return _CHINESE_OBJECT_ALIASES[cleaned]
     return cleaned
 
 

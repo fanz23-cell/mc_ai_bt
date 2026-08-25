@@ -3,19 +3,58 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from .skill_registry import SkillRegistry
+from .skill_registry import GENERIC_SKILL_NAMES, SkillRegistry
 
 
 ALLOWED_TOP_LEVEL_KEYS = {"schema", "root", "goal_spec", "context_json"}
-PHYSICAL_SKILLS = {"go_to_place", "come_to_me", "simple_move", "play_animation", "look_at", "point_at"}
-BASE_SKILLS = {"go_to_place", "come_to_me", "simple_move"}
-BODY_SKILLS = {"play_animation", "look_at", "point_at"}
-POLICY_ENABLED_SKILLS = {
-    "say",
+PHYSICAL_SKILLS = {
     "go_to_place",
     "come_to_me",
     "simple_move",
     "play_animation",
+    "look_at",
+    "point_at",
+    "look_at_static",
+    "track_entity",
+    "track_frame",
+    "track_with_gaze",
+    "search_for_entity",
+    "reach_to",
+    "align_axis",
+    "move_along_axis",
+    "maintain_distance",
+    "hold_pose",
+    "wait_for_contact",
+    "detect_contact",
+    "oscillate",
+    "retract",
+    "follow_entity",
+    "guide_entity_to_place",
+}
+BASE_SKILLS = {"go_to_place", "come_to_me", "simple_move", "maintain_distance", "follow_entity", "guide_entity_to_place"}
+BODY_SKILLS = {
+    "play_animation",
+    "look_at",
+    "point_at",
+    "look_at_static",
+    "track_entity",
+    "track_frame",
+    "track_with_gaze",
+    "search_for_entity",
+    "reach_to",
+    "align_axis",
+    "move_along_axis",
+    "hold_pose",
+    "wait_for_contact",
+    "detect_contact",
+    "oscillate",
+    "retract",
+}
+CONTINUOUS_BASE_SKILLS = {"maintain_distance", "follow_entity", "guide_entity_to_place"}
+POLICY_ENABLED_SKILLS = GENERIC_SKILL_NAMES | {
+    "request_human_confirmation",
+    "come_to_me",
+    "simple_move",
     "look_at",
     "point_at",
 }
@@ -34,6 +73,8 @@ POINT_AT_ALLOWED_KEYS = {
     "arm",
     "object",
     "target",
+    "entity",
+    "entity_id",
     "place",
     "x",
     "y",
@@ -48,7 +89,16 @@ POINT_AT_ALLOWED_KEYS = {
     "place_z",
     "duration",
 }
-POINT_AT_FRAMES = {"torso", "body", "body_ish", "chest_camera", "chest_camera_link", "camera", "base", "base_link"}
+POINT_AT_FRAMES = {
+    "torso",
+    "body",
+    "body_ish",
+    "chest_camera",
+    "chest_camera_link",
+    "camera",
+    "base",
+    "base_link",
+}
 
 
 @dataclass(frozen=True)
@@ -77,6 +127,8 @@ class PolicyLimits:
     max_point_abs_m: float = 3.0
     min_point_z_m: float = -0.2
     max_point_z_m: float = 2.2
+    max_confirmation_prompt_chars: int = 240
+    max_confirmation_timeout_sec: float = 300.0
 
 
 class PolicyGuard:
@@ -126,7 +178,7 @@ class PolicyGuard:
             return
         stats.total_nodes += retry_multiplier
         node_type = node.get("type")
-        if node_type in {"Sequence", "Fallback"}:
+        if node_type in {"Sequence", "Fallback", "Parallel"}:
             for idx, child in enumerate(node.get("children", []) or []):
                 self._walk(
                     child,
@@ -137,7 +189,10 @@ class PolicyGuard:
                 )
             return
         if node_type == "Retry":
-            max_attempts = int(node.get("max_attempts", 1) or 1)
+            try:
+                max_attempts = int(node.get("max_attempts", 1) or 1)
+            except (TypeError, ValueError):
+                max_attempts = 1
             stats.retry_product *= max_attempts
             child = node.get("child")
             self._walk(
@@ -147,6 +202,18 @@ class PolicyGuard:
                 errors,
                 retry_multiplier=retry_multiplier * max_attempts,
             )
+            return
+        if node_type == "Timeout":
+            child = node.get("child")
+            self._walk(
+                child,
+                f"{path}.child",
+                stats,
+                errors,
+                retry_multiplier=retry_multiplier,
+            )
+            return
+        if node_type == "NoAction":
             return
         if node_type == "Wait":
             duration = float(node.get("duration_sec", 0.0) or 0.0)
@@ -189,7 +256,7 @@ class PolicyGuard:
         if skill in PHYSICAL_SKILLS:
             stats.physical_actions += retry_multiplier
             stats.physical_skill_counts[skill] = stats.physical_skill_counts.get(skill, 0) + retry_multiplier
-        if skill in BASE_SKILLS:
+        if skill in BASE_SKILLS or skill in CONTINUOUS_BASE_SKILLS:
             stats.base_actions += retry_multiplier
         if skill in BODY_SKILLS:
             stats.body_actions += retry_multiplier
@@ -201,6 +268,8 @@ class PolicyGuard:
             text = str(args.get("text") or "")
             if len(text) > self._limits.max_say_chars:
                 errors.append(f"{path}.args.text exceeds {self._limits.max_say_chars} chars")
+        elif skill == "request_human_confirmation":
+            self._check_human_confirmation(args, path, errors)
         elif skill == "simple_move":
             self._check_simple_move(args, path, errors)
         elif skill == "go_to_place":
@@ -216,6 +285,26 @@ class PolicyGuard:
             self._check_look_at(args, path, errors)
         elif skill == "point_at":
             self._check_point_at(args, path, errors)
+        elif skill in {"locate_entity", "track_entity", "search_for_entity", "get_pose"}:
+            self._check_entity_target(args, path, errors, skill=skill)
+        elif skill in {"look_at_static", "track_with_gaze"}:
+            self._check_look_or_track(args, path, errors, skill=skill)
+        elif skill == "track_frame":
+            self._check_track_frame(args, path, errors)
+        elif skill == "reach_to":
+            self._check_reach_to(args, path, errors)
+        elif skill == "check_relation":
+            self._check_relation(args, path, errors)
+        elif skill in {"align_axis", "move_along_axis"}:
+            self._check_axis_skill(args, path, errors, skill=skill)
+        elif skill in {"hold_pose", "wait_for_contact", "detect_contact", "oscillate", "retract"}:
+            self._check_arm_generic(args, path, errors, skill=skill)
+        elif skill in {"follow_entity", "maintain_distance"}:
+            self._check_entity_target(args, path, errors, skill=skill)
+        elif skill == "guide_entity_to_place":
+            self._check_guide_entity_to_place(args, path, errors)
+        elif skill == "wait_for_participant":
+            self._check_wait_for_participant(args, path, errors)
         elif skill not in POLICY_ENABLED_SKILLS:
             errors.append(f"{path}.skill is registered but not policy-enabled yet: {skill}")
 
@@ -237,6 +326,30 @@ class PolicyGuard:
             errors.append(f"{path}.args.value exceeds {self._limits.max_turn_deg:g}deg")
         elif action not in {"forward", "backward", "left", "right"}:
             errors.append(f"{path}.args.action is not allowed: {action!r}")
+
+    def _check_human_confirmation(
+        self,
+        args: dict[str, Any],
+        path: str,
+        errors: list[str],
+    ) -> None:
+        prompt = str(args.get("prompt") or args.get("text") or "")
+        if not prompt.strip():
+            errors.append(f"{path}.args.prompt must be non-empty")
+        if len(prompt) > self._limits.max_confirmation_prompt_chars:
+            errors.append(
+                f"{path}.args.prompt exceeds {self._limits.max_confirmation_prompt_chars} chars"
+            )
+        role = str(args.get("required_role") or "operator").strip()
+        if role not in {"operator", "owner", "admin", "safety_operator"}:
+            errors.append(f"{path}.args.required_role is not allowed: {role!r}")
+        timeout = _optional_float(args, "timeout_sec", path, errors)
+        if timeout is not None and (
+            timeout <= 0.0 or timeout > self._limits.max_confirmation_timeout_sec
+        ):
+            errors.append(
+                f"{path}.args.timeout_sec must be in (0, {self._limits.max_confirmation_timeout_sec:g}]"
+            )
 
     def _check_look_at(
         self,
@@ -271,6 +384,8 @@ class PolicyGuard:
             errors.append(f"{path}.args.frame is not allowed: {frame!r}")
 
         object_name = _clean_label(args.get("object") or args.get("target"))
+        if not object_name:
+            object_name = _clean_label(args.get("entity") or args.get("entity_id"))
         place_name = _clean_label(args.get("place"))
         has_xyz = all(key in args for key in ("x", "y", "z"))
         partial_xyz = any(key in args for key in ("x", "y", "z")) and not has_xyz
@@ -319,6 +434,99 @@ class PolicyGuard:
                 f"{path}.args.duration must be in [0, {self._limits.max_animation_duration_sec:g}]"
             )
 
+    def _check_track_frame(self, args: dict[str, Any], path: str, errors: list[str]) -> None:
+        frame = _clean_label(args.get("frame") or args.get("target_frame"))
+        if not frame or len(frame) > 128:
+            errors.append(f"{path}.args.frame must be a non-empty frame <= 128 chars")
+
+    def _check_reach_to(self, args: dict[str, Any], path: str, errors: list[str]) -> None:
+        arm = str(args.get("arm") or "right").strip().lower()
+        if arm not in {"left", "right"}:
+            errors.append(f"{path}.args.arm must be 'left' or 'right'")
+        target_count = _embodied_target_count(args)
+        if target_count != 1:
+            errors.append(f"{path}.args must specify exactly one reach target")
+        if all(key in args for key in ("x", "y", "z")):
+            for key in ("x", "y", "z"):
+                _required_float(args, key, path, errors)
+
+    def _check_entity_target(
+        self,
+        args: dict[str, Any],
+        path: str,
+        errors: list[str],
+        *,
+        skill: str,
+    ) -> None:
+        target = _clean_label(
+            args.get("entity")
+            or args.get("entity_id")
+            or args.get("target")
+            or args.get("object")
+            or args.get("person")
+            or args.get("person_id")
+            or args.get("frame")
+        )
+        if not target or len(target) > 128:
+            errors.append(f"{path}.args target for {skill} must be non-empty and <= 128 chars")
+
+    def _check_look_or_track(self, args: dict[str, Any], path: str, errors: list[str], *, skill: str) -> None:
+        has_direction = bool(_clean_label(args.get("direction")))
+        has_frame = bool(_clean_label(args.get("frame") or args.get("target_frame")))
+        has_entity = any(
+            _clean_label(args.get(key))
+            for key in ("entity", "entity_id", "target", "object", "person", "person_id")
+        )
+        has_xyz = all(key in args for key in ("x", "y", "z"))
+        if sum(bool(item) for item in (has_direction, has_frame, has_entity, has_xyz)) != 1:
+            errors.append(f"{path}.args for {skill} must specify exactly one direction/frame/entity/x-y-z target")
+        if has_direction and str(args.get("direction") or "").strip().lower() not in LOOK_AT_DIRECTIONS:
+            errors.append(f"{path}.args.direction is not allowed: {args.get('direction')!r}")
+        if has_xyz:
+            for key in ("x", "y", "z"):
+                _required_float(args, key, path, errors)
+
+    def _check_relation(self, args: dict[str, Any], path: str, errors: list[str]) -> None:
+        relation = _clean_label(args.get("relation") or args.get("predicate"))
+        if not relation or len(relation) > 128:
+            errors.append(f"{path}.args.relation must be non-empty and <= 128 chars")
+
+    def _check_axis_skill(self, args: dict[str, Any], path: str, errors: list[str], *, skill: str) -> None:
+        arm = str(args.get("arm") or "right").strip().lower()
+        if arm not in {"left", "right"}:
+            errors.append(f"{path}.args.arm must be 'left' or 'right'")
+        axis = str(args.get("axis") or "").strip().lower()
+        if axis not in {"x", "y", "z"}:
+            errors.append(f"{path}.args.axis must be x, y, or z")
+        if skill == "align_axis" and _embodied_target_count(args) != 1:
+            errors.append(f"{path}.args for align_axis must specify exactly one target")
+        if skill == "move_along_axis":
+            distance = _optional_float(args, "distance_m", path, errors)
+            if distance is None:
+                errors.append(f"{path}.args.distance_m is required")
+
+    def _check_arm_generic(self, args: dict[str, Any], path: str, errors: list[str], *, skill: str) -> None:
+        arm = str(args.get("arm") or "right").strip().lower()
+        if arm not in {"left", "right"}:
+            errors.append(f"{path}.args.arm must be 'left' or 'right'")
+        if skill not in {"retract"}:
+            target_count = _embodied_target_count(args)
+            if target_count != 1:
+                errors.append(f"{path}.args for {skill} must specify exactly one target")
+        for key in ("duration_sec", "min_duration_sec", "extent_m", "cycles"):
+            _optional_float(args, key, path, errors)
+
+    def _check_guide_entity_to_place(self, args: dict[str, Any], path: str, errors: list[str]) -> None:
+        place = _clean_label(args.get("place") or args.get("place_name") or args.get("name"))
+        if not place or len(place) > 64:
+            errors.append(f"{path}.args.place must be non-empty and <= 64 chars")
+        self._check_entity_target(args, path, errors, skill="guide_entity_to_place")
+
+    def _check_wait_for_participant(self, args: dict[str, Any], path: str, errors: list[str]) -> None:
+        participant = _clean_label(args.get("participant") or args.get("role") or args.get("entity"))
+        if participant and len(participant) > 128:
+            errors.append(f"{path}.args.participant must be <= 128 chars")
+
     def _check_totals(self, stats: "_Stats", errors: list[str]) -> None:
         limits = self._limits
         if stats.total_nodes > limits.max_total_nodes:
@@ -358,6 +566,16 @@ class PolicyGuard:
             "robot_near_interaction_owner": ("come_to_me",),
             "relative_motion_completed": ("simple_move",),
             "animation_played": ("play_animation", "look_at", "point_at"),
+            "reach_completed": ("reach_to",),
+            "entity_following": ("follow_entity",),
+            "entity_at_place": ("guide_entity_to_place",),
+            "contact_detected": ("wait_for_contact", "detect_contact"),
+            "axis_aligned": ("align_axis",),
+            "axis_motion_completed": ("move_along_axis",),
+            "distance_maintained": ("maintain_distance",),
+            "pose_held": ("hold_pose",),
+            "oscillation_completed": ("oscillate",),
+            "retracted": ("retract",),
         }.get(predicate)
         if expected and not any(skill in stats.physical_skill_counts for skill in expected):
             errors.append(
@@ -410,3 +628,14 @@ def _required_float(
 
 def _clean_label(value: Any) -> str:
     return str(value or "").strip()
+
+
+def _embodied_target_count(args: dict[str, Any]) -> int:
+    has_xyz = all(key in args for key in ("x", "y", "z"))
+    partial_xyz = any(key in args for key in ("x", "y", "z")) and not has_xyz
+    if partial_xyz:
+        return 0
+    return sum(
+        bool(_clean_label(args.get(key)))
+        for key in ("entity", "entity_id", "object", "target", "person", "person_id", "place", "frame")
+    ) + int(has_xyz)

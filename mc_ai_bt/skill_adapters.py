@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from threading import Event
@@ -9,7 +10,14 @@ from time import monotonic
 from typing import Any, Iterator
 
 from action_msgs.msg import GoalStatus
-from mc_one.action import ComeToMe, GoToPlace, PlayAnimation, SimpleMove
+from mc_one.action import (
+    ComeToMe,
+    EmbodiedSkill,
+    GoToPlace,
+    PlayAnimation,
+    RequestHumanConfirmation,
+    SimpleMove,
+)
 from mc_one.msg import AiBtIdentity, Utterance
 from rclpy.action import ActionClient
 from rclpy.node import Node
@@ -21,6 +29,30 @@ from .resource_client import ResourceLeaseClient
 from .ros_identity import empty_identity_msg, identity_to_msg
 from .world_facts import world_fact_updates_for_execution
 from .world_state_client import WorldStateWriter
+
+
+EMBODIED_SKILLS = {
+    "locate_entity",
+    "track_entity",
+    "track_frame",
+    "get_pose",
+    "check_relation",
+    "search_for_entity",
+    "look_at_static",
+    "track_with_gaze",
+    "reach_to",
+    "align_axis",
+    "move_along_axis",
+    "maintain_distance",
+    "hold_pose",
+    "wait_for_contact",
+    "detect_contact",
+    "oscillate",
+    "retract",
+    "follow_entity",
+    "guide_entity_to_place",
+    "wait_for_participant",
+}
 
 
 @dataclass(frozen=True)
@@ -56,6 +88,12 @@ class RosSkillExecutor:
         self._come_to_me = ActionClient(node, ComeToMe, "/mc_navigation/come_to_me")
         self._simple_move = ActionClient(node, SimpleMove, "/mc_navigation/simple_move")
         self._play_animation = ActionClient(node, PlayAnimation, "/mc_animator/play")
+        self._embodied_skill = ActionClient(node, EmbodiedSkill, "/mc_embodied_skills/execute")
+        self._human_confirmation = ActionClient(
+            node,
+            RequestHumanConfirmation,
+            "/mc_ai_bt/request_human_confirmation",
+        )
         self._current_lock = threading.Lock()
         self._current_goal_handle: Any = None
 
@@ -84,6 +122,8 @@ class RosSkillExecutor:
     ) -> ExecutionResult:
         if name == "say":
             return self._say(args)
+        if name == "request_human_confirmation":
+            return self._request_human_confirmation(args, cancel_event, timeout_sec=timeout_sec)
         if name == "go_to_place":
             goal = GoToPlace.Goal()
             goal.name = str(args.get("name") or args.get("place") or "").strip()
@@ -182,7 +222,154 @@ class RosSkillExecutor:
                 cancel_event,
                 timeout_sec=timeout_sec,
             )
+        if name in EMBODIED_SKILLS:
+            return self._run_embodied_skill(name, args, cancel_event, timeout_sec=timeout_sec)
         return ExecutionResult(False, f"unsupported skill: {name}")
+
+    def _request_human_confirmation(
+        self,
+        args: dict[str, Any],
+        cancel_event: Event | None,
+        *,
+        timeout_sec: float | None = None,
+    ) -> ExecutionResult:
+        if not _action_server_ready(self._human_confirmation, timeout_sec=1.0):
+            return ExecutionResult(False, "human confirmation action server is not ready", blocked=True)
+        prompt = str(args.get("prompt") or args.get("text") or "").strip()
+        if not prompt:
+            return ExecutionResult(False, "human confirmation prompt is empty")
+        goal = RequestHumanConfirmation.Goal()
+        goal.identity = self._lease_identity_msg()
+        goal.request_id = str(args.get("request_id") or _confirmation_request_id(goal.identity))
+        goal.prompt = prompt
+        context = args.get("context_json", args.get("context", {}))
+        goal.context_json = _json_text(context)
+        goal.required_role = str(args.get("required_role") or "operator").strip()
+        goal.timeout_sec = float(timeout_sec or args.get("timeout_sec") or 30.0)
+
+        ok, goal_handle_or_message = _wait_future(
+            self._human_confirmation.send_goal_async(goal),
+            timeout_sec=5.0,
+            cancel_event=cancel_event,
+        )
+        if not ok:
+            return ExecutionResult(False, f"human confirmation goal send failed: {goal_handle_or_message}")
+        goal_handle = goal_handle_or_message
+        if not getattr(goal_handle, "accepted", False):
+            return ExecutionResult(False, "human confirmation goal rejected", blocked=True)
+
+        with self._current_lock:
+            self._current_goal_handle = goal_handle
+        try:
+            ok, wrapped_result_or_message = _wait_future(
+                goal_handle.get_result_async(),
+                timeout_sec=max(0.1, goal.timeout_sec + 2.0),
+                cancel_event=cancel_event,
+                on_cancel=lambda: _cancel_goal(goal_handle),
+            )
+            if not ok:
+                return ExecutionResult(False, f"human confirmation result failed: {wrapped_result_or_message}")
+            wrapped = wrapped_result_or_message
+            result = getattr(wrapped, "result", None)
+            decision = int(getattr(result, "decision", 0))
+            facts = {
+                "human_confirmation": {
+                    "request_id": goal.request_id,
+                    "decision": decision,
+                    "approved": decision == RequestHumanConfirmation.Goal.DECISION_APPROVED,
+                    "responder_id": str(getattr(result, "responder_id", "") or ""),
+                    "reason": str(getattr(result, "reason", "") or ""),
+                    "required_role": goal.required_role,
+                }
+            }
+            if decision == RequestHumanConfirmation.Goal.DECISION_APPROVED:
+                execution = ExecutionResult(True, "human confirmation approved", facts)
+                self._publish_success_facts(execution.facts)
+                return execution
+            return ExecutionResult(
+                False,
+                f"human confirmation {_confirmation_decision_name(decision)}",
+                facts,
+                blocked=True,
+            )
+        finally:
+            with self._current_lock:
+                if self._current_goal_handle is goal_handle:
+                    self._current_goal_handle = None
+
+    def _run_embodied_skill(
+        self,
+        skill_name: str,
+        args: dict[str, Any],
+        cancel_event: Event | None,
+        *,
+        timeout_sec: float | None = None,
+    ) -> ExecutionResult:
+        if not _action_server_ready(self._embodied_skill, timeout_sec=1.0):
+            return ExecutionResult(False, "embodied skill action server is not ready")
+        goal = EmbodiedSkill.Goal()
+        goal.identity = self._lease_identity_msg()
+        goal.skill_name = skill_name
+        goal.args_json = json.dumps(_embodied_public_args(args), sort_keys=True, separators=(",", ":"))
+        goal.timeout_sec = float(timeout_sec or args.get("timeout_sec") or 120.0)
+        goal.expected_schema_version = "mc_embodied_skills.v1"
+        goal.parent_lease_id = str(args.get("parent_lease_id") or "")
+        goal.resource_scope_id = str(args.get("resource_scope_id") or "")
+        inherited = (
+            args.get("inherited_lease_ids")
+            if isinstance(args.get("inherited_lease_ids"), list)
+            else []
+        )
+        goal.inherited_lease_ids = [str(item) for item in inherited]
+        resources = (
+            args.get("inherited_resources")
+            if isinstance(args.get("inherited_resources"), list)
+            else []
+        )
+        goal.inherited_resources = [str(item) for item in resources]
+
+        ok, goal_handle_or_message = _wait_future(
+            self._embodied_skill.send_goal_async(goal),
+            timeout_sec=5.0,
+            cancel_event=cancel_event,
+        )
+        if not ok:
+            return ExecutionResult(False, f"{skill_name} goal send failed: {goal_handle_or_message}")
+        goal_handle = goal_handle_or_message
+        if not getattr(goal_handle, "accepted", False):
+            return ExecutionResult(False, f"{skill_name} goal rejected")
+
+        with self._current_lock:
+            self._current_goal_handle = goal_handle
+        try:
+            ok, wrapped_result_or_message = _wait_future(
+                goal_handle.get_result_async(),
+                timeout_sec=goal.timeout_sec,
+                cancel_event=cancel_event,
+                on_cancel=lambda: _cancel_goal(goal_handle),
+            )
+            if not ok:
+                return ExecutionResult(False, f"{skill_name} result failed: {wrapped_result_or_message}")
+            wrapped = wrapped_result_or_message
+            status = int(getattr(wrapped, "status", GoalStatus.STATUS_UNKNOWN))
+            result = getattr(wrapped, "result", None)
+            message = str(getattr(result, "message", "") or _status_name(status))
+            skill_status = int(getattr(result, "status", EmbodiedSkill.Goal.STATUS_UNKNOWN))
+            success = bool(getattr(result, "success", False))
+            if status != GoalStatus.STATUS_SUCCEEDED or not success:
+                return ExecutionResult(
+                    False,
+                    f"{skill_name} blocked/failed: {message}",
+                    blocked=_is_blocked(skill_status),
+                )
+            facts = _loads_evidence_json(str(getattr(result, "evidence_json", "") or ""))
+            execution = ExecutionResult(True, message or f"{skill_name} succeeded", facts)
+            self._publish_success_facts(execution.facts)
+            return execution
+        finally:
+            with self._current_lock:
+                if self._current_goal_handle is goal_handle:
+                    self._current_goal_handle = None
 
     def _play_animation_skill(
         self,
@@ -272,29 +459,7 @@ class RosSkillExecutor:
             return ExecutionResult(False, f"{skill_name} action server is not ready")
         if cancel_event is not None and cancel_event.is_set():
             return ExecutionResult(False, "mission canceled")
-
-        identity = self._lease_identity_msg()
-        lease = self._leases.acquire(
-            resources=binding.resources,
-            reason=f"mc_ai_bt skill: {skill_name}",
-            timeout_sec=3.0,
-            identity=identity,
-        )
-        if not lease.success:
-            return ExecutionResult(False, f"resource lease denied: {lease.message}")
-
-        renew_stop, renew_thread = self._start_lease_renewal(lease.lease_id, identity)
-        try:
-            return self._send_and_wait(skill_name, binding, goal, cancel_event)
-        finally:
-            renew_stop.set()
-            if renew_thread is not None:
-                renew_thread.join(timeout=0.2)
-            self._leases.release(
-                lease.lease_id,
-                reason=f"{skill_name} complete",
-                identity=identity,
-            )
+        return self._send_and_wait(skill_name, binding, goal, cancel_event)
 
     def _start_lease_renewal(
         self,
@@ -365,7 +530,11 @@ class RosSkillExecutor:
                 return ExecutionResult(False, f"{skill_name} ended with {_status_name(status)}: {message}")
             if not success_field:
                 return ExecutionResult(False, f"{skill_name} result was unsuccessful: {message}")
-            execution = ExecutionResult(True, message or f"{skill_name} succeeded", dict(binding.success_facts))
+            execution = ExecutionResult(
+                True,
+                message or f"{skill_name} succeeded",
+                dict(binding.success_facts),
+            )
             self._publish_success_facts(execution.facts)
             return execution
         finally:
@@ -467,6 +636,67 @@ def _status_name(status: int) -> str:
         GoalStatus.STATUS_ABORTED: "ABORTED",
     }
     return names.get(status, f"STATUS_{status}")
+
+
+def _embodied_public_args(args: dict[str, Any]) -> dict[str, Any]:
+    control_keys = {
+        "parent_lease_id",
+        "resource_scope_id",
+        "inherited_lease_ids",
+        "inherited_resources",
+        "timeout_sec",
+    }
+    return {key: value for key, value in args.items() if key not in control_keys}
+
+
+def _confirmation_request_id(identity: AiBtIdentity) -> str:
+    mission_id = str(identity.mission_id or "manual")
+    prefix = mission_id[:12] if mission_id else "manual"
+    return f"confirm-{prefix}-{uuid.uuid4().hex[:12]}"
+
+
+def _json_text(value: Any) -> str:
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return "{}"
+        try:
+            json.loads(text)
+        except json.JSONDecodeError:
+            return json.dumps({"text": text}, sort_keys=True, separators=(",", ":"))
+        return text
+    try:
+        return json.dumps(value, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return "{}"
+
+
+def _confirmation_decision_name(decision: int) -> str:
+    names = {
+        RequestHumanConfirmation.Goal.DECISION_UNKNOWN: "UNKNOWN",
+        RequestHumanConfirmation.Goal.DECISION_APPROVED: "APPROVED",
+        RequestHumanConfirmation.Goal.DECISION_DENIED: "DENIED",
+        RequestHumanConfirmation.Goal.DECISION_TIMEOUT: "TIMEOUT",
+        RequestHumanConfirmation.Goal.DECISION_CANCELED: "CANCELED",
+    }
+    return names.get(decision, f"DECISION_{decision}")
+
+
+def _loads_evidence_json(raw: str) -> dict[str, Any]:
+    if not raw:
+        return {}
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _is_blocked(skill_status: int) -> bool:
+    return skill_status in {
+        EmbodiedSkill.Goal.STATUS_BLOCKED,
+        EmbodiedSkill.Goal.STATUS_TIMEOUT,
+    }
 
 
 def _point_at_animation(args: dict[str, Any]) -> tuple[str, dict[str, Any]]:

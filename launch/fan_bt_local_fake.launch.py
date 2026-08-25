@@ -44,7 +44,7 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument(
                 "fake_object_name",
-                default_value="cup",
+                default_value="test_object",
                 description="Fake object name published to mc_world_state.",
             ),
             DeclareLaunchArgument(
@@ -65,6 +65,8 @@ def generate_launch_description():
                     "planner_temperature": LaunchConfiguration("planner_temperature"),
                     "planner_timeout": LaunchConfiguration("planner_timeout"),
                     "mission_journal_path": LaunchConfiguration("mission_journal_path"),
+                    "start_embodied_skills": "true",
+                    "embodied_allow_fake_success": "true",
                 }.items(),
             ),
             Node(

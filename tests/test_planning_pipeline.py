@@ -21,7 +21,7 @@ class RaisingPlanner:
         raise RuntimeError("no model")
 
 
-def _mission(intent: str = "go to kitchen"):
+def _mission(intent: str = "go to test_place"):
     manager = MissionManager()
     _accepted, _message, mission, _event = manager.submit(
         intent_text=intent,
@@ -57,7 +57,7 @@ def test_planning_pipeline_returns_normalized_artifacts():
 
 
 def test_planning_pipeline_accepts_bootstrap_visual_check_plan():
-    mission, missions = _mission("find the cup")
+    mission, missions = _mission("find the test_object")
 
     result = _pipeline(BootstrapPlanner()).plan(mission, missions)
 
@@ -94,7 +94,7 @@ def test_planning_pipeline_reports_policy_error():
             "root": {
                 "type": "Sequence",
                 "children": [
-                    {"type": "Action", "skill": "go_to_place", "args": {"name": "kitchen"}},
+                    {"type": "Action", "skill": "go_to_place", "args": {"name": "test_place"}},
                     {
                         "type": "Action",
                         "skill": "simple_move",
@@ -105,7 +105,7 @@ def test_planning_pipeline_reports_policy_error():
             "goal_spec": {
                 "type": "structured",
                 "predicate": "robot_at_place",
-                "args": {"name": "kitchen"},
+                "args": {"name": "test_place"},
                 "verification": {"mode": "world_state_or_nav_result"},
             },
         }

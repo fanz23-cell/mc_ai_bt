@@ -33,7 +33,7 @@ def test_llm_json_planner_extracts_json_from_model_response():
 
 
 def test_planner_prompt_names_allowed_skills_and_constraints():
-    messages = build_planner_messages("go to kitchen", "{}")
+    messages = build_planner_messages("go to test_place", "{}")
     system = messages[0][1]
 
     assert "mc_ai_bt.plan.v1" in system

@@ -16,6 +16,9 @@ EXECUTABLE_NODE_TYPES = {
     "VisualCheck",
     "Wait",
     "Retry",
+    "Parallel",
+    "Timeout",
+    "NoAction",
 }
 FUTURE_NODE_TYPES: set[str] = set()
 ALLOWED_NODE_TYPES = EXECUTABLE_NODE_TYPES | FUTURE_NODE_TYPES
@@ -70,27 +73,53 @@ class PlanValidator:
             return
 
         timeout = node.get("timeout_sec")
-        if timeout is not None and (not isinstance(timeout, (int, float)) or timeout <= 0 or timeout > 600):
+        if timeout is not None and (
+            not isinstance(timeout, (int, float))
+            or isinstance(timeout, bool)
+            or timeout <= 0
+            or timeout > 600
+        ):
             errors.append(f"{path}.timeout_sec must be in (0, 600]")
 
-        if node_type in {"Sequence", "Fallback"}:
+        if node_type in {"Sequence", "Fallback", "Parallel"}:
             children = node.get("children")
             if not isinstance(children, list) or not children:
                 errors.append(f"{path}.children must be a non-empty list")
                 return
             for idx, child in enumerate(children):
                 self._validate_node(child, f"{path}.children[{idx}]", errors)
+            if node_type == "Parallel":
+                cancel_on_failure = node.get("cancel_on_failure")
+                if cancel_on_failure is not None and not isinstance(cancel_on_failure, bool):
+                    errors.append(f"{path}.cancel_on_failure must be boolean")
+                self._validate_parallel_resource_conflicts(children, path, errors)
             return
 
-        if node_type == "Retry":
-            max_attempts = node.get("max_attempts")
-            if not isinstance(max_attempts, int) or max_attempts < 1 or max_attempts > 5:
-                errors.append(f"{path}.max_attempts must be an integer in [1, 5]")
+        if node_type in {"Retry", "Timeout"}:
+            if node_type == "Retry":
+                max_attempts = node.get("max_attempts")
+                if not isinstance(max_attempts, int) or max_attempts < 1 or max_attempts > 5:
+                    errors.append(f"{path}.max_attempts must be an integer in [1, 5]")
+            else:
+                timeout_sec = node.get("timeout_sec")
+                if (
+                    not isinstance(timeout_sec, (int, float))
+                    or isinstance(timeout_sec, bool)
+                    or timeout_sec <= 0
+                    or timeout_sec > 600
+                ):
+                    errors.append(f"{path}.timeout_sec must be in (0, 600]")
             child = node.get("child")
             if child is None:
                 errors.append(f"{path}.child is required")
             else:
                 self._validate_node(child, f"{path}.child", errors)
+            return
+
+        if node_type == "NoAction":
+            reason = node.get("reason")
+            if reason is not None and not isinstance(reason, str):
+                errors.append(f"{path}.reason must be a string")
             return
 
         if node_type == "Condition":
@@ -133,6 +162,43 @@ class PlanValidator:
             elif not _looks_like_visual_check(check):
                 errors.append(f"{path}.check must include a query, goal type, or predicate")
             return
+
+    def _validate_parallel_resource_conflicts(
+        self,
+        children: list[Any],
+        path: str,
+        errors: list[str],
+    ) -> None:
+        branch_resources: list[tuple[int, set[str]]] = []
+        for idx, child in enumerate(children):
+            resources = self._collect_action_resources(child)
+            branch_resources.append((idx, resources))
+        for left_pos, (left_idx, left_resources) in enumerate(branch_resources):
+            for right_idx, right_resources in branch_resources[left_pos + 1 :]:
+                overlap = sorted(left_resources & right_resources)
+                if overlap:
+                    errors.append(
+                        f"{path}.children[{left_idx}] and {path}.children[{right_idx}] "
+                        f"have conflicting resources: {overlap}"
+                    )
+
+    def _collect_action_resources(self, node: Any) -> set[str]:
+        if not isinstance(node, dict):
+            return set()
+        node_type = node.get("type")
+        if node_type == "Action":
+            skill = node.get("skill")
+            if isinstance(skill, str) and self._skills.has(skill):
+                return set(self._skills.get(skill).resources)
+            return set()
+        if node_type in {"Sequence", "Fallback", "Parallel"}:
+            resources: set[str] = set()
+            for child in node.get("children", []) or []:
+                resources.update(self._collect_action_resources(child))
+            return resources
+        if node_type in {"Retry", "Timeout"}:
+            return self._collect_action_resources(node.get("child"))
+        return set()
 
     def _validate_goal_spec(self, goal_spec: Any, errors: list[str]) -> None:
         if not isinstance(goal_spec, dict):

@@ -16,6 +16,7 @@ class LeaseResult:
     success: bool
     message: str
     lease_id: str = ""
+    reused_lease_id: str = ""
 
 
 class ResourceLeaseClient:
@@ -62,6 +63,11 @@ class ResourceLeaseClient:
         reason: str,
         timeout_sec: float = 3.0,
         identity: AiBtIdentity | None = None,
+        mode: int = AcquireResourceLease.Request.MODE_EXCLUSIVE,
+        parent_lease_id: str = "",
+        resource_scope_id: str = "",
+        allow_lease_reuse: bool = False,
+        inherited_lease_ids: tuple[str, ...] = (),
     ) -> LeaseResult:
         if not resources:
             return LeaseResult(True, "no resources required")
@@ -72,9 +78,14 @@ class ResourceLeaseClient:
         request.identity = copy_identity_msg(identity)
         request.owner_id = self._owner_id
         request.resources = list(resources)
+        request.mode = int(mode)
         request.priority = self._priority
         request.ttl = _duration_msg(self._ttl_sec)
         request.allow_preempt = True
+        request.parent_lease_id = parent_lease_id
+        request.resource_scope_id = resource_scope_id
+        request.allow_lease_reuse = allow_lease_reuse
+        request.inherited_lease_ids = list(inherited_lease_ids)
         request.reason = reason
 
         ok, response_or_message = _wait_future(
@@ -88,6 +99,7 @@ class ResourceLeaseClient:
             bool(response.success),
             str(response.message),
             str(response.lease_id),
+            str(response.reused_lease_id),
         )
 
     def renew(
@@ -96,6 +108,8 @@ class ResourceLeaseClient:
         *,
         timeout_sec: float = 1.0,
         identity: AiBtIdentity | None = None,
+        parent_lease_id: str = "",
+        resource_scope_id: str = "",
     ) -> LeaseResult:
         if not lease_id:
             return LeaseResult(False, "lease_id is required")
@@ -105,6 +119,8 @@ class ResourceLeaseClient:
         request.identity = copy_identity_msg(identity)
         request.lease_id = lease_id
         request.ttl = _duration_msg(self._ttl_sec)
+        request.parent_lease_id = parent_lease_id
+        request.resource_scope_id = resource_scope_id
         request.reason = "renewed by mc_ai_bt"
         ok, response_or_message = _wait_future(
             self._renew.call_async(request),
@@ -121,12 +137,16 @@ class ResourceLeaseClient:
         *,
         reason: str = "done",
         identity: AiBtIdentity | None = None,
+        parent_lease_id: str = "",
+        resource_scope_id: str = "",
     ) -> None:
         if not lease_id or not self._release.service_is_ready():
             return
         request = ReleaseResourceLease.Request()
         request.identity = copy_identity_msg(identity)
         request.lease_id = lease_id
+        request.parent_lease_id = parent_lease_id
+        request.resource_scope_id = resource_scope_id
         request.reason = reason
         self._release.call_async(request)
 

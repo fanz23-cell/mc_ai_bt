@@ -190,6 +190,64 @@ class MissionManager:
         self._active_id = mission_id
         return MissionEvent(EVENT_RESUMED, resumed, resumed.status_text)
 
+    def reprioritize(
+        self,
+        mission_id: str,
+        *,
+        priority: int,
+        preempt_if_needed: bool,
+        reason: str,
+    ) -> MissionEvent:
+        mission_id = self._resolve_control_id(mission_id)
+        mission = self._require(mission_id)
+        if mission.state in _TERMINAL_STATES:
+            raise KeyError(f"mission is terminal: {mission_id}")
+        new_priority = max(0, min(int(priority), 255))
+        updated = replace(
+            mission,
+            priority=new_priority,
+            status_text=reason or mission.status_text,
+        )
+        self._missions[mission_id] = updated
+
+        active = self._missions.get(self._active_id or "")
+        if (
+            preempt_if_needed
+            and updated.state == STATE_QUEUED
+            and active is not None
+            and active.identity.mission_id != mission_id
+            and active.state not in _TERMINAL_STATES
+            and updated.priority > active.priority
+        ):
+            demoted = replace(
+                active,
+                identity=active.identity.next_plan(),
+                state=STATE_QUEUED,
+                active_node="",
+                status_text=f"preempted by higher priority mission {mission_id}",
+                bt_json="",
+                goal_spec_json="",
+            )
+            promoted = replace(
+                updated,
+                state=STATE_PLANNING,
+                active_node="",
+                status_text=reason or "planning",
+                bt_json="",
+                goal_spec_json="",
+            )
+            self._missions[demoted.identity.mission_id] = demoted
+            self._missions[mission_id] = promoted
+            self._active_id = mission_id
+            return MissionEvent(
+                EVENT_PREEMPTED,
+                promoted,
+                promoted.status_text,
+                payload_json=f'{{"preempted_mission_id":"{demoted.identity.mission_id}"}}',
+            )
+
+        return MissionEvent(EVENT_ACCEPTED, updated, reason or "priority updated")
+
     def cancel(self, mission_id: str, reason: str) -> MissionEvent:
         mission_id = self._resolve_control_id(mission_id)
         mission = self._require(mission_id)

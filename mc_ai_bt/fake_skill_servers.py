@@ -25,7 +25,7 @@ class FakeSkillServers(Node):
     def __init__(self) -> None:
         super().__init__("mc_ai_bt_fake_skill_servers")
         self.declare_parameter("delay_sec", 0.05)
-        self.declare_parameter("fake_object_name", "cup")
+        self.declare_parameter("fake_object_name", "test_object")
         self.declare_parameter("fake_object_score", 0.9)
         self.declare_parameter("fake_visible_people_count", 1)
         self.declare_parameter("perception_period_sec", 0.5)

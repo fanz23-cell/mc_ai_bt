@@ -44,6 +44,9 @@ class _FakeNode:
     def _publish_task_projection(self):
         self.projections += 1
 
+    def _cancel_startup_snapshot_timer(self):
+        AiBtNode._cancel_startup_snapshot_timer(self)
+
     def destroy_timer(self, timer):
         self.destroyed_timers.append(timer)
 
@@ -58,7 +61,7 @@ class _FakeNode:
 def _mission(mission_id="recovered"):
     return Mission(
         identity=Identity(mission_id=mission_id, plan_version=2),
-        intent_text="go to kitchen",
+        intent_text="go to test_place",
         source="voice",
         operator_id="user",
         priority=10,

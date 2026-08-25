@@ -7,14 +7,17 @@ import rclpy
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile
 
-from mc_one.msg import AiBtIdentity, TaskEvent, TaskStatus, WorldEvent
+from mc_one.msg import AiBtIdentity, PolicyState, TaskEvent, TaskStatus, WorldEvent
 from mc_one.srv import (
     CancelMission,
     ListMissions,
     PauseMission,
     QueryWorld,
+    ReprioritizeMission,
     ResumeMission,
+    SetPolicyState,
     SubmitTaskIntent,
 )
 
@@ -23,6 +26,7 @@ from .executor import BtExecutor
 from .goal_check import GoalChecker, TriState
 from .identity import Identity
 from .mission import (
+    EVENT_PREEMPTED,
     Mission,
     MissionEvent,
     MissionManager,
@@ -45,13 +49,17 @@ from .query_world import QueryWorldEngine
 from .ros_identity import identity_to_msg
 from .resource_client import ResourceLeaseClient
 from .trigger_manager import (
-    ACTION_BLOCK_ACTIVE,
-    ACTION_REPLAN_ACTIVE,
+    ACTION_BLOCKED,
+    ACTION_ASK_CLARIFICATION,
+    ACTION_LOCAL_HANDLED,
+    ACTION_PLAN_NEW_MISSION,
+    ACTION_REPLAN,
     TriggerDecision,
     TriggerManager,
     trigger_decision_matches_mission,
 )
 from .validator import PlanValidator
+from .visual_client import MissionCheckExecutor, VisualCheckClient, VisualCheckSettings
 from .world_state_client import WorldStateClient, WorldStateWriter
 
 
@@ -81,6 +89,16 @@ class AiBtNode(Node):
             callback_group=self._client_callback_group,
         )
         self._goal_checker = GoalChecker(self._world_state.snapshot_json)
+        self._visual_client = VisualCheckClient(
+            self,
+            settings=VisualCheckSettings(
+                action_name=str(self.get_parameter("visual_check_action").value or "/mc_multimodal/visual_check"),
+                camera_source=str(self.get_parameter("visual_check_camera_source").value or "head"),
+                max_age_sec=float(self.get_parameter("visual_check_max_age_sec").value or 2.0),
+                timeout_sec=float(self.get_parameter("visual_check_timeout_sec").value or 15.0),
+            ),
+            callback_group=self._client_callback_group,
+        )
         self._context_builder = ContextBuilder(
             snapshot_provider=self._world_state.snapshot_json,
             skill_registry=self._skill_registry,
@@ -102,18 +120,26 @@ class AiBtNode(Node):
         )
         self._trigger_manager = TriggerManager()
         self._query_world = QueryWorldEngine()
+        self._policy_state = self._default_policy_state()
         self._mission_lock = threading.RLock()
         self._runner_threads: list[threading.Thread] = []
         self._cancel_events: dict[str, threading.Event] = {}
         self._mission_cancel_keys: dict[str, str] = {}
         self._status_pub = self.create_publisher(TaskStatus, "/mc_ai_bt/task_status", 10)
         self._event_pub = self.create_publisher(TaskEvent, "/mc_ai_bt/task_events", 10)
+        self._policy_pub = self.create_publisher(
+            PolicyState,
+            "/mc_ai_bt/policy_state",
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
+        )
         self.create_service(SubmitTaskIntent, "/mc_ai_bt/submit_task", self._handle_submit)
         self.create_service(CancelMission, "/mc_ai_bt/cancel_mission", self._handle_cancel)
         self.create_service(PauseMission, "/mc_ai_bt/pause_mission", self._handle_pause)
         self.create_service(ResumeMission, "/mc_ai_bt/resume_mission", self._handle_resume)
+        self.create_service(ReprioritizeMission, "/mc_ai_bt/reprioritize_mission", self._handle_reprioritize)
         self.create_service(ListMissions, "/mc_ai_bt/list_missions", self._handle_list)
         self.create_service(QueryWorld, "/mc_ai_bt/query_world", self._handle_query_world)
+        self.create_service(SetPolicyState, "/mc_ai_bt/set_policy_state", self._handle_set_policy_state)
         self.create_subscription(
             WorldEvent,
             "/mc_world_state/events",
@@ -127,6 +153,7 @@ class AiBtNode(Node):
                 1.0,
                 self._publish_startup_snapshot,
             )
+        self._publish_policy_state()
 
     def _declare_parameters(self) -> None:
         self.declare_parameter("planner_backend", "bootstrap")
@@ -134,6 +161,10 @@ class AiBtNode(Node):
         self.declare_parameter("planner_temperature", 0.0)
         self.declare_parameter("planner_timeout", 15.0)
         self.declare_parameter("mission_journal_path", "")
+        self.declare_parameter("visual_check_action", "/mc_multimodal/visual_check")
+        self.declare_parameter("visual_check_camera_source", "head")
+        self.declare_parameter("visual_check_max_age_sec", 2.0)
+        self.declare_parameter("visual_check_timeout_sec", 15.0)
 
     def _build_mission_journal(self) -> MissionJournal | None:
         path = str(self.get_parameter("mission_journal_path").value or "").strip()
@@ -267,11 +298,17 @@ class AiBtNode(Node):
     ) -> None:
         try:
             with self._skill_executor.use_identity(mission.identity):
+                checks = MissionCheckExecutor(
+                    goal_checker=self._goal_checker,
+                    visual_client=self._visual_client,
+                    identity=mission.identity,
+                    cancel_event=cancel_event,
+                )
                 execution = self._executor.execute_json(
                     mission.bt_json,
                     self._skill_executor,
                     cancel_event=cancel_event,
-                    checks=self._goal_checker,
+                    checks=checks,
                     progress_callback=lambda active_node, progress: self._on_execution_progress(
                         mission,
                         active_node,
@@ -284,7 +321,7 @@ class AiBtNode(Node):
                 state = STATE_BLOCKED
                 message = execution.message
             elif execution.success:
-                check = self._goal_checker.check_json(mission.goal_spec_json, execution)
+                check = checks.check_json(mission.goal_spec_json, execution)
                 if check.state is TriState.TRUE:
                     state = STATE_SUCCEEDED
                     message = f"goal check TRUE: {check.message}"
@@ -389,6 +426,46 @@ class AiBtNode(Node):
         response.message = event.message
         return response
 
+    def _handle_reprioritize(
+        self,
+        request: ReprioritizeMission.Request,
+        response: ReprioritizeMission.Response,
+    ) -> ReprioritizeMission.Response:
+        preempted_cancel_event = None
+        preempt_reason = request.reason or "reprioritized"
+        try:
+            with self._mission_lock:
+                event = self._missions.reprioritize(
+                    request.mission_id,
+                    priority=request.priority,
+                    preempt_if_needed=bool(request.preempt_if_needed),
+                    reason=preempt_reason,
+                )
+                preempted_id = ""
+                if event.event == EVENT_PREEMPTED and event.payload_json:
+                    try:
+                        payload = json.loads(event.payload_json)
+                        preempted_id = str(payload.get("preempted_mission_id") or "")
+                    except (TypeError, ValueError):
+                        preempted_id = ""
+                if preempted_id:
+                    runner_key = self._mission_cancel_keys.get(preempted_id, "")
+                    preempted_cancel_event = self._cancel_events.get(runner_key)
+        except KeyError as exc:
+            response.success = False
+            response.message = str(exc)
+            return response
+        if preempted_cancel_event is not None:
+            preempted_cancel_event.set()
+            self._skill_executor.cancel_current(preempt_reason)
+        self._publish_event(event)
+        if event.mission.state == STATE_PLANNING and not event.mission.bt_json:
+            self._plan_and_start(event.mission)
+        response.success = True
+        response.message = event.message
+        response.status = self._status_msg(event.mission)
+        return response
+
     def _handle_list(
         self,
         request: ListMissions.Request,
@@ -440,22 +517,63 @@ class AiBtNode(Node):
         response.snapshot = snapshot
         return response
 
+    def _handle_set_policy_state(
+        self,
+        request: SetPolicyState.Request,
+        response: SetPolicyState.Response,
+    ) -> SetPolicyState.Response:
+        try:
+            policy = self._policy_from_request(request)
+        except ValueError as exc:
+            response.success = False
+            response.message = str(exc)
+            response.current_policy = self._policy_state
+            return response
+        self._policy_state = policy
+        self._publish_policy_state()
+        self._world_writer.update_fact(
+            source=request.source or "mc_ai_bt.policy",
+            scope="policy",
+            key="state",
+            value=_policy_state_dict(policy),
+            timeout_sec=0.25,
+        )
+        response.success = True
+        response.message = "policy updated"
+        response.current_policy = policy
+        return response
+
     def _on_world_event(self, msg: WorldEvent) -> None:
+        has_active_mission = self._has_active_mission()
         decision = self._trigger_manager.handle_world_event(
             event_type=msg.event_type,
             snapshot_id=msg.snapshot_id,
             payload_json=msg.payload_json,
+            has_active_mission=has_active_mission,
         )
         if decision.is_no_action:
             return
         self._handle_trigger_decision(decision)
 
     def _handle_trigger_decision(self, decision: TriggerDecision) -> None:
-        if decision.action == ACTION_BLOCK_ACTIVE:
+        if decision.action == ACTION_LOCAL_HANDLED:
+            self.get_logger().debug(f"trigger handled locally: {decision.reason}")
+            return
+        if decision.action == ACTION_BLOCKED:
             self._block_active_from_trigger(decision)
             return
-        if decision.action == ACTION_REPLAN_ACTIVE:
+        if decision.action == ACTION_REPLAN:
             self._replan_active_from_trigger(decision)
+            return
+        if decision.action == ACTION_ASK_CLARIFICATION:
+            self._block_active_from_trigger(decision)
+            return
+        if decision.action == ACTION_PLAN_NEW_MISSION:
+            self._plan_new_mission_from_trigger(decision)
+            return
+        self.get_logger().debug(
+            f"unsupported trigger decision ignored: {decision.action}"
+        )
 
     def _select_missions(
         self,
@@ -509,6 +627,11 @@ class AiBtNode(Node):
         if self._startup_snapshot_publishes_remaining <= 0:
             self._cancel_startup_snapshot_timer()
 
+    def _publish_policy_state(self) -> None:
+        policy = self._copy_policy_state(self._policy_state)
+        policy.header.stamp = self.get_clock().now().to_msg()
+        self._policy_pub.publish(policy)
+
     def _cancel_startup_snapshot_timer(self) -> None:
         timer = self._startup_snapshot_timer
         if timer is None:
@@ -558,6 +681,16 @@ class AiBtNode(Node):
             ok, message = self._world_writer.update(update, timeout_sec=0.25)
             if not ok:
                 self.get_logger().debug(f"task projection skipped: {message}")
+
+    def _has_active_mission(self) -> bool:
+        terminal = {STATE_SUCCEEDED, STATE_FAILED, STATE_CANCELED, STATE_BLOCKED}
+        with self._mission_lock:
+            try:
+                target_id = self._missions.resolve_control_id("")
+            except KeyError:
+                return False
+            mission = self._missions.get(target_id)
+        return mission is not None and mission.state not in terminal
 
     def _block_active_from_trigger(self, decision: TriggerDecision) -> None:
         try:
@@ -621,6 +754,55 @@ class AiBtNode(Node):
         self._publish_event(event)
         self._plan_and_start(event.mission)
 
+    def _plan_new_mission_from_trigger(self, decision: TriggerDecision) -> None:
+        context_json = json.dumps(
+            {
+                "schema": "mc_ai_bt.trigger_context.v1",
+                "decision": {
+                    "action": decision.action,
+                    "reason": decision.reason,
+                    "message": decision.message,
+                    "details": decision.details,
+                },
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        intent_text = _intent_for_trigger_new_mission(decision)
+        try:
+            with self._mission_lock:
+                if self._has_active_mission_unlocked():
+                    self.get_logger().debug(
+                        f"new mission trigger ignored because a mission is active: {decision.reason}"
+                    )
+                    return
+                accepted, _message, mission, event = self._missions.submit(
+                    intent_text=intent_text,
+                    source="world_event",
+                    operator_id="trigger_manager",
+                    parent_mission_id="",
+                    priority=20,
+                    allow_queue=False,
+                    context_json=context_json,
+                )
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warning(
+                f"new mission trigger failed: {type(exc).__name__}: {exc}"
+            )
+            return
+        self._publish_event(event)
+        if accepted and mission.state != STATE_QUEUED:
+            self._plan_and_start(mission)
+
+    def _has_active_mission_unlocked(self) -> bool:
+        terminal = {STATE_SUCCEEDED, STATE_FAILED, STATE_CANCELED, STATE_BLOCKED}
+        try:
+            target_id = self._missions.resolve_control_id("")
+        except KeyError:
+            return False
+        mission = self._missions.get(target_id)
+        return mission is not None and mission.state not in terminal
+
     def _status_msg(self, mission: Mission) -> TaskStatus:
         msg = TaskStatus()
         msg.header.stamp = self.get_clock().now().to_msg()
@@ -639,6 +821,48 @@ class AiBtNode(Node):
     @staticmethod
     def _identity_msg(identity: Identity) -> AiBtIdentity:
         return identity_to_msg(identity)
+
+    @staticmethod
+    def _default_policy_state() -> PolicyState:
+        policy = PolicyState()
+        policy.autonomy_level = PolicyState.AUTONOMY_INTERACTIVE
+        policy.privacy_mode = False
+        policy.allow_active_vision = True
+        policy.allow_following = True
+        policy.allow_guiding = True
+        policy.allow_approach_unknown_person = False
+        policy.hard_safety_stop_active = False
+        policy.consent_owner_id = ""
+        policy.policy_json = "{}"
+        return policy
+
+    @staticmethod
+    def _copy_policy_state(src: PolicyState) -> PolicyState:
+        policy = PolicyState()
+        policy.autonomy_level = int(src.autonomy_level)
+        policy.privacy_mode = bool(src.privacy_mode)
+        policy.allow_active_vision = bool(src.allow_active_vision)
+        policy.allow_following = bool(src.allow_following)
+        policy.allow_guiding = bool(src.allow_guiding)
+        policy.allow_approach_unknown_person = bool(src.allow_approach_unknown_person)
+        policy.hard_safety_stop_active = bool(src.hard_safety_stop_active)
+        policy.consent_owner_id = str(src.consent_owner_id or "")
+        policy.policy_json = str(src.policy_json or "{}")
+        return policy
+
+    def _policy_from_request(self, request: SetPolicyState.Request) -> PolicyState:
+        policy = self._copy_policy_state(self._policy_state if request.merge else request.policy)
+        patch_text = str(request.patch_json or "").strip()
+        if not patch_text:
+            return policy
+        try:
+            patch = json.loads(patch_text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"invalid policy patch_json: {exc}") from exc
+        if not isinstance(patch, dict):
+            raise ValueError("policy patch_json must be an object")
+        _apply_policy_patch(policy, patch)
+        return policy
 
 
 def main() -> None:
@@ -662,6 +886,62 @@ def _safe_rclpy_shutdown() -> None:
             rclpy.shutdown()
     except Exception:
         pass
+
+
+def _intent_for_trigger_new_mission(decision: TriggerDecision) -> str:
+    if decision.reason == "PERSON_HAND_OFFERED":
+        return "A person is offering an interaction. Decide whether to start a safe local interaction or take no action."
+    if decision.reason == "PERSON_APPROACHED":
+        return "A person approached the robot. Decide whether to greet or take no action."
+    return f"Handle world event {decision.reason} if useful, otherwise take no action."
+
+
+def _policy_state_dict(policy: PolicyState) -> dict[str, object]:
+    return {
+        "schema": "mc_ai_bt.policy_state.v1",
+        "autonomy_level": int(policy.autonomy_level),
+        "privacy_mode": bool(policy.privacy_mode),
+        "allow_active_vision": bool(policy.allow_active_vision),
+        "allow_following": bool(policy.allow_following),
+        "allow_guiding": bool(policy.allow_guiding),
+        "allow_approach_unknown_person": bool(policy.allow_approach_unknown_person),
+        "hard_safety_stop_active": bool(policy.hard_safety_stop_active),
+        "consent_owner_id": str(policy.consent_owner_id or ""),
+        "policy_json": str(policy.policy_json or "{}"),
+    }
+
+
+def _apply_policy_patch(policy: PolicyState, patch: dict[str, object]) -> None:
+    allowed = {
+        "autonomy_level",
+        "privacy_mode",
+        "allow_active_vision",
+        "allow_following",
+        "allow_guiding",
+        "allow_approach_unknown_person",
+        "hard_safety_stop_active",
+        "consent_owner_id",
+        "policy_json",
+    }
+    for key, value in patch.items():
+        if key not in allowed:
+            raise ValueError(f"unsupported policy field: {key}")
+        if key == "autonomy_level":
+            level = int(value)
+            if level < PolicyState.AUTONOMY_LOCKED_DOWN or level > PolicyState.AUTONOMY_SUPERVISED:
+                raise ValueError(f"invalid autonomy_level: {level}")
+            policy.autonomy_level = level
+        elif key == "consent_owner_id":
+            policy.consent_owner_id = str(value or "")
+        elif key == "policy_json":
+            text = str(value or "{}")
+            try:
+                json.loads(text)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"invalid policy_json: {exc}") from exc
+            policy.policy_json = text
+        else:
+            setattr(policy, key, bool(value))
 
 
 if __name__ == "__main__":
