@@ -15,6 +15,16 @@ class ExecutionResult:
     message: str
     facts: dict[str, Any] = field(default_factory=dict)
     blocked: bool = False
+    # True only for the subset of `blocked` failures that are a genuine
+    # evidentiary/semantic gap -- a Condition/GoalCheck/VisualCheck node came
+    # back UNKNOWN -- as opposed to a mechanical dead-end (a Timeout expired,
+    # a Parallel child never reported, a checker isn't wired up). node.py's
+    # _run_mission uses this to decide whether a mission that hits this
+    # should pause (resumable once new evidence arrives; see mission.py's
+    # pause/resume) or terminate as BLOCKED (a plain retry/replan won't help
+    # a config error or an expired timeout the way it can resolve missing
+    # evidence). See OMEGACLAW_AI_BT_INTEGRATION.md §3.5.
+    needs_decision: bool = False
 
 
 class SkillExecutor(Protocol):
@@ -110,7 +120,8 @@ class BtExecutor:
                 )
                 facts.update(result.facts)
                 if not result.success:
-                    return ExecutionResult(False, result.message, facts, result.blocked)
+                    return ExecutionResult(
+                        False, result.message, facts, result.blocked, result.needs_decision)
             return ExecutionResult(True, "sequence succeeded", facts)
         if node_type == "Fallback":
             last = ExecutionResult(False, "fallback had no children")
@@ -127,7 +138,7 @@ class BtExecutor:
                 )
                 facts.update(last.facts)
                 if last.blocked:
-                    return ExecutionResult(False, last.message, facts, True)
+                    return ExecutionResult(False, last.message, facts, True, last.needs_decision)
                 if last.success:
                     return ExecutionResult(True, last.message, facts)
             return ExecutionResult(False, last.message, facts)
@@ -293,7 +304,7 @@ class BtExecutor:
             )
             facts.update(last.facts)
             if last.blocked:
-                return ExecutionResult(False, last.message, facts, True)
+                return ExecutionResult(False, last.message, facts, True, last.needs_decision)
             if last.success:
                 return ExecutionResult(True, f"retry succeeded on attempt {attempt}", facts)
         return ExecutionResult(
@@ -347,8 +358,11 @@ class BtExecutor:
         facts: dict[str, Any] = dict(blackboard)
         failures: list[ExecutionResult] = []
         blocked = False
+        needs_decision = False
         for result in results:
             if result is None:
+                # A child thread that never reported is a bug/race, not an
+                # evidentiary gap -- needs_decision deliberately NOT set.
                 failures.append(ExecutionResult(False, "parallel child did not report a result", {}, True))
                 blocked = True
                 continue
@@ -356,9 +370,10 @@ class BtExecutor:
             if not result.success:
                 failures.append(result)
                 blocked = blocked or result.blocked
+                needs_decision = needs_decision or result.needs_decision
         if failures:
             message = "; ".join(result.message for result in failures)
-            return ExecutionResult(False, f"parallel failed: {message}", facts, blocked)
+            return ExecutionResult(False, f"parallel failed: {message}", facts, blocked, needs_decision)
         return ExecutionResult(True, "parallel succeeded", facts)
 
     def _execute_timeout(
@@ -467,7 +482,7 @@ def _check_as_execution_result(
         return ExecutionResult(True, f"{label} TRUE: {message}", facts)
     if state == "FALSE":
         return ExecutionResult(False, f"{label} FALSE: {message}", facts)
-    return ExecutionResult(False, f"{label} UNKNOWN: {message}", facts, True)
+    return ExecutionResult(False, f"{label} UNKNOWN: {message}", facts, True, needs_decision=True)
 
 
 def _visual_check_as_execution_result(
@@ -482,7 +497,8 @@ def _visual_check_as_execution_result(
         return ExecutionResult(True, f"visual check TRUE: {message}", facts)
     if state == "FALSE":
         return ExecutionResult(False, f"visual check FALSE: {message}", facts)
-    return ExecutionResult(False, f"visual check UNKNOWN: {message}", facts, True)
+    return ExecutionResult(
+        False, f"visual check UNKNOWN: {message}", facts, True, needs_decision=True)
 
 
 def _normalise_goal_check_spec(check: dict[str, Any]) -> dict[str, Any]:

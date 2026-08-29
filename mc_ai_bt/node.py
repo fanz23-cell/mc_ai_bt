@@ -317,17 +317,33 @@ class AiBtNode(Node):
                 )
             state = STATE_FAILED
             message = execution.message
+            # `escalate`, not STATE_BLOCKED: a genuine evidentiary gap (a
+            # Condition/GoalCheck/VisualCheck node, or the final goal check
+            # itself, came back UNKNOWN) is resumable once new evidence
+            # arrives -- pause() rather than a terminal mark, per
+            # OMEGACLAW_AI_BT_INTEGRATION.md §3.5. A mechanical dead-end
+            # (execution.blocked but NOT execution.needs_decision -- a
+            # Timeout expired, a Parallel child never reported, a checker
+            # isn't wired up) still terminates as BLOCKED: replanning won't
+            # fix a config error or an expired timeout the way it can
+            # resolve missing evidence, and there is no decision for Omega
+            # to actually make there.
+            escalate = False
             if execution.blocked:
-                state = STATE_BLOCKED
-                message = execution.message
+                if execution.needs_decision:
+                    escalate = True
+                    message = f"awaiting Omega decision: {execution.message}"
+                else:
+                    state = STATE_BLOCKED
+                    message = execution.message
             elif execution.success:
                 check = checks.check_json(mission.goal_spec_json, execution)
                 if check.state is TriState.TRUE:
                     state = STATE_SUCCEEDED
                     message = f"goal check TRUE: {check.message}"
                 elif check.state is TriState.UNKNOWN:
-                    state = STATE_BLOCKED
-                    message = f"goal check UNKNOWN: {check.message}"
+                    escalate = True
+                    message = f"awaiting Omega decision: goal check UNKNOWN: {check.message}"
                 else:
                     state = STATE_FAILED
                     message = f"goal check FALSE: {check.message}"
@@ -335,13 +351,21 @@ class AiBtNode(Node):
             with self._mission_lock:
                 if not self._missions.accepts_async_result(mission.identity):
                     return
-                terminal = self._missions.mark_terminal(
-                    mission.identity.mission_id,
-                    state=state,
-                    message=message,
-                )
-            self._publish_event(terminal)
-            self._start_next_ready()
+                if escalate:
+                    outcome = self._missions.pause(mission.identity.mission_id, message)
+                else:
+                    outcome = self._missions.mark_terminal(
+                        mission.identity.mission_id,
+                        state=state,
+                        message=message,
+                    )
+            self._publish_event(outcome)
+            if not escalate:
+                # A paused mission keeps holding _active_id (pause() does not
+                # promote the next queued mission, unlike mark_terminal) --
+                # nothing else should start in its place while it is only
+                # waiting on a decision, not actually done.
+                self._start_next_ready()
         finally:
             with self._mission_lock:
                 if self._mission_cancel_keys.get(mission.identity.mission_id) == runner_key:

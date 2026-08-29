@@ -255,6 +255,11 @@ def test_executor_timeout_blocks_and_cancels_slow_child():
     assert result.blocked
     assert "timeout after" in result.message
     assert time.monotonic() - started < 0.5
+    # A mechanical dead-end, not an evidentiary gap: replanning the same
+    # timeout won't be fixed by Omega resolving some ambiguity, so this must
+    # stay a terminal BLOCKED rather than becoming an escalation pause (see
+    # OMEGACLAW_AI_BT_INTEGRATION.md §3.5 / node.py's _run_mission).
+    assert not result.needs_decision
 
 
 def test_executor_condition_true_continues_sequence():
@@ -296,6 +301,10 @@ def test_executor_condition_unknown_blocks_instead_of_failing_false():
     assert not result.success
     assert result.blocked
     assert "UNKNOWN" in result.message
+    # A genuine evidentiary gap: more/better evidence (a re-observe, asking
+    # the person) could resolve this, so it's the one case that should
+    # become a resumable escalation pause rather than a terminal BLOCKED.
+    assert result.needs_decision
 
 
 def test_goal_check_sees_facts_from_previous_action():
@@ -364,6 +373,10 @@ def test_visual_check_unknown_query_blocks_without_calling_checker():
     assert not result.success
     assert result.blocked
     assert checks.requests == []
+    # A wiring gap (no visual_check configured), not an evidentiary one --
+    # Omega being asked to decide wouldn't help here either, so this must
+    # NOT become an escalation pause.
+    assert not result.needs_decision
 
 
 def test_visual_check_unknown_query_uses_visual_service_when_configured():
@@ -394,6 +407,85 @@ def test_visual_check_structured_unknown_falls_back_to_visual_service():
     assert result.success
     assert checks.requests[0][0]["predicate"] == "object_visible"
     assert checks.visual_requests == [({"query": "do you see the test_object?"}, {})]
+
+
+def test_needs_decision_propagates_through_sequence():
+    skills = FakeSkills()
+    checks = FakeChecks(TriState.UNKNOWN)
+    root = {
+        "type": "Sequence",
+        "children": [
+            {"type": "Action", "skill": "say", "args": {"text": "first"}},
+            {"type": "Condition", "predicate": "person_awake", "args": {}},
+            {"type": "Action", "skill": "say", "args": {"text": "unreached"}},
+        ],
+    }
+
+    result = BtExecutor().execute(root, skills, checks=checks)
+
+    assert not result.success
+    assert result.blocked
+    assert result.needs_decision
+    assert skills.said == ["first"]
+
+
+def test_needs_decision_propagates_through_fallback():
+    skills = FakeSkills()
+    checks = FakeChecks(TriState.UNKNOWN)
+    root = {
+        "type": "Fallback",
+        "children": [
+            {"type": "Condition", "predicate": "person_awake", "args": {}},
+            {"type": "Action", "skill": "say", "args": {"text": "never reached"}},
+        ],
+    }
+
+    result = BtExecutor().execute(root, skills, checks=checks)
+
+    assert not result.success
+    assert result.blocked
+    assert result.needs_decision
+    # Fallback stops at an UNKNOWN branch rather than trying the next one:
+    # a genuine ambiguity needs resolving, not routing around.
+    assert skills.said == []
+
+
+def test_needs_decision_propagates_through_retry():
+    skills = FakeSkills()
+    checks = FakeChecks(TriState.UNKNOWN)
+
+    result = BtExecutor().execute(
+        {
+            "type": "Retry",
+            "max_attempts": 3,
+            "child": {"type": "Condition", "predicate": "person_awake", "args": {}},
+        },
+        skills,
+        checks=checks,
+    )
+
+    assert not result.success
+    assert result.blocked
+    assert result.needs_decision
+    # Retrying the identical check can't manufacture new evidence -- exactly
+    # why blocked short-circuits the remaining attempts.
+    assert len(checks.requests) == 1
+
+
+def test_a_plain_failure_does_not_set_needs_decision():
+    """FALSE is a plain failure, not a gap -- it must not also pause."""
+    skills = FakeSkills()
+    checks = FakeChecks(TriState.FALSE)
+
+    result = BtExecutor().execute(
+        {"type": "Condition", "predicate": "person_awake", "args": {}},
+        skills,
+        checks=checks,
+    )
+
+    assert not result.success
+    assert not result.blocked
+    assert not result.needs_decision
 
 
 def test_executor_reports_progress_for_sequence_leaves():
