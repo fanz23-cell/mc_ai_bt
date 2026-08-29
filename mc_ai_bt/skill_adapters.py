@@ -27,33 +27,15 @@ from .identity import Identity
 from .lease_timing import lease_renew_interval
 from .resource_client import ResourceLeaseClient
 from .ros_identity import empty_identity_msg, identity_to_msg
+from .skill_registry import DEFAULT_SKILLS
 from .world_facts import world_fact_updates_for_execution
 from .world_state_client import WorldStateWriter
 
 
-EMBODIED_SKILLS = {
-    "locate_entity",
-    "track_entity",
-    "track_frame",
-    "get_pose",
-    "check_relation",
-    "search_for_entity",
-    "look_at_static",
-    "track_with_gaze",
-    "reach_to",
-    "align_axis",
-    "move_along_axis",
-    "maintain_distance",
-    "hold_pose",
-    "wait_for_contact",
-    "detect_contact",
-    "oscillate",
-    "retract",
-    "approach_entity",
-    "follow_entity",
-    "guide_entity_to_place",
-    "wait_for_participant",
-}
+# Computed from skill_registry.py's dispatch field, not hand-copied -- see
+# SkillSpec's docstring and OMEGACLAW_AI_BT_INTEGRATION.md §9 for why. Adding a new
+# embodied skill now means adding one DEFAULT_SKILLS entry; this recomputes automatically.
+EMBODIED_SKILLS = {name for name, spec in DEFAULT_SKILLS.items() if spec.dispatch == "embodied"}
 
 
 @dataclass(frozen=True)

@@ -3,65 +3,25 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from .skill_registry import GENERIC_SKILL_NAMES, SkillRegistry
+from .skill_registry import DEFAULT_SKILLS, SkillRegistry
 
 
 ALLOWED_TOP_LEVEL_KEYS = {"schema", "root", "goal_spec", "context_json"}
-PHYSICAL_SKILLS = {
-    "go_to_place",
-    "approach_entity",
-    "come_to_me",
-    "simple_move",
-    "play_animation",
-    "look_at",
-    "point_at",
-    "look_at_static",
-    "track_entity",
-    "track_frame",
-    "track_with_gaze",
-    "search_for_entity",
-    "reach_to",
-    "align_axis",
-    "move_along_axis",
-    "maintain_distance",
-    "hold_pose",
-    "wait_for_contact",
-    "detect_contact",
-    "oscillate",
-    "retract",
-    "follow_entity",
-    "guide_entity_to_place",
-}
-BASE_SKILLS = {
-    "go_to_place", "approach_entity", "come_to_me", "simple_move",
-    "maintain_distance", "follow_entity", "guide_entity_to_place",
-}
+
+# These five sets used to be independent, hand-written literals -- three separate
+# production bugs in one afternoon (adding a single new skill, approach_entity) traced back
+# to exactly this pattern: a name added to skill_registry.py but not copied into every one
+# of these. Computed from DEFAULT_SKILLS instead; see skill_registry.py's SkillSpec
+# docstring and OMEGACLAW_AI_BT_INTEGRATION.md §9 for the full story. Adding a new skill now
+# means adding ONE entry to DEFAULT_SKILLS -- these five recompute automatically.
+_BODY_RESOURCES = {"gaze", "left_arm", "right_arm", "body"}
+BASE_SKILLS = {name for name, spec in DEFAULT_SKILLS.items() if "base" in spec.resources}
 BODY_SKILLS = {
-    "play_animation",
-    "look_at",
-    "point_at",
-    "look_at_static",
-    "track_entity",
-    "track_frame",
-    "track_with_gaze",
-    "search_for_entity",
-    "reach_to",
-    "align_axis",
-    "move_along_axis",
-    "hold_pose",
-    "wait_for_contact",
-    "detect_contact",
-    "oscillate",
-    "retract",
+    name for name, spec in DEFAULT_SKILLS.items() if set(spec.resources) & _BODY_RESOURCES
 }
-CONTINUOUS_BASE_SKILLS = {"maintain_distance", "follow_entity", "guide_entity_to_place"}
-POLICY_ENABLED_SKILLS = GENERIC_SKILL_NAMES | {
-    "request_human_confirmation",
-    "come_to_me",
-    "simple_move",
-    "look_at",
-    "point_at",
-}
+PHYSICAL_SKILLS = BASE_SKILLS | BODY_SKILLS
+CONTINUOUS_BASE_SKILLS = {name for name in BASE_SKILLS if DEFAULT_SKILLS[name].realtime}
+POLICY_ENABLED_SKILLS = set(DEFAULT_SKILLS.keys())
 LOOK_AT_DIRECTIONS = {
     "front",
     "front_up",

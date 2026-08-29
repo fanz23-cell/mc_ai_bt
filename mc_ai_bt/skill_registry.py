@@ -11,34 +11,17 @@ class SkillSpec:
     args_schema: dict[str, object] = field(default_factory=dict)
     result_predicates: tuple[str, ...] = ()
     realtime: bool = False
-
-
-GENERIC_SKILL_NAMES = {
-    "locate_entity",
-    "track_entity",
-    "track_frame",
-    "get_pose",
-    "check_relation",
-    "search_for_entity",
-    "look_at_static",
-    "track_with_gaze",
-    "reach_to",
-    "align_axis",
-    "move_along_axis",
-    "maintain_distance",
-    "hold_pose",
-    "wait_for_contact",
-    "detect_contact",
-    "oscillate",
-    "retract",
-    "go_to_place",
-    "approach_entity",
-    "follow_entity",
-    "guide_entity_to_place",
-    "wait_for_participant",
-    "say",
-    "play_animation",
-}
+    # "embodied" (default): routes through the generic /mc_embodied_skills/execute action
+    #   (skill_adapters.py's EMBODIED_SKILLS -- computed from this field, see below).
+    # "dedicated": has its own ActionClient/ServiceClient in skill_adapters.py
+    #   (go_to_place/come_to_me/simple_move/play_animation/look_at/point_at/
+    #   request_human_confirmation).
+    # "voice": handled by mc_ai_bt/voice directly, dispatches to no robot action at all (say).
+    # This is the single source every other skill-name set in this file and in
+    # policy_guard.py/skill_adapters.py is computed from -- see
+    # OMEGACLAW_AI_BT_INTEGRATION.md §9 for why hand-copying these sets independently caused
+    # three separate live production failures in one afternoon.
+    dispatch: str = "embodied"
 
 
 DEFAULT_SKILLS: dict[str, SkillSpec] = {
@@ -180,6 +163,7 @@ DEFAULT_SKILLS: dict[str, SkillSpec] = {
         "Navigate to an arbitrary configured place region.",
         {"place": "name|place"},
         ("robot_at_place",),
+        dispatch="dedicated",
     ),
     "approach_entity": SkillSpec(
         "approach_entity",
@@ -219,6 +203,7 @@ DEFAULT_SKILLS: dict[str, SkillSpec] = {
         "Speak through the legacy TTS path.",
         {"text": "string"},
         ("say_submitted",),
+        dispatch="voice",
     ),
     "request_human_confirmation": SkillSpec(
         "request_human_confirmation",
@@ -226,6 +211,7 @@ DEFAULT_SKILLS: dict[str, SkillSpec] = {
         "Ask an operator to approve or deny a bounded mission step.",
         {"prompt": "string"},
         ("human_confirmation",),
+        dispatch="dedicated",
     ),
     "simple_move": SkillSpec(
         "simple_move",
@@ -233,6 +219,7 @@ DEFAULT_SKILLS: dict[str, SkillSpec] = {
         "Bounded relative base movement primitive.",
         {"action": "forward|backward|left|right", "value": "number"},
         ("relative_motion_completed",),
+        dispatch="dedicated",
     ),
     "play_animation": SkillSpec(
         "play_animation",
@@ -240,6 +227,7 @@ DEFAULT_SKILLS: dict[str, SkillSpec] = {
         "Play a named animator clip or generator.",
         {"animation": "string"},
         ("animation_played",),
+        dispatch="dedicated",
     ),
     "look_at": SkillSpec(
         "look_at",
@@ -247,6 +235,7 @@ DEFAULT_SKILLS: dict[str, SkillSpec] = {
         "Compatibility wrapper for look_at_static direction controls.",
         {"direction": "direction"},
         ("look_at_static_completed",),
+        dispatch="dedicated",
     ),
     "point_at": SkillSpec(
         "point_at",
@@ -254,6 +243,7 @@ DEFAULT_SKILLS: dict[str, SkillSpec] = {
         "Compatibility wrapper that points at an arbitrary target.",
         {"target": "object|place|x/y/z"},
         ("point_at",),
+        dispatch="dedicated",
     ),
     "come_to_me": SkillSpec(
         "come_to_me",
@@ -261,8 +251,12 @@ DEFAULT_SKILLS: dict[str, SkillSpec] = {
         "Compatibility wrapper for navigating to the current interaction owner.",
         {},
         ("robot_near_interaction_owner",),
+        dispatch="dedicated",
     ),
 }
+
+
+GENERIC_SKILL_NAMES = {name for name, spec in DEFAULT_SKILLS.items() if spec.dispatch != "voice"}
 
 
 class SkillRegistry:
