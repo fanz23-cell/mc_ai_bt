@@ -307,6 +307,16 @@ def test_relation_checked_false_when_not_matched():
     assert result.state is TriState.FALSE
 
 
+def test_entity_approached_confirmed_by_execution_fact():
+    goal_spec = {"type": "structured", "predicate": "entity_approached", "args": {"target": "person"}}
+    execution = ExecutionResult(
+        True, "approached", {"entity_approached": {"matched": True, "target": "person"}})
+
+    result = GoalChecker().check(goal_spec, execution)
+
+    assert result.state is TriState.TRUE
+
+
 def test_world_snapshot_can_confirm_person_visible_by_count():
     world_json = json.dumps(
         {

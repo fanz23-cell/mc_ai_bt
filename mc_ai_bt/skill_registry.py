@@ -32,6 +32,7 @@ GENERIC_SKILL_NAMES = {
     "oscillate",
     "retract",
     "go_to_place",
+    "approach_entity",
     "follow_entity",
     "guide_entity_to_place",
     "wait_for_participant",
@@ -179,6 +180,15 @@ DEFAULT_SKILLS: dict[str, SkillSpec] = {
         "Navigate to an arbitrary configured place region.",
         {"place": "name|place"},
         ("robot_at_place",),
+    ),
+    "approach_entity": SkillSpec(
+        "approach_entity",
+        ("base",),
+        "Navigate to an entity's current live position (from locate_entity/perception), "
+        "not a preconfigured place -- use this for 'go to <person/object>' when no named "
+        "place applies. Fails if the entity has not been perceived recently.",
+        {"target": "entity|entity_id|object|person"},
+        ("entity_approached",),
     ),
     "follow_entity": SkillSpec(
         "follow_entity",

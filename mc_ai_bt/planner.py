@@ -439,6 +439,14 @@ def build_planner_messages(
                 "by one of near/at/by/next to/close to, e.g. relation='the mug near the sink'. "
                 "It only checks entity-to-entity proximity, not containment in a named place."
             ),
+            (
+                "go_to_place ONLY works for a place already configured by name -- if there is no "
+                "known place for what the person means (e.g. 'go to her', 'walk over to the box'), "
+                "do not invent a place name. Use approach_entity instead: one arg, target, the "
+                "plain name of the person/object to walk to; it navigates to that entity's live "
+                "perceived position. It fails if the entity has not been perceived recently -- "
+                "that is a real, reportable outcome, not something to retry with a guessed place."
+            ),
             "Do not invent ROS topics, action names, Python code, frames, joint commands or expressions.",
             "For physical actions, use only skills from the skill catalog.",
             (

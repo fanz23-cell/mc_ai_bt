@@ -85,6 +85,9 @@ PREDICATE_REGISTRY: dict[str, PredicateSpec] = {
     "relation_checked": PredicateSpec("relation_checked", ("objects", "people", "entities"), "objects"),
     "search_for_entity_completed": PredicateSpec(
         "search_for_entity_completed", ("objects", "people", "entities"), "objects"),
+    # approach_entity (mc_embodied_skills) -- navigates to a located entity's live
+    # position via nav2's raw NavigateToPose, not a preconfigured place (go_to_place).
+    "entity_approached": PredicateSpec("entity_approached", ("objects", "people", "entities"), "objects"),
 }
 
 

@@ -9,6 +9,7 @@ from .skill_registry import GENERIC_SKILL_NAMES, SkillRegistry
 ALLOWED_TOP_LEVEL_KEYS = {"schema", "root", "goal_spec", "context_json"}
 PHYSICAL_SKILLS = {
     "go_to_place",
+    "approach_entity",
     "come_to_me",
     "simple_move",
     "play_animation",
@@ -31,7 +32,10 @@ PHYSICAL_SKILLS = {
     "follow_entity",
     "guide_entity_to_place",
 }
-BASE_SKILLS = {"go_to_place", "come_to_me", "simple_move", "maintain_distance", "follow_entity", "guide_entity_to_place"}
+BASE_SKILLS = {
+    "go_to_place", "approach_entity", "come_to_me", "simple_move",
+    "maintain_distance", "follow_entity", "guide_entity_to_place",
+}
 BODY_SKILLS = {
     "play_animation",
     "look_at",
@@ -285,7 +289,7 @@ class PolicyGuard:
             self._check_look_at(args, path, errors)
         elif skill == "point_at":
             self._check_point_at(args, path, errors)
-        elif skill in {"locate_entity", "track_entity", "search_for_entity", "get_pose"}:
+        elif skill in {"locate_entity", "track_entity", "search_for_entity", "get_pose", "approach_entity"}:
             self._check_entity_target(args, path, errors, skill=skill)
         elif skill in {"look_at_static", "track_with_gaze"}:
             self._check_look_or_track(args, path, errors, skill=skill)
@@ -563,6 +567,7 @@ class PolicyGuard:
             return
         expected = {
             "robot_at_place": ("go_to_place",),
+            "entity_approached": ("approach_entity",),
             "robot_near_interaction_owner": ("come_to_me",),
             "relative_motion_completed": ("simple_move",),
             "animation_played": ("play_animation", "look_at", "point_at"),

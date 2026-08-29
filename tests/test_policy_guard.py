@@ -276,6 +276,20 @@ def test_policy_rejects_embodied_skill_without_required_target():
     assert any("reach target" in error for error in result.errors)
 
 
+def test_policy_accepts_approach_entity_with_target():
+    plan = _plan({"type": "Action", "skill": "approach_entity", "args": {"target": "person"}})
+
+    assert PolicyGuard().check(plan).ok
+
+
+def test_policy_rejects_approach_entity_without_target():
+    plan = _plan({"type": "Action", "skill": "approach_entity", "args": {}})
+
+    result = PolicyGuard().check(plan)
+
+    assert not result.ok
+
+
 def test_policy_rejects_unsafe_visual_check_predicate():
     plan = _plan(
         {
