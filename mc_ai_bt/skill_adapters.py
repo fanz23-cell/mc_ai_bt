@@ -49,6 +49,7 @@ EMBODIED_SKILLS = {
     "detect_contact",
     "oscillate",
     "retract",
+    "approach_entity",
     "follow_entity",
     "guide_entity_to_place",
     "wait_for_participant",
