@@ -255,6 +255,58 @@ def test_object_visible_can_be_confirmed_by_execution_fact():
     assert result.state is TriState.TRUE
 
 
+def test_entity_located_confirmed_by_execution_fact():
+    goal_spec = {
+        "type": "structured",
+        "predicate": "entity_located",
+        "args": {"target": "mystery_gadget"},
+    }
+    execution = ExecutionResult(
+        True, "located", {"entity_located": {"matched": True, "target": "mystery_gadget"}})
+
+    result = GoalChecker().check(goal_spec, execution)
+
+    assert result.state is TriState.TRUE
+
+
+def test_entity_located_missing_evidence_is_unknown_not_false():
+    goal_spec = {"type": "structured", "predicate": "entity_located", "args": {"target": "mystery_gadget"}}
+
+    result = GoalChecker().check(goal_spec, ExecutionResult(True, "located", {}))
+
+    assert result.state is TriState.UNKNOWN
+
+
+def test_search_for_entity_completed_confirmed_by_execution_fact():
+    goal_spec = {"type": "structured", "predicate": "search_for_entity_completed", "args": {"target": "widget"}}
+    execution = ExecutionResult(
+        True, "searched", {"search_for_entity_completed": {"matched": True, "target": "widget"}})
+
+    result = GoalChecker().check(goal_spec, execution)
+
+    assert result.state is TriState.TRUE
+
+
+def test_relation_checked_confirmed_by_execution_fact():
+    goal_spec = {"type": "structured", "predicate": "relation_checked", "args": {"relation": "mug near sink"}}
+    execution = ExecutionResult(
+        True, "checked", {"relation_checked": {"matched": True, "relation": "mug near sink"}})
+
+    result = GoalChecker().check(goal_spec, execution)
+
+    assert result.state is TriState.TRUE
+
+
+def test_relation_checked_false_when_not_matched():
+    goal_spec = {"type": "structured", "predicate": "relation_checked", "args": {"relation": "mug near sink"}}
+    execution = ExecutionResult(
+        True, "checked", {"relation_checked": {"matched": False, "relation": "mug near sink"}})
+
+    result = GoalChecker().check(goal_spec, execution)
+
+    assert result.state is TriState.FALSE
+
+
 def test_world_snapshot_can_confirm_person_visible_by_count():
     world_json = json.dumps(
         {

@@ -427,6 +427,18 @@ def build_planner_messages(
                 "point_at must use exactly one target form: object/target name, place name, "
                 "or explicit x/y/z coordinates; optional arm is left or right."
             ),
+            (
+                "locate_entity, get_pose and search_for_entity take exactly one arg, target: "
+                "the plain name of the object or person to look for, e.g. target=mystery_gadget. "
+                "They check current world-state knowledge, not an active physical search; an "
+                "UNKNOWN/not-found result means the entity has not been perceived recently, not "
+                "that it does not exist."
+            ),
+            (
+                "check_relation takes exactly one arg, relation: two entity/object names joined "
+                "by one of near/at/by/next to/close to, e.g. relation='the mug near the sink'. "
+                "It only checks entity-to-entity proximity, not containment in a named place."
+            ),
             "Do not invent ROS topics, action names, Python code, frames, joint commands or expressions.",
             "For physical actions, use only skills from the skill catalog.",
             (

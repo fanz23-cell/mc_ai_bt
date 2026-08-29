@@ -72,6 +72,19 @@ PREDICATE_REGISTRY: dict[str, PredicateSpec] = {
     "oscillation_completed": PredicateSpec("oscillation_completed", ("robot", "objects", "people", "interactions"), "robot"),
     "retracted": PredicateSpec("retracted", ("robot",), "robot"),
     "human_confirmation": PredicateSpec("human_confirmation", ("tasks",), "tasks"),
+    # locate_entity/get_pose/search_for_entity/check_relation (mc_embodied_skills,
+    # RosActionSkillProvider) populate these via the generic PREDICATE_REGISTRY path
+    # below -- their evidence already carries a "matched" bool, exactly the shape
+    # _direct_predicate_result expects, so no bespoke handler is needed the way
+    # object_visible/person_visible have one. mc_world_state itself never writes a
+    # fact under these names, so the world-state snapshot fallback always reports
+    # UNKNOWN for them; execution facts (the action that just ran) are the only real
+    # source, same as animation_played/robot_at_place above.
+    "entity_located": PredicateSpec("entity_located", ("objects", "people", "entities"), "objects"),
+    "pose_available": PredicateSpec("pose_available", ("objects", "people", "entities"), "objects"),
+    "relation_checked": PredicateSpec("relation_checked", ("objects", "people", "entities"), "objects"),
+    "search_for_entity_completed": PredicateSpec(
+        "search_for_entity_completed", ("objects", "people", "entities"), "objects"),
 }
 
 
