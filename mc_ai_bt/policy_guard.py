@@ -490,6 +490,11 @@ class PolicyGuard:
         participant = _clean_label(args.get("participant") or args.get("role") or args.get("entity"))
         if participant and len(participant) > 128:
             errors.append(f"{path}.args.participant must be <= 128 chars")
+        condition = str(args.get("condition") or "present").strip().lower()
+        if condition not in {"present", "hand_raised", "hand_offered", "facing_robot"}:
+            errors.append(
+                f"{path}.args.condition must be one of present/hand_raised/hand_offered/facing_robot"
+            )
 
     def _check_totals(self, stats: "_Stats", errors: list[str]) -> None:
         limits = self._limits

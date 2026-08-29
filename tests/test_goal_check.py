@@ -317,6 +317,24 @@ def test_entity_approached_confirmed_by_execution_fact():
     assert result.state is TriState.TRUE
 
 
+def test_participant_ready_confirmed_by_execution_fact():
+    goal_spec = {"type": "structured", "predicate": "participant_ready", "args": {"role": "customer"}}
+    execution = ExecutionResult(
+        True, "ready", {"participant_ready": {"matched": True, "person_id": "person:1", "role": "customer"}})
+
+    result = GoalChecker().check(goal_spec, execution)
+
+    assert result.state is TriState.TRUE
+
+
+def test_participant_ready_missing_evidence_is_unknown_not_false():
+    goal_spec = {"type": "structured", "predicate": "participant_ready", "args": {"role": "customer"}}
+
+    result = GoalChecker().check(goal_spec, ExecutionResult(True, "ready", {}))
+
+    assert result.state is TriState.UNKNOWN
+
+
 def test_world_snapshot_can_confirm_person_visible_by_count():
     world_json = json.dumps(
         {

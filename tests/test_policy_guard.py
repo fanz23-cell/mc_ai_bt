@@ -290,6 +290,31 @@ def test_policy_rejects_approach_entity_without_target():
     assert not result.ok
 
 
+def test_policy_accepts_wait_for_participant_default_condition():
+    plan = _plan({"type": "Action", "skill": "wait_for_participant", "args": {"role": "customer"}})
+
+    assert PolicyGuard().check(plan).ok
+
+
+def test_policy_accepts_wait_for_participant_explicit_condition():
+    plan = _plan(
+        {"type": "Action", "skill": "wait_for_participant", "args": {"role": "customer", "condition": "hand_raised"}}
+    )
+
+    assert PolicyGuard().check(plan).ok
+
+
+def test_policy_rejects_wait_for_participant_bad_condition():
+    plan = _plan(
+        {"type": "Action", "skill": "wait_for_participant", "args": {"condition": "waving"}}
+    )
+
+    result = PolicyGuard().check(plan)
+
+    assert not result.ok
+    assert any("condition" in error for error in result.errors)
+
+
 def test_policy_rejects_unsafe_visual_check_predicate():
     plan = _plan(
         {

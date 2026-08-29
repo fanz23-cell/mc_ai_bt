@@ -88,6 +88,10 @@ PREDICATE_REGISTRY: dict[str, PredicateSpec] = {
     # approach_entity (mc_embodied_skills) -- navigates to a located entity's live
     # position via nav2's raw NavigateToPose, not a preconfigured place (go_to_place).
     "entity_approached": PredicateSpec("entity_approached", ("objects", "people", "entities"), "objects"),
+    # wait_for_participant (mc_embodied_skills) -- polls mc_world_state's "people"
+    # scope directly until a matching SemanticPerson fact appears; evidence already
+    # carries "matched", same generic path as entity_located et al. above.
+    "participant_ready": PredicateSpec("participant_ready", ("people",), "people"),
 }
 
 

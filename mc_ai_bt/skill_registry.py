@@ -193,8 +193,15 @@ DEFAULT_SKILLS: dict[str, SkillSpec] = {
     "wait_for_participant": SkillSpec(
         "wait_for_participant",
         (),
-        "Wait for a participant/role to become available in World State.",
-        {"participant": "role|entity"},
+        "Wait for a person matching an optional role to satisfy a condition in World "
+        "State (present/hand_raised/hand_offered/facing_robot), polling until it "
+        "happens or timeout_sec elapses. Does not itself move the robot.",
+        {
+            "role": "optional role name, matched against the person's roles[] "
+            "(omit to match any visible person)",
+            "condition": "one of present/hand_raised/hand_offered/facing_robot, "
+            "default present",
+        },
         ("participant_ready",),
     ),
     "say": SkillSpec(
