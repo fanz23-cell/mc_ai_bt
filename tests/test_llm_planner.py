@@ -42,3 +42,17 @@ def test_planner_prompt_names_allowed_skills_and_constraints():
     assert "look_at may use only direction" in system
     assert "Do not invent ROS topics" in system
     assert "UNKNOWN" in system
+
+
+def test_planner_prompt_includes_args_schema_for_every_skill():
+    # Found live 2026-08-29 building remember_place: the skill catalog line used to
+    # carry only resources+description, never args_schema, so the model had no idea
+    # what argument keys a brand-new skill took and generated a node missing
+    # args.name outright. Confirmed live: adding args_schema to this line fixed it
+    # 3/3 tries where it had failed before. This is the systemic guard against that
+    # class of bug regressing for ANY future skill, not just this one.
+    messages = build_planner_messages("remember this spot as front_desk", "{}")
+    system = messages[0][1]
+
+    assert '"name": "place name to save"' in system
+    assert '"target": "entity|entity_id|object|person"' in system

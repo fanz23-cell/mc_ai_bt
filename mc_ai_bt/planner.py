@@ -398,7 +398,19 @@ def build_planner_messages(
             continue
         spec = skills.get(name)
         resources = ",".join(spec.resources) if spec.resources else "none"
-        skill_lines.append(f"- {spec.name}: resources=[{resources}] {spec.description}")
+        # Found live 2026-08-29 building remember_place: this line used to omit
+        # args_schema entirely, so the model had no idea what argument keys a new
+        # skill actually took and had to guess from the free-text description alone
+        # -- it generated a remember_place node missing args.name outright. The
+        # handful of skills below with their own hardcoded sentences (look_at,
+        # point_at, go_to_place/approach_entity, etc.) exist BECAUSE this line
+        # never carried that information; surfacing args_schema here directly, for
+        # every skill, is the systemic fix (not one more hardcoded sentence for
+        # remember_place specifically) -- it may make some of those sentences
+        # redundant over time, but removing them isn't done here since they still
+        # carry semantic guidance (e.g. "don't invent a place name") beyond arg shape.
+        args_repr = json.dumps(spec.args_schema) if spec.args_schema else "{}"
+        skill_lines.append(f"- {spec.name}: resources=[{resources}] args={args_repr} {spec.description}")
 
     system = "\n".join(
         [
