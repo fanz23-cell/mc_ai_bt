@@ -256,3 +256,48 @@ def test_rejects_parallel_branches_with_conflicting_skill_resources():
 
     assert not result.ok
     assert any("conflicting resources" in error and "body" in error for error in result.errors)
+
+
+def test_rejects_parallel_branches_with_cross_family_resource_conflict():
+    # Found live 2026-08-29 (§C5): "body" and "gaze" are different resource
+    # strings, but mc_resource_authority's own runtime lease arbiter treats
+    # them as conflicting (body's children include gaze) -- a plan pairing
+    # play_animation (body) with look_at_static (gaze) used to clear this
+    # validator with zero errors and only get denied later, at the resource
+    # lease, or worse race silently for skills that skip leasing entirely.
+    plan = {
+        "root": {
+            "type": "Parallel",
+            "children": [
+                {"type": "Action", "skill": "play_animation", "args": {"animation": "wave"}},
+                {"type": "Action", "skill": "look_at_static", "args": {"target": "left"}},
+            ],
+        },
+        "goal_spec": {
+            "type": "human",
+            "verification": {"mode": "implicit_conversation"},
+        },
+    }
+
+    result = PlanValidator().validate(plan)
+
+    assert not result.ok
+    assert any("conflicting resources" in error for error in result.errors)
+
+
+def test_accepts_parallel_branches_with_genuinely_unrelated_resources():
+    plan = {
+        "root": {
+            "type": "Parallel",
+            "children": [
+                {"type": "Action", "skill": "say", "args": {"text": "hi"}},
+                {"type": "Action", "skill": "simple_move", "args": {"action": "forward", "value": 0.2}},
+            ],
+        },
+        "goal_spec": {
+            "type": "human",
+            "verification": {"mode": "implicit_conversation"},
+        },
+    }
+
+    assert PlanValidator().validate(plan).ok

@@ -203,11 +203,18 @@ class PlanValidator:
             branch_resources.append((idx, resources))
         for left_pos, (left_idx, left_resources) in enumerate(branch_resources):
             for right_idx, right_resources in branch_resources[left_pos + 1 :]:
-                overlap = sorted(left_resources & right_resources)
-                if overlap:
+                conflicts = sorted(
+                    {
+                        f"{left}~{right}" if left != right else left
+                        for left in left_resources
+                        for right in right_resources
+                        if resources_conflict(left, right)
+                    }
+                )
+                if conflicts:
                     errors.append(
                         f"{path}.children[{left_idx}] and {path}.children[{right_idx}] "
-                        f"have conflicting resources: {overlap}"
+                        f"have conflicting resources: {conflicts}"
                     )
 
     def _collect_action_resources(self, node: Any) -> set[str]:
@@ -254,3 +261,36 @@ def _looks_like_visual_check(check: dict[str, Any]) -> bool:
     if _looks_like_goal_check(check):
         return True
     return isinstance(check.get("query"), str) and check["query"].strip()
+
+
+# resources_conflict/resource_conflict_family: an intentional, independent copy of
+# mc_resource_authority/mc_resource_authority/authority.py's own functions of the
+# same name -- these are two separately-deployed packages/images, so they cannot
+# share a Python module directly (the same reason §9.1's skill-name consolidation
+# settled on per-repo derivation + a cross-repo test, not a shared mc_one module).
+# Kept in sync by mc_ai_bt/tests/test_cross_repo_resource_semantics.py, which
+# imports the real mc_resource_authority definition (when checked out as a
+# sibling directory) and asserts the two agree pairwise over every known
+# resource name. Found live 2026-08-29 (§C5): before this, a Parallel plan
+# using "body" and "gaze" resources -- which mc_resource_authority's own lease
+# arbiter DOES treat as conflicting -- passed this validator with zero errors,
+# only to be denied a lease at runtime (or worse, silently race at the ROS
+# action-server level for skills that don't acquire a lease at all -- see
+# skill_adapters.py's _run_action).
+def resources_conflict(left: str, right: str) -> bool:
+    left = left.strip()
+    right = right.strip()
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    return right in resource_conflict_family(left) or left in resource_conflict_family(right)
+
+
+def resource_conflict_family(resource: str) -> set[str]:
+    body_children = {"left_arm", "right_arm", "gaze", "head", "torso"}
+    if resource == "body":
+        return {"body", *body_children}
+    if resource in body_children:
+        return {resource, "body"}
+    return {resource}
