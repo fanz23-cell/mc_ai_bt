@@ -344,6 +344,64 @@ def test_policy_rejects_wait_for_participant_bad_condition():
     assert any("condition" in error for error in result.errors)
 
 
+def test_policy_accepts_wait_for_event_within_bounds():
+    plan = _plan(
+        {
+            "type": "WaitForEvent",
+            "predicate": "participant_ready",
+            "args": {"role": "customer"},
+            "poll_interval_sec": 2.0,
+            "timeout_sec": 600.0,
+        }
+    )
+
+    assert PolicyGuard().check(plan).ok
+
+
+def test_policy_accepts_wait_for_event_default_poll_interval():
+    plan = _plan({"type": "WaitForEvent", "predicate": "participant_ready", "timeout_sec": 60.0})
+
+    assert PolicyGuard().check(plan).ok
+
+
+def test_policy_rejects_wait_for_event_poll_interval_out_of_bounds():
+    plan = _plan(
+        {"type": "WaitForEvent", "predicate": "participant_ready", "poll_interval_sec": 0.1, "timeout_sec": 60.0}
+    )
+
+    result = PolicyGuard().check(plan)
+
+    assert not result.ok
+    assert any("poll_interval_sec" in error for error in result.errors)
+
+
+def test_policy_rejects_wait_for_event_timeout_missing():
+    plan = _plan({"type": "WaitForEvent", "predicate": "participant_ready"})
+
+    result = PolicyGuard().check(plan)
+
+    assert not result.ok
+    assert any("timeout_sec" in error for error in result.errors)
+
+
+def test_policy_rejects_wait_for_event_timeout_too_large():
+    plan = _plan({"type": "WaitForEvent", "predicate": "participant_ready", "timeout_sec": 1801.0})
+
+    result = PolicyGuard().check(plan)
+
+    assert not result.ok
+    assert any("timeout_sec" in error for error in result.errors)
+
+
+def test_policy_rejects_wait_for_event_unsafe_predicate():
+    plan = _plan({"type": "WaitForEvent", "predicate": "__import__", "timeout_sec": 60.0})
+
+    result = PolicyGuard().check(plan)
+
+    assert not result.ok
+    assert any("policy-safe" in error for error in result.errors)
+
+
 def test_policy_rejects_unsafe_visual_check_predicate():
     plan = _plan(
         {

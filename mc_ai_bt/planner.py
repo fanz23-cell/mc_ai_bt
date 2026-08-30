@@ -421,11 +421,28 @@ def build_planner_messages(
             "root must be a Behavior Tree made only from executable node types.",
             (
                 "Executable node types: Sequence, Fallback, Parallel, Timeout, Action, Wait, Retry, "
-                "Condition, GoalCheck, VisualCheck, NoAction."
+                "Condition, GoalCheck, VisualCheck, NoAction, WaitForEvent."
             ),
             "Parallel children must be independently safe and must not require overlapping skill resources.",
             "Timeout wraps exactly one child and must set timeout_sec in seconds.",
             "NoAction is only for an explicit already-satisfied/no-op plan with a short reason.",
+            (
+                "WaitForEvent shape (flat object, no nesting): "
+                '{"type": "WaitForEvent", "predicate": "<predicate name string, e.g. participant_ready>", '
+                '"args": {<that predicate\'s own args, e.g. role, condition>}, "poll_interval_sec": <0.5-30, '
+                'default 2>, "timeout_sec": <required, max 1800>}. predicate is a plain string naming an '
+                "existing structured predicate (the same ones Condition/GoalCheck use) -- never a nested "
+                "Condition/GoalCheck object. Polls that predicate every poll_interval_sec until TRUE or "
+                "timeout_sec elapses; use it instead of Retry(Sequence[Wait,Condition]) for 'wait until X "
+                "happens', since that pattern caps out around 1500s and has no real interval control. Only "
+                "use predicate names that already exist as a result of some skill's result_predicates "
+                "(e.g. robot_at_place, entity_faced, participant_ready) -- never invent one. For 'wait for "
+                "a person/role to become ready/raise a hand/etc', do NOT use WaitForEvent at all: call the "
+                "wait_for_participant skill directly as a plain Action (args role/condition; set the "
+                "Action's own top-level timeout_sec, max 600, for how long to wait, NOT inside args) -- it "
+                "already blocks internally up to its own timeout, so wrapping it in WaitForEvent or "
+                "inventing a predicate for it is always wrong."
+            ),
             (
                 "VisualCheck must be a concise true/false visual query. It may use structured world-state "
                 "evidence or the configured visual checker; UNKNOWN blocks instead of being guessed."

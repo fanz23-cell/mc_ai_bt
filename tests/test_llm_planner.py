@@ -44,6 +44,14 @@ def test_planner_prompt_names_allowed_skills_and_constraints():
     assert "UNKNOWN" in system
 
 
+def test_planner_prompt_lists_wait_for_event_node_type():
+    messages = build_planner_messages("wait until a customer raises a hand", "{}")
+    system = messages[0][1]
+
+    assert "WaitForEvent" in system
+    assert "poll_interval_sec" in system
+
+
 def test_planner_prompt_includes_args_schema_for_every_skill():
     # Found live 2026-08-29 building remember_place: the skill catalog line used to
     # carry only resources+description, never args_schema, so the model had no idea

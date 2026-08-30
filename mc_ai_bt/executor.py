@@ -4,6 +4,7 @@ import json
 import threading
 from dataclasses import dataclass, field
 from threading import Event
+from time import monotonic
 from typing import Any, Callable, Protocol
 
 from .visual_check import visual_check_goal_spec
@@ -200,6 +201,13 @@ class BtExecutor:
             return self._execute_progress_leaf(
                 _node_label(node, _path),
                 lambda: self._execute_goal_check(node, checks, facts),
+                progress_callback,
+                _progress_state,
+            )
+        if node_type == "WaitForEvent":
+            return self._execute_progress_leaf(
+                _node_label(node, _path),
+                lambda: self._execute_wait_for_event(node, checks, facts, cancel_event),
                 progress_callback,
                 _progress_state,
             )
@@ -445,6 +453,47 @@ class BtExecutor:
         goal_spec = _normalise_goal_check_spec(check)
         return _check_as_execution_result(checks, goal_spec, facts, label="goal check")
 
+    def _execute_wait_for_event(
+        self,
+        node: dict[str, Any],
+        checks: CheckExecutor | None,
+        facts: dict[str, Any],
+        cancel_event: Event | None,
+    ) -> ExecutionResult:
+        if checks is None:
+            return ExecutionResult(False, "wait_for_event checker is not configured", facts, True)
+        try:
+            poll_interval_sec = float(node.get("poll_interval_sec", 2.0))
+        except (TypeError, ValueError):
+            return ExecutionResult(False, "wait_for_event poll_interval_sec must be numeric")
+        try:
+            timeout_sec = float(node.get("timeout_sec"))
+        except (TypeError, ValueError):
+            return ExecutionResult(False, "wait_for_event timeout_sec must be numeric")
+        goal_spec = {
+            "type": "structured",
+            "predicate": node.get("predicate"),
+            "args": node.get("args") or {},
+            "verification": node.get("verification") or {"mode": "world_state"},
+        }
+        deadline = monotonic() + max(0.0, timeout_sec)
+        waiter = cancel_event if cancel_event is not None else Event()
+        while True:
+            result = checks.check(goal_spec, ExecutionResult(True, "wait_for_event input", dict(facts)))
+            state = _tri_state_value(getattr(result, "state", "UNKNOWN"))
+            message = str(getattr(result, "message", ""))
+            if state == "TRUE":
+                return ExecutionResult(True, f"wait_for_event TRUE: {message}", facts)
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                # Timed out, not disproven: "didn't happen in time" is UNKNOWN, the
+                # same way a Condition/GoalCheck UNKNOWN pauses rather than fails --
+                # see ExecutionResult.needs_decision's docstring.
+                return ExecutionResult(
+                    False, f"wait_for_event timed out: {message}", facts, True, needs_decision=True)
+            if waiter.wait(timeout=min(poll_interval_sec, remaining)):
+                return ExecutionResult(False, "mission canceled")
+
     def _execute_visual_check(
         self,
         node: dict[str, Any],
@@ -530,7 +579,7 @@ def _count_progress_leaves(node: Any) -> int:
     if not isinstance(node, dict):
         return 0
     node_type = node.get("type")
-    if node_type in {"Action", "Wait", "Condition", "GoalCheck", "VisualCheck", "NoAction"}:
+    if node_type in {"Action", "Wait", "Condition", "GoalCheck", "VisualCheck", "NoAction", "WaitForEvent"}:
         return 1
     if node_type in {"Sequence", "Fallback", "Parallel"}:
         return sum(_count_progress_leaves(child) for child in node.get("children", []) or [])

@@ -93,6 +93,15 @@ class PolicyLimits:
     max_point_z_m: float = 2.2
     max_confirmation_prompt_chars: int = 240
     max_confirmation_timeout_sec: float = 300.0
+    # WaitForEvent (§10.8) is deliberately NOT folded into max_wait_total_sec -- that
+    # budget is for plain Wait's idle, no-information sleep (kept tight at 30s total).
+    # WaitForEvent is the opposite: a bounded, productive poll this node type exists so
+    # a plan doesn't need Retry(Sequence[Wait,Condition])'s ~1500s/5-attempt workaround
+    # (see the capability audit's wait_for_event row). Its own ceiling is per-node, not
+    # accumulated across a plan.
+    min_wait_for_event_poll_sec: float = 0.5
+    max_wait_for_event_poll_sec: float = 30.0
+    max_wait_for_event_timeout_sec: float = 1800.0
 
 
 class PolicyGuard:
@@ -197,6 +206,29 @@ class PolicyGuard:
             predicate = str(check.get("predicate") or "")
             if predicate.startswith("__") or "." in predicate:
                 errors.append(f"{path}.check.predicate is not policy-safe: {predicate!r}")
+            return
+        if node_type == "WaitForEvent":
+            stats.conditions += retry_multiplier
+            predicate = str(node.get("predicate") or "")
+            if predicate.startswith("__") or "." in predicate:
+                errors.append(f"{path}.predicate is not policy-safe: {predicate!r}")
+            poll_interval_sec = node.get("poll_interval_sec", self._limits.min_wait_for_event_poll_sec)
+            if not isinstance(poll_interval_sec, (int, float)) or not (
+                self._limits.min_wait_for_event_poll_sec <= poll_interval_sec
+                <= self._limits.max_wait_for_event_poll_sec
+            ):
+                errors.append(
+                    f"{path}.poll_interval_sec must be in "
+                    f"[{self._limits.min_wait_for_event_poll_sec:g}, "
+                    f"{self._limits.max_wait_for_event_poll_sec:g}]"
+                )
+            timeout_sec = node.get("timeout_sec")
+            if not isinstance(timeout_sec, (int, float)) or not (
+                0 < timeout_sec <= self._limits.max_wait_for_event_timeout_sec
+            ):
+                errors.append(
+                    f"{path}.timeout_sec must be in (0, {self._limits.max_wait_for_event_timeout_sec:g}]"
+                )
             return
         if node_type == "VisualCheck":
             stats.visual_checks += retry_multiplier

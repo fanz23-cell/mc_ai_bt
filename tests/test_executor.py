@@ -55,6 +55,20 @@ class FakeChecksWithVisual(FakeChecks):
         return CheckResult(self.visual_state, f"{self.visual_state.value.lower()} visual")
 
 
+class FakeChecksSequence:
+    """Returns a different TriState on each successive call -- used to prove
+    WaitForEvent actually re-polls instead of only checking once."""
+
+    def __init__(self, states):
+        self.states = list(states)
+        self.calls = 0
+
+    def check(self, goal_spec: dict, execution: ExecutionResult):
+        self.calls += 1
+        state = self.states[min(self.calls - 1, len(self.states) - 1)]
+        return CheckResult(state, f"{state.value.lower()} check {self.calls}")
+
+
 class FactSkills:
     def __init__(self):
         self.calls = []
@@ -305,6 +319,76 @@ def test_executor_condition_unknown_blocks_instead_of_failing_false():
     # the person) could resolve this, so it's the one case that should
     # become a resumable escalation pause rather than a terminal BLOCKED.
     assert result.needs_decision
+
+
+def test_wait_for_event_succeeds_immediately_when_true():
+    checks = FakeChecks(TriState.TRUE)
+    node = {"type": "WaitForEvent", "predicate": "participant_ready", "timeout_sec": 5.0, "poll_interval_sec": 0.05}
+
+    result = BtExecutor().execute(node, FakeSkills(), checks=checks)
+
+    assert result.success
+    assert len(checks.requests) == 1
+
+
+def test_wait_for_event_polls_until_true():
+    checks = FakeChecksSequence([TriState.FALSE, TriState.FALSE, TriState.TRUE])
+    node = {"type": "WaitForEvent", "predicate": "participant_ready", "timeout_sec": 5.0, "poll_interval_sec": 0.02}
+
+    result = BtExecutor().execute(node, FakeSkills(), checks=checks)
+
+    assert result.success
+    assert checks.calls == 3
+
+
+def test_wait_for_event_times_out_as_unknown_not_false():
+    checks = FakeChecks(TriState.FALSE)
+    node = {"type": "WaitForEvent", "predicate": "participant_ready", "timeout_sec": 0.12, "poll_interval_sec": 0.05}
+
+    result = BtExecutor().execute(node, FakeSkills(), checks=checks)
+
+    assert not result.success
+    assert result.blocked
+    assert result.needs_decision
+    assert "timed out" in result.message
+
+
+def test_wait_for_event_respects_cancellation():
+    checks = FakeChecks(TriState.FALSE)
+    cancel_event = threading.Event()
+
+    def _cancel_soon():
+        time.sleep(0.05)
+        cancel_event.set()
+
+    threading.Thread(target=_cancel_soon).start()
+    node = {"type": "WaitForEvent", "predicate": "participant_ready", "timeout_sec": 5.0, "poll_interval_sec": 0.5}
+    start = time.monotonic()
+
+    result = BtExecutor().execute(node, FakeSkills(), cancel_event=cancel_event, checks=checks)
+
+    assert time.monotonic() - start < 1.0
+    assert not result.success
+    assert "canceled" in result.message
+
+
+def test_wait_for_event_requires_numeric_timeout():
+    checks = FakeChecks(TriState.TRUE)
+    node = {"type": "WaitForEvent", "predicate": "participant_ready", "poll_interval_sec": 0.05}
+
+    result = BtExecutor().execute(node, FakeSkills(), checks=checks)
+
+    assert not result.success
+    assert "timeout_sec must be numeric" in result.message
+
+
+def test_wait_for_event_blocked_without_checker():
+    node = {"type": "WaitForEvent", "predicate": "participant_ready", "timeout_sec": 1.0}
+
+    result = BtExecutor().execute(node, FakeSkills(), checks=None)
+
+    assert not result.success
+    assert result.blocked
 
 
 def test_goal_check_sees_facts_from_previous_action():
