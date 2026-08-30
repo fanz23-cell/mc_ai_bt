@@ -479,6 +479,27 @@ def build_planner_messages(
                 "a human-type goal_spec (verification mode implicit_conversation) instead of a structured one."
             ),
             (
+                # Found live 2026-08-30: a plan called search_for_entity(target=\"woman\"), then checked
+                # a Condition with predicate \"visible_people\" -- not in the list above at all. That exact
+                # string IS real inside this codebase, just not as a predicate: it is the raw fact-storage
+                # key under the world-state \"people\" scope that person_visible's own evaluation reads
+                # internally (goal_check.py), so it plausibly *looks* like a valid name without being one.
+                # Whether the model meant person_visible or genuinely invented it, checking either one here
+                # was the wrong call: search_for_entity's OWN result (search_for_entity_completed) is what
+                # actually reflects whether that search just found \"woman\" -- person_visible/visible_people
+                # answer a different, unrelated question (is a person visible in the current camera frame
+                # right now, independent of any search this plan ran).
+                '"visible_people" is never a valid predicate name -- it is an internal fact key, not '
+                "something a Condition/GoalCheck/WaitForEvent can check; do not write it. More generally: "
+                "immediately after calling a locate-type skill (search_for_entity, locate_entity, get_pose, "
+                "wait_for_participant, check_relation), the Condition/GoalCheck that asks \"did that just "
+                "find/confirm it\" must check THAT skill's own result predicate from the (from <skill>) list "
+                "above (search_for_entity_completed, entity_located, pose_available, participant_ready, "
+                "relation_checked respectively) -- not person_visible/object_visible, which answer a "
+                "different question (is something visible in the current camera view right now) and are "
+                "correct ONLY when nothing in this plan already ran a locate-type skill for the same target."
+            ),
+            (
                 "Never write a say node whose text states the outcome of a Condition/GoalCheck/"
                 "VisualCheck/check_relation/locate_entity-family step that has not run yet -- a say node's "
                 "text is fixed at planning time, before any check has actually executed, so writing 'Yes, "

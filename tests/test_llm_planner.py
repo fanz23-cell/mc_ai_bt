@@ -84,3 +84,19 @@ def test_planner_prompt_includes_args_schema_for_every_skill():
 
     assert '"name": "place name to save"' in system
     assert '"target": "entity|entity_id|object|person"' in system
+
+
+def test_planner_prompt_warns_against_visible_people_and_wrong_predicate_after_search():
+    # Found live 2026-08-30: a real submitted mission ("find a woman in the room")
+    # planned search_for_entity(target="woman") followed by a Condition checking
+    # predicate "visible_people" -- not a real predicate name at all (it's an
+    # internal world-state fact key person_visible's own evaluation reads), and
+    # even if it had been the real person_visible, that answers a different
+    # question than "did the search just find her". The mission could never
+    # succeed as a result, regardless of whether a woman was actually present.
+    messages = build_planner_messages("search the room for a woman", "{}")
+    system = messages[0][1]
+
+    assert '"visible_people" is never a valid predicate name' in system
+    assert "search_for_entity_completed" in system
+    assert "did that just" in system

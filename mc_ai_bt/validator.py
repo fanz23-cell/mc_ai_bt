@@ -4,7 +4,27 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
+from .goal_check import PREDICATE_REGISTRY
 from .skill_registry import SkillRegistry
+
+
+# The complete set of real, checkable predicate names -- mirrors planner.py's
+# _KNOWN_PREDICATE_NAMES exactly (same registry, same place_remembered carve-out;
+# see that module's comment for why place_remembered is bespoke-only). Duplicated
+# rather than imported from planner.py: this is a plan-time SCHEMA check, kept
+# independent of prompt-construction code the way policy/resource checks already
+# are elsewhere in this file.
+#
+# FOUND LIVE 2026-08-30: a real submitted mission planned a Condition with
+# predicate "visible_people" -- not a real predicate name at all (it's an
+# internal world-state fact-storage key, not something Condition/GoalCheck/
+# WaitForEvent can check; see goal_check.py). Nothing here rejected it: this
+# validator only ever checked that `predicate` was a non-empty STRING, so an
+# invented name passed schema validation, ran, and could only ever resolve to
+# an eternal, unanswerable UNKNOWN at execution time -- wasting the mission
+# every time, for every plan that made this exact mistake, regardless of
+# whether prompt engineering (planner.py) reduces how often the model tries it.
+KNOWN_PREDICATE_NAMES = frozenset({*PREDICATE_REGISTRY.keys(), "place_remembered"})
 
 
 EXECUTABLE_NODE_TYPES = {
@@ -128,16 +148,22 @@ class PlanValidator:
             return
 
         if node_type == "Condition":
-            if not isinstance(node.get("predicate"), str) or not node["predicate"].strip():
+            predicate = node.get("predicate")
+            if not isinstance(predicate, str) or not predicate.strip():
                 errors.append(f"{path}.predicate is required")
+            elif predicate not in KNOWN_PREDICATE_NAMES:
+                errors.append(f"{path}.predicate is not a known predicate: {predicate!r}")
             args = node.get("args", {})
             if not isinstance(args, dict):
                 errors.append(f"{path}.args must be an object")
             return
 
         if node_type == "WaitForEvent":
-            if not isinstance(node.get("predicate"), str) or not node["predicate"].strip():
+            predicate = node.get("predicate")
+            if not isinstance(predicate, str) or not predicate.strip():
                 errors.append(f"{path}.predicate is required")
+            elif predicate not in KNOWN_PREDICATE_NAMES:
+                errors.append(f"{path}.predicate is not a known predicate: {predicate!r}")
             args = node.get("args", {})
             if not isinstance(args, dict):
                 errors.append(f"{path}.args must be an object")
@@ -181,6 +207,10 @@ class PlanValidator:
                 errors.append(f"{path}.check must be an object")
             elif not _looks_like_goal_check(check):
                 errors.append(f"{path}.check must include a goal type or predicate")
+            else:
+                predicate = check.get("predicate")
+                if isinstance(predicate, str) and predicate.strip() and predicate not in KNOWN_PREDICATE_NAMES:
+                    errors.append(f"{path}.check.predicate is not a known predicate: {predicate!r}")
             return
 
         if node_type == "VisualCheck":
@@ -245,8 +275,12 @@ class PlanValidator:
         verification = goal_spec.get("verification")
         if not isinstance(verification, dict) or not verification:
             errors.append("goal_spec.verification must be a non-empty object")
-        if goal_type == "structured" and "predicate" not in goal_spec:
-            errors.append("structured goal_spec requires predicate")
+        if goal_type == "structured":
+            predicate = goal_spec.get("predicate")
+            if "predicate" not in goal_spec:
+                errors.append("structured goal_spec requires predicate")
+            elif isinstance(predicate, str) and predicate.strip() and predicate not in KNOWN_PREDICATE_NAMES:
+                errors.append(f"goal_spec.predicate is not a known predicate: {predicate!r}")
         if goal_type == "visual" and "query" not in goal_spec:
             errors.append("visual goal_spec requires query")
 

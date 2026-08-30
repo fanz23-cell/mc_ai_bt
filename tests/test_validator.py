@@ -88,6 +88,74 @@ def test_accepts_executable_condition_and_goal_check_nodes():
     assert result.ok
 
 
+def test_rejects_condition_with_invented_predicate():
+    # Found live 2026-08-30: a real submitted mission's plan used
+    # predicate "visible_people" -- not a real predicate name (it's an internal
+    # world-state fact-storage key that person_visible's own evaluation reads,
+    # not something Condition/GoalCheck/WaitForEvent can check). The validator
+    # previously only checked that `predicate` was a non-empty string, so this
+    # passed schema validation, ran, and could only ever resolve to an eternal,
+    # unanswerable UNKNOWN -- wasting the mission regardless of whether a woman
+    # was actually present. This is the systemic guard: any invented predicate
+    # name is now rejected at plan-validation time, not just this one string.
+    plan = {
+        "root": {
+            "type": "Condition",
+            "predicate": "visible_people",
+        },
+        "goal_spec": {"type": "human", "verification": {"mode": "implicit_conversation"}},
+    }
+
+    result = PlanValidator().validate(plan)
+
+    assert not result.ok
+    assert any("not a known predicate" in error and "visible_people" in error
+               for error in result.errors)
+
+
+def test_rejects_goal_check_with_invented_predicate():
+    plan = {
+        "root": {
+            "type": "GoalCheck",
+            "check": {"predicate": "visible_people"},
+        },
+        "goal_spec": {"type": "human", "verification": {"mode": "implicit_conversation"}},
+    }
+
+    result = PlanValidator().validate(plan)
+
+    assert not result.ok
+    assert any("not a known predicate" in error for error in result.errors)
+
+
+def test_rejects_wait_for_event_with_invented_predicate():
+    plan = {
+        "root": {"type": "WaitForEvent", "predicate": "visible_people", "timeout_sec": 60.0},
+        "goal_spec": {"type": "human", "verification": {"mode": "implicit_conversation"}},
+    }
+
+    result = PlanValidator().validate(plan)
+
+    assert not result.ok
+    assert any("not a known predicate" in error for error in result.errors)
+
+
+def test_rejects_structured_goal_spec_with_invented_predicate():
+    plan = {
+        "root": {"type": "Action", "skill": "say", "args": {"text": "hi"}},
+        "goal_spec": {
+            "type": "structured",
+            "predicate": "visible_people",
+            "verification": {"mode": "world_state"},
+        },
+    }
+
+    result = PlanValidator().validate(plan)
+
+    assert not result.ok
+    assert any("not a known predicate" in error for error in result.errors)
+
+
 def test_accepts_wait_for_event_node():
     plan = {
         "root": {
