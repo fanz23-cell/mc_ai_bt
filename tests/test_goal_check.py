@@ -317,6 +317,24 @@ def test_entity_approached_confirmed_by_execution_fact():
     assert result.state is TriState.TRUE
 
 
+def test_entity_faced_confirmed_by_execution_fact():
+    goal_spec = {"type": "structured", "predicate": "entity_faced", "args": {"target": "person"}}
+    execution = ExecutionResult(
+        True, "faced", {"entity_faced": {"matched": True, "target": "person", "bearing_deg": 12.5}})
+
+    result = GoalChecker().check(goal_spec, execution)
+
+    assert result.state is TriState.TRUE
+
+
+def test_entity_faced_missing_evidence_is_unknown_not_false():
+    goal_spec = {"type": "structured", "predicate": "entity_faced", "args": {"target": "person"}}
+
+    result = GoalChecker().check(goal_spec, ExecutionResult(True, "faced", {}))
+
+    assert result.state is TriState.UNKNOWN
+
+
 def test_participant_ready_confirmed_by_execution_fact():
     goal_spec = {"type": "structured", "predicate": "participant_ready", "args": {"role": "customer"}}
     execution = ExecutionResult(

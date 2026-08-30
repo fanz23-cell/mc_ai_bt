@@ -174,6 +174,15 @@ DEFAULT_SKILLS: dict[str, SkillSpec] = {
         {"target": "entity|entity_id|object|person"},
         ("entity_approached",),
     ),
+    "face_entity": SkillSpec(
+        "face_entity",
+        ("base",),
+        "Rotate in place (no travel) to face an entity's current live position. A single "
+        "bounded turn computed once from a snapshot -- does not continuously track a moving "
+        "target; call again to re-aim.",
+        {"target": "entity|entity_id|object|person"},
+        ("entity_faced",),
+    ),
     "follow_entity": SkillSpec(
         "follow_entity",
         ("base",),

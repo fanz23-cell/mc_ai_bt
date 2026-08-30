@@ -249,7 +249,7 @@ class PolicyGuard:
             self._check_look_at(args, path, errors)
         elif skill == "point_at":
             self._check_point_at(args, path, errors)
-        elif skill in {"locate_entity", "track_entity", "search_for_entity", "get_pose", "approach_entity"}:
+        elif skill in {"locate_entity", "track_entity", "search_for_entity", "get_pose", "approach_entity", "face_entity"}:
             self._check_entity_target(args, path, errors, skill=skill)
         elif skill in {"look_at_static", "track_with_gaze"}:
             self._check_look_or_track(args, path, errors, skill=skill)

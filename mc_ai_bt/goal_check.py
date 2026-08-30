@@ -92,6 +92,13 @@ PREDICATE_REGISTRY: dict[str, PredicateSpec] = {
     # scope directly until a matching SemanticPerson fact appears; evidence already
     # carries "matched", same generic path as entity_located et al. above.
     "participant_ready": PredicateSpec("participant_ready", ("people",), "people"),
+    # face_entity (mc_embodied_skills) -- rotates in place via SimpleMove/Spin; v1
+    # deliberately has no hard semantic re-verification (no "is the robot actually
+    # facing X" world-state fact exists yet, same caveat reach_to's own evidence
+    # lives with for some of its fields), so semantic_verified is always False in
+    # its evidence -- but "matched" still reflects whether the Spin action itself
+    # reported success, which is what this generic path reads.
+    "entity_faced": PredicateSpec("entity_faced", ("robot", "objects", "people", "entities"), "robot"),
 }
 
 
