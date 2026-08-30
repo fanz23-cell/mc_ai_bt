@@ -4,9 +4,34 @@ import json
 import re
 from typing import Any, Protocol
 
+from .goal_check import PREDICATE_REGISTRY
 from .policy_guard import LOOK_AT_DIRECTIONS, POLICY_ENABLED_SKILLS, PolicyLimits
-from .skill_registry import SkillRegistry
+from .skill_registry import DEFAULT_SKILLS, SkillRegistry
 from .visual_check import visual_check_goal_spec
+
+# The complete set of real predicate names Condition/GoalCheck/WaitForEvent/goal_spec
+# can actually check -- PREDICATE_REGISTRY covers every one except place_remembered
+# (deliberately bespoke-only, §10.5: no world-state fact backs it, so it isn't in the
+# generic-fallthrough registry, but it's still a real, checkable predicate name).
+_KNOWN_PREDICATE_NAMES = tuple(sorted({*PREDICATE_REGISTRY.keys(), "place_remembered"}))
+
+
+def _predicate_names_with_producing_skill() -> str:
+    # Found live 2026-08-29 (§C2): even after being told the exact list of valid
+    # predicate names, the model still confused a *skill* name (check_relation) for
+    # the *predicate* it produces (relation_checked) -- a predicate name alone,
+    # with no indication of which skill's result_predicates it comes from, wasn't
+    # enough to stop that specific mix-up. Pairing each predicate with its skill
+    # directly is the same fix §10.5 already made for args_schema, applied here.
+    predicate_to_skills: dict[str, list[str]] = {}
+    for name, spec in DEFAULT_SKILLS.items():
+        for predicate in spec.result_predicates:
+            predicate_to_skills.setdefault(predicate, []).append(name)
+    parts = []
+    for predicate in _KNOWN_PREDICATE_NAMES:
+        skills = predicate_to_skills.get(predicate)
+        parts.append(f"{predicate} (from {'/'.join(skills)})" if skills else predicate)
+    return ", ".join(parts)
 
 
 PERSON_WORDS = {"person", "people", "someone", "anyone", "人", "某人", "一个人"}
@@ -442,6 +467,26 @@ def build_planner_messages(
                 "Action's own top-level timeout_sec, max 600, for how long to wait, NOT inside args) -- it "
                 "already blocks internally up to its own timeout, so wrapping it in WaitForEvent or "
                 "inventing a predicate for it is always wrong."
+            ),
+            (
+                "The predicate field on Condition, GoalCheck, WaitForEvent, and a structured goal_spec must "
+                "always be one of these exact strings, never invented or guessed, and never a skill name -- "
+                "a predicate is what a skill's execution *produces evidence for*, not the skill's own name "
+                "(e.g. the check_relation skill produces the relation_checked predicate; use relation_checked "
+                "in predicate fields, never check_relation): "
+                + _predicate_names_with_producing_skill()
+                + ". If none of these fits what you actually need to check, do not invent a new name -- use "
+                "a human-type goal_spec (verification mode implicit_conversation) instead of a structured one."
+            ),
+            (
+                "Never write a say node whose text states the outcome of a Condition/GoalCheck/"
+                "VisualCheck/check_relation/locate_entity-family step that has not run yet -- a say node's "
+                "text is fixed at planning time, before any check has actually executed, so writing 'Yes, "
+                "X is true' there is always a guess, never a verified fact. For a plan whose whole point is "
+                "answering a check (e.g. 'is X near Y', 'check whether the door is open'), do not add a "
+                "say node for the conclusion at all: leave the goal_spec structured with the real predicate, "
+                "and let the mission's own real result reach the user afterward through the existing "
+                "terminal-event channel, not a pre-written guess baked into this plan."
             ),
             (
                 "VisualCheck must be a concise true/false visual query. It may use structured world-state "

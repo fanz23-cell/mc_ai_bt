@@ -44,6 +44,26 @@ def test_planner_prompt_names_allowed_skills_and_constraints():
     assert "UNKNOWN" in system
 
 
+def test_planner_prompt_lists_known_predicate_names():
+    # Found live 2026-08-29 (§C2): the planner had no idea which predicate names
+    # actually exist, so it repeatedly either invented one ("root.children[1].
+    # predicate is required" validator rejections) or gave up on a structured
+    # goal_spec entirely and pre-wrote a guessed conclusion into a say node instead.
+    messages = build_planner_messages("is the red_mug near the blue_shelf", "{}")
+    system = messages[0][1]
+
+    assert "relation_checked" in system
+    assert "robot_at_place" in system
+    assert "never invented or guessed" in system
+
+
+def test_planner_prompt_warns_against_pre_written_check_conclusions():
+    messages = build_planner_messages("check whether the door is open", "{}")
+    system = messages[0][1]
+
+    assert "fixed at planning time" in system
+
+
 def test_planner_prompt_lists_wait_for_event_node_type():
     messages = build_planner_messages("wait until a customer raises a hand", "{}")
     system = messages[0][1]
