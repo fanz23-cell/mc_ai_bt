@@ -191,6 +191,15 @@ DEFAULT_SKILLS: dict[str, SkillSpec] = {
         ("entity_following",),
         realtime=True,
     ),
+    "remember_place": SkillSpec(
+        "remember_place",
+        (),
+        "Save the robot's current location as a named place, usable later by go_to_place. "
+        "Requires a map to be loaded; does not move the robot.",
+        {"name": "place name to save"},
+        ("place_remembered",),
+        dispatch="dedicated",
+    ),
     "guide_entity_to_place": SkillSpec(
         "guide_entity_to_place",
         ("base",),

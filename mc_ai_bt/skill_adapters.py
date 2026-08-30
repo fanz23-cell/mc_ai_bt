@@ -19,6 +19,7 @@ from mc_one.action import (
     SimpleMove,
 )
 from mc_one.msg import AiBtIdentity, Utterance
+from mc_one.srv import SavePlaceHere
 from rclpy.action import ActionClient
 from rclpy.node import Node
 
@@ -77,6 +78,7 @@ class RosSkillExecutor:
             RequestHumanConfirmation,
             "/mc_ai_bt/request_human_confirmation",
         )
+        self._save_place_here = node.create_client(SavePlaceHere, "/mc_navigation/save_place_here")
         self._current_lock = threading.Lock()
         self._current_goal_handle: Any = None
 
@@ -205,9 +207,37 @@ class RosSkillExecutor:
                 cancel_event,
                 timeout_sec=timeout_sec,
             )
+        if name == "remember_place":
+            return self._remember_place(args)
         if name in EMBODIED_SKILLS:
             return self._run_embodied_skill(name, args, cancel_event, timeout_sec=timeout_sec)
         return ExecutionResult(False, f"unsupported skill: {name}")
+
+    def _remember_place(self, args: dict[str, Any]) -> ExecutionResult:
+        # SavePlaceHere (mc_navigation) is a plain service, not an action -- unlike every
+        # other dedicated skill above, there is no goal/result lifecycle, just a request/
+        # response. It does its own map->base_link TF lookup and yaw derivation server-side
+        # (nav_orchestrator.py's _on_save_place_here), so this adapter only needs the name.
+        name = str(args.get("name") or args.get("place") or args.get("place_name") or "").strip()
+        if not name:
+            return ExecutionResult(False, "remember_place requires name")
+        if not _service_ready(self._save_place_here, timeout_sec=1.0):
+            return ExecutionResult(False, "remember_place service is not ready", blocked=True)
+        request = SavePlaceHere.Request()
+        request.name = name
+        ok, response_or_message = _wait_future(self._save_place_here.call_async(request), timeout_sec=10.0)
+        if not ok:
+            return ExecutionResult(False, f"remember_place failed: {response_or_message}")
+        response = response_or_message
+        if not bool(getattr(response, "success", False)):
+            return ExecutionResult(False, f"remember_place failed: {getattr(response, 'message', '')}")
+        execution = ExecutionResult(
+            True,
+            str(getattr(response, "message", "") or f"remembered place {name}"),
+            {"place_remembered": name},
+        )
+        self._publish_success_facts(execution.facts)
+        return execution
 
     def _request_human_confirmation(
         self,
@@ -597,6 +627,18 @@ def _action_server_ready(client, *, timeout_sec: float) -> bool:
         return bool(wait_for_server(timeout_sec=timeout_sec))
     except TypeError:
         return bool(wait_for_server(timeout_sec))
+    except Exception:
+        return False
+
+
+def _service_ready(client, *, timeout_sec: float) -> bool:
+    try:
+        if client.service_is_ready():
+            return True
+    except Exception:
+        return False
+    try:
+        return bool(client.wait_for_service(timeout_sec=timeout_sec))
     except Exception:
         return False
 

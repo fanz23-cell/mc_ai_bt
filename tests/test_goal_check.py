@@ -317,6 +317,32 @@ def test_entity_approached_confirmed_by_execution_fact():
     assert result.state is TriState.TRUE
 
 
+def test_place_remembered_confirmed_by_execution_fact():
+    goal_spec = {"type": "structured", "predicate": "place_remembered", "args": {"name": "front_desk"}}
+    execution = ExecutionResult(True, "remembered", {"place_remembered": "front_desk"})
+
+    result = GoalChecker().check(goal_spec, execution)
+
+    assert result.state is TriState.TRUE
+
+
+def test_place_remembered_mismatch_is_false():
+    goal_spec = {"type": "structured", "predicate": "place_remembered", "args": {"name": "front_desk"}}
+    execution = ExecutionResult(True, "remembered", {"place_remembered": "back_office"})
+
+    result = GoalChecker().check(goal_spec, execution)
+
+    assert result.state is TriState.FALSE
+
+
+def test_place_remembered_missing_evidence_is_unknown_not_false():
+    goal_spec = {"type": "structured", "predicate": "place_remembered", "args": {"name": "front_desk"}}
+
+    result = GoalChecker().check(goal_spec, ExecutionResult(True, "remembered", {}))
+
+    assert result.state is TriState.UNKNOWN
+
+
 def test_entity_faced_confirmed_by_execution_fact():
     goal_spec = {"type": "structured", "predicate": "entity_faced", "args": {"target": "person"}}
     execution = ExecutionResult(

@@ -219,6 +219,15 @@ class GoalChecker:
                 return CheckResult(TriState.FALSE, f"animation_played mismatch: {actual} != {expected}")
             return CheckResult(TriState.UNKNOWN, "animation_played fact missing")
 
+        if predicate == "place_remembered":
+            expected = str(args.get("name") or "")
+            actual = str(facts.get("place_remembered") or "")
+            if actual and actual == expected:
+                return CheckResult(TriState.TRUE, f"place_remembered confirmed: {actual}")
+            if actual:
+                return CheckResult(TriState.FALSE, f"place_remembered mismatch: {actual} != {expected}")
+            return CheckResult(TriState.UNKNOWN, "place_remembered fact missing")
+
         if predicate == "object_visible":
             evidence = object_visibility_evidence(
                 _execution_object_entry(args, facts),

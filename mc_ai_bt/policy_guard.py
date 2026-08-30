@@ -269,6 +269,8 @@ class PolicyGuard:
             self._check_guide_entity_to_place(args, path, errors)
         elif skill == "wait_for_participant":
             self._check_wait_for_participant(args, path, errors)
+        elif skill == "remember_place":
+            self._check_remember_place(args, path, errors)
         elif skill not in POLICY_ENABLED_SKILLS:
             errors.append(f"{path}.skill is registered but not policy-enabled yet: {skill}")
 
@@ -495,6 +497,11 @@ class PolicyGuard:
             errors.append(
                 f"{path}.args.condition must be one of present/hand_raised/hand_offered/facing_robot"
             )
+
+    def _check_remember_place(self, args: dict[str, Any], path: str, errors: list[str]) -> None:
+        name = _clean_label(args.get("name") or args.get("place") or args.get("place_name"))
+        if not name or len(name) > 64:
+            errors.append(f"{path}.args.name must be non-empty and <= 64 chars")
 
     def _check_totals(self, stats: "_Stats", errors: list[str]) -> None:
         limits = self._limits

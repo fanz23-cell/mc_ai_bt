@@ -304,6 +304,21 @@ def test_policy_rejects_face_entity_without_target():
     assert not result.ok
 
 
+def test_policy_accepts_remember_place_with_name():
+    plan = _plan({"type": "Action", "skill": "remember_place", "args": {"name": "front_desk"}})
+
+    assert PolicyGuard().check(plan).ok
+
+
+def test_policy_rejects_remember_place_without_name():
+    plan = _plan({"type": "Action", "skill": "remember_place", "args": {}})
+
+    result = PolicyGuard().check(plan)
+
+    assert not result.ok
+    assert any("name" in error for error in result.errors)
+
+
 def test_policy_accepts_wait_for_participant_default_condition():
     plan = _plan({"type": "Action", "skill": "wait_for_participant", "args": {"role": "customer"}})
 
