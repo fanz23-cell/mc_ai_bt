@@ -465,3 +465,85 @@ def test_terminal_mission_cannot_be_resumed_or_canceled_again():
             assert "terminal" in str(exc) or "no active mission" in str(exc)
         else:
             raise AssertionError("terminal mission operation should fail")
+
+
+def _submit(manager, intent_text, *, priority=1):
+    _accepted, _message, mission, _event = manager.submit(
+        intent_text=intent_text,
+        source="voice",
+        operator_id="user",
+        parent_mission_id="",
+        priority=priority,
+        allow_queue=True,
+        context_json="{}",
+    )
+    return mission
+
+
+def test_pause_promotes_next_queued_mission():
+    # FOUND LIVE 2026-08-30: pause() used to leave `_active_id` pointed at the
+    # paused mission indefinitely -- since only cancel/mark_terminal ever
+    # promoted a queued mission, a mission paused on an unanswered escalation
+    # (e.g. §10.7/C2's "awaiting Omega decision") blocked every later mission
+    # at STATE_QUEUED forever, with no resource conflict involved at all.
+    manager = MissionManager()
+    first = _submit(manager, "first")
+    manager.set_plan(first.identity.mission_id, "bt", "goal")
+    second = _submit(manager, "second")
+    assert manager.get(second.identity.mission_id).state == STATE_QUEUED
+
+    manager.pause(first.identity.mission_id, "awaiting Omega decision: is a woman visible?")
+
+    promoted = manager.get(second.identity.mission_id)
+    assert promoted.state == STATE_PLANNING, (
+        "a queued mission must start as soon as the active one pauses, not "
+        "starve until someone cancels the paused one"
+    )
+    assert manager.get(first.identity.mission_id).state == STATE_PAUSED
+
+
+def test_pause_with_nothing_queued_keeps_current_alias_on_the_paused_mission():
+    # The other half of the same fix: when nothing is waiting, pause() must
+    # NOT orphan `_active_id` to None (unlike a terminal transition, a paused
+    # mission is still a legitimate ""/"active"/"current" resume target --
+    # see test_empty_control_id_targets_current_active_mission).
+    manager = MissionManager()
+    first = _submit(manager, "first")
+    manager.set_plan(first.identity.mission_id, "bt", "goal")
+
+    manager.pause("current", "hold")
+
+    resumed = manager.resume("current", "continue")
+    assert resumed.mission.identity.mission_id == first.identity.mission_id
+    assert resumed.mission.state == STATE_RUNNING
+
+
+def test_resume_requeues_instead_of_stealing_an_occupied_slot():
+    # The flip side of test_pause_promotes_next_queued_mission: once pause()
+    # has handed the slot to a second mission, resuming the first one must
+    # not unconditionally reclaim it back -- that would silently corrupt
+    # `_active_id` bookkeeping (two missions both effectively "active") and
+    # starve whatever the second mission itself later queues behind it.
+    manager = MissionManager()
+    first = _submit(manager, "first")
+    manager.set_plan(first.identity.mission_id, "bt", "goal")
+    second = _submit(manager, "second")
+    manager.pause(first.identity.mission_id, "hold")
+    assert manager.get(second.identity.mission_id).state == STATE_PLANNING
+
+    resumed = manager.resume(first.identity.mission_id, "continue")
+
+    assert resumed.mission.state == STATE_QUEUED, (
+        "the slot belongs to 'second' now -- 'first' must wait its turn, "
+        "not barge back into STATE_RUNNING/PLANNING"
+    )
+    assert manager.get(second.identity.mission_id).state == STATE_PLANNING, (
+        "resuming 'first' must not disturb the mission that is actually active"
+    )
+
+    manager.cancel(second.identity.mission_id, "done")
+
+    assert manager.get(first.identity.mission_id).state == STATE_PLANNING, (
+        "once the slot frees up, the re-queued (resumed) mission takes its turn "
+        "like any other queued mission"
+    )

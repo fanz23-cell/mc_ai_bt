@@ -162,6 +162,25 @@ class MissionManager:
         )
 
     def pause(self, mission_id: str, reason: str) -> MissionEvent:
+        # PAUSED is inert -- accepts_async_result() already refuses execution
+        # results for a paused mission, and mc_resource_authority never sees a
+        # lease held across a pause (each dedicated skill's lease is scoped to
+        # one BT-node execution, released long before a Condition/GoalCheck
+        # node can raise the escalation that leads here). So unlike cancel/
+        # mark_terminal, this used to leave `_active_id` pointed at the paused
+        # mission indefinitely -- the sole "active" slot this manager enforces
+        # stayed occupied by a mission doing nothing, and every other queued
+        # mission starved until a human explicitly cancelled it.
+        #
+        # FOUND LIVE 2026-08-30: a mission paused on an unanswered "awaiting
+        # Omega decision" escalation (§10.7/C2) blocked a second, later
+        # mission at STATE_QUEUED forever -- it never even reached planning.
+        # Omega itself never noticed: it only tracks "is a robot_event still
+        # owed to me", and a queued mission that never starts never emits one,
+        # so Omega just replied conversationally to the user's next request
+        # without submitting anything new. Confirmed via mc_resource_authority
+        # returning zero active leases at the time -- this is the manager's
+        # own single-active-mission bookkeeping, not a resource conflict.
         mission_id = self._resolve_control_id(mission_id)
         mission = self._require(mission_id)
         if mission.state in _TERMINAL_STATES:
@@ -170,6 +189,8 @@ class MissionManager:
             return MissionEvent(EVENT_PAUSED, mission, mission.status_text)
         paused = replace(mission, state=STATE_PAUSED, status_text=reason or "paused")
         self._missions[mission_id] = paused
+        if self._active_id == mission_id:
+            self._release_slot_for_pause(mission_id)
         return MissionEvent(EVENT_PAUSED, paused, paused.status_text)
 
     def resume(self, mission_id: str, reason: str) -> MissionEvent:
@@ -179,15 +200,31 @@ class MissionManager:
             raise KeyError(f"mission is terminal: {mission_id}")
         if mission.state != STATE_PAUSED:
             raise KeyError(f"mission is not paused: {mission_id}")
-        next_state = STATE_RUNNING if mission.bt_json else STATE_PLANNING
+        # Mirror pause()'s own slot handoff: pause() promotes a queued mission
+        # into `_active_id` when one is waiting, so resuming must not
+        # unconditionally reclaim the slot -- something else may genuinely be
+        # active now. Claim it only if it is free or still this mission's own
+        # (the common case: nothing was queued when this mission paused, so
+        # `_active_id` never moved); otherwise re-enter the normal queue, the
+        # same way any other mission waits its turn.
+        slot_free = self._active_id is None or self._active_id == mission_id
+        next_state = (
+            (STATE_RUNNING if mission.bt_json else STATE_PLANNING)
+            if slot_free else STATE_QUEUED
+        )
         resumed = replace(
             mission,
-            identity=mission.identity.for_execution() if mission.bt_json else mission.identity,
+            identity=mission.identity.for_execution() if (mission.bt_json and slot_free) else mission.identity,
             state=next_state,
-            status_text=reason or ("running" if next_state == STATE_RUNNING else "planning"),
+            status_text=reason or {
+                STATE_RUNNING: "running",
+                STATE_PLANNING: "planning",
+                STATE_QUEUED: "queued",
+            }[next_state],
         )
         self._missions[mission_id] = resumed
-        self._active_id = mission_id
+        if slot_free:
+            self._active_id = mission_id
         return MissionEvent(EVENT_RESUMED, resumed, resumed.status_text)
 
     def reprioritize(
@@ -381,16 +418,39 @@ class MissionManager:
         active.sort(key=lambda mission: (-mission.priority, mission.identity.mission_id))
         return active[0].identity.mission_id
 
-    def _promote_next_queued(self) -> None:
-        self._active_id = self._next_queued_id()
-        if self._active_id is None:
-            return
-        queued = self._missions[self._active_id]
-        self._missions[self._active_id] = replace(
+    def _promote(self, next_id: str) -> None:
+        self._active_id = next_id
+        queued = self._missions[next_id]
+        self._missions[next_id] = replace(
             queued,
             state=STATE_PLANNING,
             status_text="planning",
         )
+
+    def _promote_next_queued(self) -> None:
+        # Used after a mission goes TERMINAL: it can never be a valid
+        # "" / "active" / "current" alias target again (_check_can_update
+        # already rejects terminal missions), so orphaning `_active_id` to
+        # None when nothing is queued is correct here -- there genuinely is
+        # no mission left to call "current".
+        next_id = self._next_queued_id()
+        if next_id is None:
+            self._active_id = None
+            return
+        self._promote(next_id)
+
+    def _release_slot_for_pause(self, mission_id: str) -> None:
+        # Same handoff as _promote_next_queued, but for a mission going
+        # PAUSED, not terminal: unlike a terminal mission, a paused one
+        # remains a perfectly valid resume()/cancel() target, including via
+        # the ""/"active"/"current" alias (see
+        # test_empty_control_id_targets_current_active_mission) -- so when
+        # there is nothing queued to hand the slot to, `_active_id` is left
+        # pointing at `mission_id` rather than cleared to None.
+        next_id = self._next_queued_id()
+        if next_id is None:
+            return
+        self._promote(next_id)
 
     @staticmethod
     def _synthetic_rejected(
