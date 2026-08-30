@@ -467,12 +467,38 @@ class RosSkillExecutor:
         goal,
         cancel_event: Event | None,
     ) -> ExecutionResult:
+        # Every dedicated-dispatch skill (go_to_place/come_to_me/simple_move/
+        # play_animation/look_at/point_at, all of them via ActionBinding.resources)
+        # goes through here -- before this, only `say` ever acquired a resource
+        # lease at all, so two of these could race on the same base/body resource
+        # with no arbitration, only whichever ROS goal happened to preempt the
+        # other at the animator/behavior-server level. Found live 2026-08-29
+        # (§C5): a Parallel of look_at + look_at_static genuinely fought over
+        # gaze, "preempted" by raw single-goal action-server semantics, not a
+        # graceful lease denial. Same lease client `say` already uses -- not a
+        # new mechanism.
         binding = _binding_with_node_timeout(binding, node_timeout_sec)
         if not _action_server_ready(binding.client, timeout_sec=1.0):
             return ExecutionResult(False, f"{skill_name} action server is not ready")
         if cancel_event is not None and cancel_event.is_set():
             return ExecutionResult(False, "mission canceled")
-        return self._send_and_wait(skill_name, binding, goal, cancel_event)
+        identity = self._lease_identity_msg()
+        lease = self._leases.acquire(
+            resources=binding.resources,
+            reason=f"mc_ai_bt skill: {skill_name}",
+            timeout_sec=1.0,
+            identity=identity,
+        )
+        if not lease.success:
+            return ExecutionResult(False, f"resource lease denied: {lease.message}")
+        stop_renewal, renewal_thread = self._start_lease_renewal(lease.lease_id, identity)
+        try:
+            return self._send_and_wait(skill_name, binding, goal, cancel_event)
+        finally:
+            stop_renewal.set()
+            if renewal_thread is not None:
+                renewal_thread.join(timeout=1.0)
+            self._leases.release(lease.lease_id, reason=f"{skill_name} finished", identity=identity)
 
     def _start_lease_renewal(
         self,
