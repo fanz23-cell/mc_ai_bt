@@ -35,18 +35,18 @@ DEFAULT_SKILLS: dict[str, SkillSpec] = {
     "track_entity": SkillSpec(
         "track_entity",
         ("gaze",),
-        "Track an arbitrary entity from realtime perception.",
+        "One-shot: look toward an entity's current perceived position, then stop. Does NOT "
+        "continuously follow a moving target -- call again to re-aim if it moves.",
         {"target": "entity|entity_id|object|person"},
         ("track_entity_completed",),
-        realtime=True,
     ),
     "track_frame": SkillSpec(
         "track_frame",
         ("gaze",),
-        "Track a ROS frame from realtime TF/perception.",
+        "One-shot: look toward a ROS TF frame's current position, then stop. Does NOT "
+        "continuously track a moving frame -- call again to re-aim if it moves.",
         {"frame": "frame|target_frame"},
         ("track_completed",),
-        realtime=True,
     ),
     "get_pose": SkillSpec(
         "get_pose",
@@ -80,10 +80,10 @@ DEFAULT_SKILLS: dict[str, SkillSpec] = {
     "track_with_gaze": SkillSpec(
         "track_with_gaze",
         ("gaze",),
-        "Continuously keep gaze on a realtime target.",
+        "One-shot despite the name: looks toward a target (entity or frame) once, then "
+        "stops -- does NOT continuously follow it. Call again to re-aim if it moves.",
         {"target": "entity|frame"},
         ("track_with_gaze_completed",),
-        realtime=True,
     ),
     "reach_to": SkillSpec(
         "reach_to",
