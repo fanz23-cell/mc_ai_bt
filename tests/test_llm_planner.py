@@ -100,3 +100,21 @@ def test_planner_prompt_warns_against_visible_people_and_wrong_predicate_after_s
     assert '"visible_people" is never a valid predicate name' in system
     assert "search_for_entity_completed" in system
     assert "did that just" in system
+
+
+def test_planner_prompt_steers_generic_person_presence_to_person_visible():
+    # Found live 2026-08-30: search_for_entity(target="woman") always fails --
+    # confirmed by calling the real object/person classifier directly: it only
+    # recognizes a fixed 80-class vocabulary (person, chair, bottle, ... zebra),
+    # no gender-specific classes, and rejects "woman" outright regardless of
+    # whether a woman is actually in the room. person_visible, by contrast, is
+    # fed by a continuously-running pose detector with real evidence -- for a
+    # plain "is anyone there" question, that is the predicate that can actually
+    # answer, not a search_for_entity call the classifier was never going to
+    # resolve.
+    messages = build_planner_messages("look for a woman in the room", "{}")
+    system = messages[0][1]
+
+    assert "closed, fixed set of" in system
+    assert "go straight to a Condition/GoalCheck with predicate person_visible" in system
+    assert '"cardboard package box"' in system

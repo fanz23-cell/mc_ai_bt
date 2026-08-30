@@ -1,7 +1,10 @@
 from mc_ai_bt.identity import Identity
 from mc_ai_bt.mission import (
+    EVENT_BLOCKED,
+    EVENT_PAUSED,
     EVENT_PREEMPTED,
     MissionManager,
+    STATE_BLOCKED,
     STATE_CANCELED,
     STATE_PAUSED,
     STATE_QUEUED,
@@ -516,6 +519,45 @@ def test_pause_with_nothing_queued_keeps_current_alias_on_the_paused_mission():
     resumed = manager.resume("current", "continue")
     assert resumed.mission.identity.mission_id == first.identity.mission_id
     assert resumed.mission.state == STATE_RUNNING
+
+
+def test_resume_then_identical_repause_escalates_to_blocked_not_silent_limbo():
+    # Found live 2026-08-30: resume() re-runs the exact BT node that raised the
+    # escalation, with no way to carry new evidence into it. Omega separately
+    # confirmed (by camera) the thing the paused Condition needed, resumed the
+    # mission on that basis, and the mission re-paused on the IDENTICAL reason
+    # within the same second -- Omega never noticed and just kept believing
+    # the mission was "resumed, awaiting outcome" for 6+ minutes while it sat
+    # paused the whole time, with no robot_event to tell anyone otherwise.
+    manager = MissionManager()
+    mission = _submit(manager, "find the woman")
+    manager.set_plan(mission.identity.mission_id, "bt", "goal")
+    reason = "awaiting Omega decision: condition UNKNOWN: no verification evidence for entity_located"
+
+    manager.pause(mission.identity.mission_id, reason)
+    manager.resume(mission.identity.mission_id, "camera confirmed it")
+    event = manager.pause(mission.identity.mission_id, reason)
+
+    assert event.event == EVENT_BLOCKED
+    assert event.mission.state == STATE_BLOCKED
+    assert "resuming again will not resolve this" in event.mission.status_text
+    assert reason in event.mission.status_text
+
+
+def test_resume_then_different_repause_reason_is_a_normal_pause():
+    # The other half: a re-pause for a genuinely DIFFERENT reason (the mission
+    # progressed to a new check, or the escalation text itself changed) is not
+    # the stuck-loop pattern above and must not be forced to BLOCKED.
+    manager = MissionManager()
+    mission = _submit(manager, "find the woman")
+    manager.set_plan(mission.identity.mission_id, "bt", "goal")
+
+    manager.pause(mission.identity.mission_id, "awaiting Omega decision: is the door open?")
+    manager.resume(mission.identity.mission_id, "it is open")
+    event = manager.pause(mission.identity.mission_id, "awaiting Omega decision: is anyone home?")
+
+    assert event.event == EVENT_PAUSED
+    assert event.mission.state == STATE_PAUSED
 
 
 def test_resume_requeues_instead_of_stealing_an_occupied_slot():

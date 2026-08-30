@@ -500,6 +500,35 @@ def build_planner_messages(
                 "correct ONLY when nothing in this plan already ran a locate-type skill for the same target."
             ),
             (
+                # Found live 2026-08-30: "find/look for a woman in the room" planned
+                # search_for_entity(target="woman") -> Condition(entity_located). entity_located's real
+                # evidence comes from mc_perception's object/person classifier, which only recognizes a
+                # fixed, closed vocabulary of class names (a standard 80-class detector: person, chair,
+                # bottle, cup, laptop, ... -- no gender-specific classes, no "box"/"package" class either).
+                # Asking it to locate "woman" or "cardboard package box" fails outright, every time,
+                # regardless of what is actually in the room -- confirmed live by calling the detector
+                # directly with both a real class name (succeeded) and "woman" (rejected, listing its
+                # known classes). No amount of the room actually containing a woman fixes this: the
+                # target string itself is unrecognizable to the classifier search_for_entity queries.
+                "search_for_entity/locate_entity's real target vocabulary is a closed, fixed set of "
+                "generic object/creature classes (airplane, apple, backpack, ..., person, ..., zebra -- "
+                "the standard 80-class set; person is the only human-related class, with no gender, "
+                "age, or clothing distinction). Before using search_for_entity/locate_entity/entity_located "
+                "for anything human, ask: does the actual intent reduce to \"is any person present/nearby\", "
+                "with no further distinguishing detail the classifier could resolve (a name, a role, "
+                "hand-raised, facing the robot)? If so, do not call search_for_entity at all -- go straight "
+                "to a Condition/GoalCheck with predicate person_visible (fed by a continuously-running "
+                "pose detector, real evidence, not gated on having called any locate skill first). Reserve "
+                "search_for_entity/locate_entity for a target that is either one of the fixed class names "
+                "verbatim, or a role/description wait_for_participant's own condition argument already "
+                "covers (hand_raised, facing_robot) -- never a free-text description like \"woman\" or "
+                "\"cardboard package box\" that the classifier was never going to recognize. When the "
+                "target is a specific object with no matching class name in that fixed set, there is no "
+                "structured predicate that can verify it -- use a human-type goal_spec (verification mode "
+                "implicit_conversation) and a VisualCheck/robot_observe-backed description instead of "
+                "forcing search_for_entity on a name it cannot possibly resolve."
+            ),
+            (
                 "Never write a say node whose text states the outcome of a Condition/GoalCheck/"
                 "VisualCheck/check_relation/locate_entity-family step that has not run yet -- a say node's "
                 "text is fixed at planning time, before any check has actually executed, so writing 'Yes, "

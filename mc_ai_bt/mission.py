@@ -64,6 +64,10 @@ class MissionManager:
             mission.identity.mission_id: mission for mission in missions
         }
         self._active_id: str | None = self._select_active_id()
+        # mission_id -> the pause reason it was resumed FROM (set by resume(), cleared
+        # once the mission moves on to any state other than an identical re-pause).
+        # See pause()'s own comment for why this exists.
+        self._resumed_from_reason: dict[str, str] = {}
 
     def submit(
         self,
@@ -187,6 +191,32 @@ class MissionManager:
             raise KeyError(f"mission is terminal: {mission_id}")
         if mission.state == STATE_PAUSED:
             return MissionEvent(EVENT_PAUSED, mission, mission.status_text)
+        # FOUND LIVE 2026-08-30: resume() re-runs the exact BT node that raised the
+        # escalation, with no way to carry new evidence into it (e.g. Omega separately
+        # confirming something by camera doesn't reach the Condition it resumed) -- so
+        # a resume based on anything other than the world-state fact the check itself
+        # reads just re-produces the identical "awaiting Omega decision" reason,
+        # immediately. Observed live: Omega resumed such a mission, got the identical
+        # pause text back within the same second, and then never noticed -- its own
+        # summary kept saying "resumed, awaiting outcome" for 6+ minutes with no
+        # further action, while the mission sat paused the whole time. Silently
+        # re-pausing on the identical reason right after a resume is indistinguishable
+        # from progress to whoever is watching for a robot_event, so instead of pausing
+        # again, this now escalates straight to BLOCKED (terminal -- releases the
+        # slot exactly like any other terminal transition, and emits a real event
+        # through the same channel §16.1 fixed) with a message that says plainly that
+        # resuming will not help, rather than leaving the mission (and whoever is
+        # waiting on it) in the same silent limbo a second time.
+        if self._resumed_from_reason.get(mission_id) == reason:
+            self._resumed_from_reason.pop(mission_id, None)
+            return self.mark_terminal(
+                mission_id,
+                state=STATE_BLOCKED,
+                message=(
+                    f"resumed, but immediately re-paused on the identical reason: {reason!r} -- "
+                    "resuming again will not resolve this; a different approach is needed"
+                ),
+            )
         paused = replace(mission, state=STATE_PAUSED, status_text=reason or "paused")
         self._missions[mission_id] = paused
         if self._active_id == mission_id:
@@ -225,6 +255,18 @@ class MissionManager:
         self._missions[mission_id] = resumed
         if slot_free:
             self._active_id = mission_id
+        # Only relevant when resuming straight back into the SAME BT (STATE_RUNNING):
+        # that is the one case where the exact node that raised this pause is about to
+        # re-execute verbatim, with no way for whatever resolved the caller's mind
+        # (resume's own `reason` here, or evidence gathered outside this mission
+        # entirely) to reach that node. A resume that goes through STATE_PLANNING
+        # instead (slot was busy, or there was no bt_json yet) gets a fresh plan, which
+        # may check something else entirely -- tracking the old reason there would
+        # compare apples to oranges, so only record it for the STATE_RUNNING case.
+        if next_state == STATE_RUNNING:
+            self._resumed_from_reason[mission_id] = mission.status_text
+        else:
+            self._resumed_from_reason.pop(mission_id, None)
         return MissionEvent(EVENT_RESUMED, resumed, resumed.status_text)
 
     def reprioritize(
@@ -299,6 +341,7 @@ class MissionManager:
         self._missions[mission_id] = canceled
         if self._active_id == mission_id:
             self._promote_next_queued()
+        self._resumed_from_reason.pop(mission_id, None)
         return MissionEvent(EVENT_CANCELED, canceled, canceled.status_text)
 
     def mark_terminal(
@@ -322,6 +365,7 @@ class MissionManager:
         self._missions[mission_id] = done
         if self._active_id == mission_id:
             self._promote_next_queued()
+        self._resumed_from_reason.pop(mission_id, None)
         event = {
             STATE_SUCCEEDED: EVENT_SUCCEEDED,
             STATE_FAILED: EVENT_FAILED,
