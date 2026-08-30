@@ -19,6 +19,7 @@ EXECUTABLE_NODE_TYPES = {
     "Parallel",
     "Timeout",
     "NoAction",
+    "WaitForEvent",
 }
 FUTURE_NODE_TYPES: set[str] = set()
 ALLOWED_NODE_TYPES = EXECUTABLE_NODE_TYPES | FUTURE_NODE_TYPES
@@ -72,14 +73,18 @@ class PlanValidator:
             errors.append(f"{path}.type is planned but not executable yet: {node_type!r}")
             return
 
-        timeout = node.get("timeout_sec")
-        if timeout is not None and (
-            not isinstance(timeout, (int, float))
-            or isinstance(timeout, bool)
-            or timeout <= 0
-            or timeout > 600
-        ):
-            errors.append(f"{path}.timeout_sec must be in (0, 600]")
+        # WaitForEvent's own branch below validates timeout_sec against its own,
+        # wider bound (up to 1800s, not 600s) -- skip the generic check here so
+        # the two don't fight over the same field with different limits.
+        if node_type != "WaitForEvent":
+            timeout = node.get("timeout_sec")
+            if timeout is not None and (
+                not isinstance(timeout, (int, float))
+                or isinstance(timeout, bool)
+                or timeout <= 0
+                or timeout > 600
+            ):
+                errors.append(f"{path}.timeout_sec must be in (0, 600]")
 
         if node_type in {"Sequence", "Fallback", "Parallel"}:
             children = node.get("children")
@@ -128,6 +133,29 @@ class PlanValidator:
             args = node.get("args", {})
             if not isinstance(args, dict):
                 errors.append(f"{path}.args must be an object")
+            return
+
+        if node_type == "WaitForEvent":
+            if not isinstance(node.get("predicate"), str) or not node["predicate"].strip():
+                errors.append(f"{path}.predicate is required")
+            args = node.get("args", {})
+            if not isinstance(args, dict):
+                errors.append(f"{path}.args must be an object")
+            timeout_sec = node.get("timeout_sec")
+            if (
+                not isinstance(timeout_sec, (int, float))
+                or isinstance(timeout_sec, bool)
+                or timeout_sec <= 0
+                or timeout_sec > 1800
+            ):
+                errors.append(f"{path}.timeout_sec must be in (0, 1800]")
+            poll_interval_sec = node.get("poll_interval_sec", 2.0)
+            if (
+                not isinstance(poll_interval_sec, (int, float))
+                or isinstance(poll_interval_sec, bool)
+                or not (0.5 <= poll_interval_sec <= 30)
+            ):
+                errors.append(f"{path}.poll_interval_sec must be in [0.5, 30]")
             return
 
         if node_type == "Action":

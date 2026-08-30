@@ -88,6 +88,89 @@ def test_accepts_executable_condition_and_goal_check_nodes():
     assert result.ok
 
 
+def test_accepts_wait_for_event_node():
+    plan = {
+        "root": {
+            "type": "WaitForEvent",
+            "predicate": "participant_ready",
+            "args": {"role": "customer"},
+            "poll_interval_sec": 1.0,
+            "timeout_sec": 8.0,
+        },
+        "goal_spec": {
+            "type": "human",
+            "verification": {"mode": "implicit_conversation"},
+        },
+    }
+
+    result = PlanValidator().validate(plan)
+
+    assert result.ok
+
+
+def test_accepts_wait_for_event_default_poll_interval():
+    plan = {
+        "root": {"type": "WaitForEvent", "predicate": "participant_ready", "timeout_sec": 60.0},
+        "goal_spec": {"type": "human", "verification": {"mode": "implicit_conversation"}},
+    }
+
+    assert PlanValidator().validate(plan).ok
+
+
+def test_rejects_wait_for_event_missing_predicate():
+    plan = {
+        "root": {"type": "WaitForEvent", "timeout_sec": 60.0},
+        "goal_spec": {"type": "human", "verification": {"mode": "implicit_conversation"}},
+    }
+
+    result = PlanValidator().validate(plan)
+
+    assert not result.ok
+    assert any("predicate" in error for error in result.errors)
+
+
+def test_rejects_wait_for_event_timeout_over_1800():
+    # This is exactly the bug found live 2026-08-29: a WaitForEvent plan with
+    # timeout_sec > 600 (but <= 1800, its own documented ceiling) must not be
+    # rejected by the generic node-level timeout_sec check, which caps at 600
+    # for every other node type.
+    plan = {
+        "root": {"type": "WaitForEvent", "predicate": "participant_ready", "timeout_sec": 1801.0},
+        "goal_spec": {"type": "human", "verification": {"mode": "implicit_conversation"}},
+    }
+
+    result = PlanValidator().validate(plan)
+
+    assert not result.ok
+    assert any("timeout_sec" in error for error in result.errors)
+
+
+def test_accepts_wait_for_event_timeout_above_600_below_1800():
+    plan = {
+        "root": {"type": "WaitForEvent", "predicate": "participant_ready", "timeout_sec": 1200.0},
+        "goal_spec": {"type": "human", "verification": {"mode": "implicit_conversation"}},
+    }
+
+    assert PlanValidator().validate(plan).ok
+
+
+def test_rejects_wait_for_event_poll_interval_out_of_bounds():
+    plan = {
+        "root": {
+            "type": "WaitForEvent",
+            "predicate": "participant_ready",
+            "poll_interval_sec": 0.1,
+            "timeout_sec": 60.0,
+        },
+        "goal_spec": {"type": "human", "verification": {"mode": "implicit_conversation"}},
+    }
+
+    result = PlanValidator().validate(plan)
+
+    assert not result.ok
+    assert any("poll_interval_sec" in error for error in result.errors)
+
+
 def test_accepts_visual_check_nodes():
     plan = {
         "root": {
