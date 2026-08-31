@@ -135,3 +135,19 @@ def test_planner_prompt_warns_there_is_no_stop_skill():
 
     assert "no 'stop' skill" in system
     assert "already stop on arrival" in system
+
+
+def test_planner_prompt_warns_sequential_steps_are_not_parallel():
+    # Found live 2026-08-31: "turn right, then look for what's there" (an
+    # explicitly two-step, sequential instruction) planned as two children
+    # both needing the "gaze" resource under what the validator's own error
+    # ("root.children[1].children[0] and ...children[1] have conflicting
+    # resources: ['gaze']") identified as a concurrent-execution node --
+    # correctly rejected, but the mission the person asked for was never
+    # planned at all.
+    messages = build_planner_messages(
+        "turn right, then look for what's there", "{}")
+    system = messages[0][1]
+
+    assert "is a Sequence, not" in system
+    assert "Parallel means both children run at once" in system

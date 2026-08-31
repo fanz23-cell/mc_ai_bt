@@ -449,6 +449,13 @@ def build_planner_messages(
                 "Condition, GoalCheck, VisualCheck, NoAction, WaitForEvent."
             ),
             "Parallel children must be independently safe and must not require overlapping skill resources.",
+            (
+                "An intent phrased as a sequence of steps -- 'first do X, then do Y', 'turn right, "
+                "then look for Z', 'go there and tell me when you arrive' -- is a Sequence, not "
+                "Parallel: Parallel means both children run at once. Two steps that both need the "
+                "same resource (e.g. two skills that both need gaze) can only ever be valid as a "
+                "Sequence; putting them in Parallel is always a resource conflict and will be rejected."
+            ),
             "Timeout wraps exactly one child and must set timeout_sec in seconds.",
             "NoAction is only for an explicit already-satisfied/no-op plan with a short reason.",
             (
