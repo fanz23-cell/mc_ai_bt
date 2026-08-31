@@ -41,7 +41,7 @@ from .mission import (
 from .mission_journal import MissionJournal
 from .policy_guard import PolicyGuard
 from .planner_factory import PlannerSettings, build_planner
-from .planning_pipeline import PlanningPipeline
+from .planning_pipeline import PlanningPipeline, PlanningResult
 from .skill_adapters import RosSkillExecutor
 from .skill_registry import SkillRegistry
 from .task_projection import task_projection_updates
@@ -244,7 +244,7 @@ class AiBtNode(Node):
         expected_identity = mission.identity
         with self._mission_lock:
             missions = self._missions.all()
-        planning = self._planning.plan(mission, missions)
+        planning = self._plan_with_hard_timeout(mission, missions)
         if not planning.ok:
             with self._mission_lock:
                 try:
@@ -274,6 +274,63 @@ class AiBtNode(Node):
                 return
         self._publish_event(planned)
         self._start_runner(planned.mission)
+
+    def _plan_with_hard_timeout(
+        self, mission: Mission, missions: tuple[Mission, ...]
+    ) -> PlanningResult:
+        """Enforce the configured planner_timeout as a hard wall-clock deadline
+        around self._planning.plan(), independent of whatever timeout the
+        injected LLM client itself claims to honor.
+
+        FOUND LIVE 2026-08-31: the langchain_openai ChatOpenAI client backing
+        the planner is already constructed with timeout=planner_timeout
+        (planner_factory.py), but under this session's observed network
+        conditions that configured timeout did not fire at all: a mission sat
+        in "planning" for 4+ minutes with no exception ever raised anywhere,
+        holding the single active-mission slot the whole time (submit_task_intent
+        calls self._plan_and_start synchronously, so the caller's own request
+        -- the Robot Gateway Bridge's /submit_mission call -- was left hanging
+        too, past its own separate timeout, and reported a confusing failure
+        while the mission kept sitting there regardless).
+        PlanningPipeline.plan already turns a raised exception into a graceful
+        PlanningResult(False, "planner", ...) -- see its own try/except -- this
+        gives that same graceful outcome an upper bound even when the
+        underlying call never raises anything at all. Running it on its own
+        thread and giving up waiting after the deadline, regardless of whether
+        that thread ever returns, is a hard backstop, not a replacement for a
+        working client-side timeout -- the orphaned thread's eventual result,
+        if any, is simply discarded.
+        """
+        timeout_sec = float(self.get_parameter("planner_timeout").value or 15.0)
+        result_box: dict[str, object] = {}
+        done = threading.Event()
+
+        def _run() -> None:
+            try:
+                result_box["value"] = self._planning.plan(mission, missions)
+            except Exception as exc:  # noqa: BLE001
+                result_box["error"] = exc
+            finally:
+                done.set()
+
+        threading.Thread(
+            target=_run,
+            name=f"planning-{mission.identity.mission_id[:8]}",
+            daemon=True,
+        ).start()
+        # A little slack past timeout_sec: the client's own timeout is meant to
+        # fire first and produce a real error message; this deadline is only
+        # the backstop for when it does not.
+        if not done.wait(timeout=max(0.0, timeout_sec) + 1.0):
+            return PlanningResult(
+                False,
+                "planner",
+                f"planner timed out after {timeout_sec:g}s with no response from the LLM backend",
+            )
+        if "error" in result_box:
+            exc = result_box["error"]
+            return PlanningResult(False, "planner", f"planner failed: {type(exc).__name__}: {exc}")
+        return result_box["value"]  # type: ignore[return-value]
 
     def _start_runner(self, mission: Mission) -> None:
         cancel_event = threading.Event()
