@@ -179,7 +179,9 @@ DEFAULT_SKILLS: dict[str, SkillSpec] = {
         ("base",),
         "Rotate in place (no travel) to face an entity's current live position. A single "
         "bounded turn computed once from a snapshot -- does not continuously track a moving "
-        "target; call again to re-aim.",
+        "target; call again to re-aim. target must be a real, perceivable person/object name "
+        "(e.g. 'the plant'), never a bare compass direction like 'right' or 'left' -- for "
+        "'turn right'/'turn left' with no named target, use simple_move instead.",
         {"target": "entity|entity_id|object|person"},
         ("entity_faced",),
     ),
@@ -241,7 +243,10 @@ DEFAULT_SKILLS: dict[str, SkillSpec] = {
     "simple_move": SkillSpec(
         "simple_move",
         ("base",),
-        "Bounded relative base movement primitive.",
+        "Bounded relative base movement primitive: move forward/backward by a distance in "
+        "metres, or turn left/right in place by an angle in degrees, with no named target. "
+        "This is what 'turn right'/'turn left'/'turn around' means -- use face_entity only "
+        "when the intent names an actual person/object to turn toward.",
         {"action": "forward|backward|left|right", "value": "number"},
         ("relative_motion_completed",),
         dispatch="dedicated",
