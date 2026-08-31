@@ -118,3 +118,20 @@ def test_planner_prompt_steers_generic_person_presence_to_person_visible():
     assert "closed, fixed set of" in system
     assert "go straight to a Condition/GoalCheck with predicate person_visible" in system
     assert '"cardboard package box"' in system
+
+
+def test_planner_prompt_warns_there_is_no_stop_skill():
+    # Found live 2026-08-31, twice, on two different plans: the planner tried
+    # to satisfy "...and stop right next to it"/"...stop right beside it" with
+    # a dedicated "stop" step -- once as an invented top-level skill (rejected:
+    # "root.children[2].skill is unknown: stop"), once as simple_move's action
+    # arg (rejected: "args.action is not allowed: 'stop'"). Both plans were
+    # correctly rejected by the validator, but the mission the person actually
+    # asked for never got planned at all -- approach_entity/go_to_place/
+    # come_to_me already stop on arrival, no separate step is ever needed.
+    messages = build_planner_messages(
+        "navigate to the plant and stop right next to it", "{}")
+    system = messages[0][1]
+
+    assert "no 'stop' skill" in system
+    assert "already stop on arrival" in system

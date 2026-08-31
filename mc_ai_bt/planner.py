@@ -571,6 +571,13 @@ def build_planner_messages(
                 "perceived position. It fails if the entity has not been perceived recently -- "
                 "that is a real, reportable outcome, not something to retry with a guessed place."
             ),
+            (
+                "There is no 'stop' skill and no 'stop' action on any skill, including "
+                "simple_move -- go_to_place/approach_entity/come_to_me already stop on arrival by "
+                "themselves. An intent phrased as '...and stop right next to it' or '...then stop' "
+                "is satisfied entirely by the navigation skill alone; do not add a separate step "
+                "for the word 'stop' in the intent text."
+            ),
             "Do not invent ROS topics, action names, Python code, frames, joint commands or expressions.",
             "For physical actions, use only skills from the skill catalog.",
             (
