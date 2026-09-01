@@ -237,8 +237,42 @@ class AiBtNode(Node):
         if mission.state == STATE_QUEUED:
             return response
 
-        self._plan_and_start(mission)
+        self._plan_and_start_async(mission)
         return response
+
+    def _plan_and_start_async(self, mission: Mission) -> None:
+        """Run _plan_and_start on its own thread so the caller returns
+        immediately instead of blocking for the full LLM planning latency.
+
+        FOUND LIVE 2026-08-31: SubmitTaskIntent.srv's own comment documents
+        the mission as running asynchronously, but _handle_submit called
+        _plan_and_start directly -- the service callback itself blocked until
+        planning finished, failed, or _plan_with_hard_timeout's backstop
+        fired. _plan_with_hard_timeout already runs the LLM call on its own
+        thread, but that only bounds ONE call's latency; it does not stop the
+        calling thread from blocking on it. This is the actual async
+        boundary: the same expected_identity staleness checks
+        _plan_and_start already uses internally (mark_terminal/set_plan's
+        KeyError-on-stale-identity path) are what make it safe to let more
+        than one of these run/land at different times.
+
+        Every call site that used to call _plan_and_start directly now goes
+        through here, not just the three external service handlers (submit/
+        resume/reprioritize) this was originally written for: _start_next_ready
+        runs on a mission's own runner thread (a planning hang there would
+        have delayed the NEXT mission picking up its slot, the same class of
+        problem this exists to prevent, just one thread removed from a live
+        caller instead of on it), and _replan_active_from_trigger/
+        _plan_new_mission_from_trigger run on whatever callback processes
+        WorldEvent-driven triggers, where a synchronous block risks starving
+        an entire ROS callback group, not just one caller's response.
+        """
+        threading.Thread(
+            target=self._plan_and_start,
+            args=(mission,),
+            name=f"plan-and-start-{mission.identity.mission_id[:8]}",
+            daemon=True,
+        ).start()
 
     def _plan_and_start(self, mission: Mission) -> None:
         expected_identity = mission.identity
@@ -437,7 +471,7 @@ class AiBtNode(Node):
                 if mission.state == STATE_PLANNING and not mission.bt_json
             ]
         if ready:
-            self._plan_and_start(ready[0])
+            self._plan_and_start_async(ready[0])
 
     def _handle_cancel(
         self,
@@ -502,7 +536,7 @@ class AiBtNode(Node):
         if event.mission.state == STATE_RUNNING and event.mission.bt_json:
             self._start_runner(event.mission)
         elif event.mission.state == STATE_PLANNING and not event.mission.bt_json:
-            self._plan_and_start(event.mission)
+            self._plan_and_start_async(event.mission)
         response.success = True
         response.message = event.message
         return response
@@ -541,7 +575,7 @@ class AiBtNode(Node):
             self._skill_executor.cancel_current(preempt_reason)
         self._publish_event(event)
         if event.mission.state == STATE_PLANNING and not event.mission.bt_json:
-            self._plan_and_start(event.mission)
+            self._plan_and_start_async(event.mission)
         response.success = True
         response.message = event.message
         response.status = self._status_msg(event.mission)
@@ -833,7 +867,7 @@ class AiBtNode(Node):
             cancel_event.set()
             self._skill_executor.cancel_current(decision.message)
         self._publish_event(event)
-        self._plan_and_start(event.mission)
+        self._plan_and_start_async(event.mission)
 
     def _plan_new_mission_from_trigger(self, decision: TriggerDecision) -> None:
         context_json = json.dumps(
@@ -873,7 +907,7 @@ class AiBtNode(Node):
             return
         self._publish_event(event)
         if accepted and mission.state != STATE_QUEUED:
-            self._plan_and_start(mission)
+            self._plan_and_start_async(mission)
 
     def _has_active_mission_unlocked(self) -> bool:
         terminal = {STATE_SUCCEEDED, STATE_FAILED, STATE_CANCELED, STATE_BLOCKED}
@@ -946,7 +980,38 @@ class AiBtNode(Node):
         return policy
 
 
+def _log_provenance(entry_point: str) -> None:
+    """Print which copy of this node's code is actually running, and whether
+    it matches the real ros2-run entry point — before rclpy.init(), with a
+    plain print (not the ROS logger) so it survives regardless of logging
+    config. See [[feedback_dual_entrypoint_hotpatch]]: a site-packages-only
+    hot patch can silently leave the real entry point stale for an unknown
+    period with no error at all. This makes "which code is actually running"
+    checkable in the container logs instead of assumed.
+    """
+    import hashlib
+    import os
+
+    def _hash(path: str) -> tuple[str, str]:
+        try:
+            with open(path, "rb") as handle:
+                digest = hashlib.sha256(handle.read()).hexdigest()[:12]
+            return digest, f"{os.path.getmtime(path):.0f}"
+        except OSError as exc:
+            return f"MISSING({exc})", "-"
+
+    self_path = os.path.abspath(__file__)
+    self_sha, self_mtime = _hash(self_path)
+    entry_sha, entry_mtime = _hash(entry_point)
+    print(
+        f"PROVENANCE self={self_path} sha256={self_sha} mtime={self_mtime} "
+        f"| entry={entry_point} sha256={entry_sha} mtime={entry_mtime}",
+        flush=True,
+    )
+
+
 def main() -> None:
+    _log_provenance("/ros2_ws/install/mc_ai_bt/lib/mc_ai_bt/ai_bt")
     rclpy.init()
     node = AiBtNode()
     executor = MultiThreadedExecutor()

@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from typing import Any
 
 from .entity_facts import (
-    fact_value,
     normalise_entity_name,
     object_fact_key,
     object_name_from_args,
@@ -42,20 +41,15 @@ def evaluate_place_predicate(
 
 
 def _build_world_state_evaluator(facts: dict[str, Any]):
-    try:
-        from mc_world_state.place_regions import PlaceRegionIndex
-        from mc_world_state.predicate_evaluator import PredicateEvaluator
-    except Exception:
-        return None
+    # FOUND LIVE 2026-08-31: this used to `from mc_world_state.place_regions import
+    # PlaceRegionIndex` directly -- mc_ai_bt and mc_world_state are separate Docker
+    # images with no shared runtime, so that import ALWAYS raised in production and
+    # this ALWAYS returned None, meaning person_at_place/object_at_place could never
+    # resolve to TRUE/FALSE, only ever UNKNOWN. place_region_predicates.py is a
+    # kept-in-sync mirror (see its own module docstring) of the same logic.
+    from .place_region_predicates import PredicateEvaluator, place_regions_from_facts
 
-    places = PlaceRegionIndex()
-    for scope_name in ("places", "place_regions"):
-        scoped = facts.get(scope_name)
-        if not isinstance(scoped, dict):
-            continue
-        for key, entry in scoped.items():
-            places.upsert_from_fact(str(key), fact_value(entry))
-    return PredicateEvaluator(places)
+    return PredicateEvaluator(place_regions_from_facts(facts))
 
 
 def _normalise_place_args(predicate: str, args: dict[str, Any]) -> dict[str, Any]:

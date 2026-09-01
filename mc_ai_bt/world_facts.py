@@ -130,4 +130,23 @@ def world_fact_updates_for_execution(facts: dict[str, Any]) -> tuple[WorldFactUp
             )
         )
 
+    # FOUND LIVE 2026-08-31: naming a person used to write nothing at all (no skill
+    # existed for it) -- remember_person only ever produces this fact after actually
+    # locating the person (see mc_embodied_skills/node.py's _remember_person_skill),
+    # so a name reaching mc_world_state here is backed by real, fresh perception, not
+    # bare chat text. A separate scope from "people"/"semantic_people" on purpose: a
+    # name binding should not be clobbered by the next unrelated pose-detection frame.
+    person_named = facts.get("person_named")
+    if isinstance(person_named, dict) and person_named.get("person_id") and person_named.get("name"):
+        person_id = str(person_named["person_id"])
+        updates.append(
+            WorldFactUpdate(
+                source="mc_ai_bt.skill.remember_person",
+                scope="people_names",
+                key=person_id,
+                value={"person_id": person_id, "name": str(person_named["name"])},
+                merge=False,
+            )
+        )
+
     return tuple(updates)

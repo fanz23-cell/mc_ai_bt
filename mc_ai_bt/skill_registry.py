@@ -22,12 +22,78 @@ class SkillSpec:
     # OMEGACLAW_AI_BT_INTEGRATION.md §9 for why hand-copying these sets independently caused
     # three separate live production failures in one afternoon.
     dispatch: str = "embodied"
+    # FOUND LIVE 2026-08-31: align_axis/move_along_axis/maintain_distance/wait_for_contact/
+    # detect_contact are registered here exactly like any working skill (same dataclass
+    # shape, same fields) but seattle_lab/mc_embodied_skills/node.py unconditionally
+    # returns STATUS_BLOCKED for every one of them -- "requires new IK/pose-tracking work
+    # not yet built" / "requires a dedicated closed-loop controller". Nothing before this
+    # field told the LLM planner that; the exact same unfiltered catalog (planner.py's
+    # build_planner_messages) was serialized into its prompt whether a skill actually
+    # worked or not, so the planner had no way to distinguish "really works" from
+    # "registered but not implemented" -- it could only find out by trying and getting
+    # STATUS_BLOCKED back. "available" (every other skill): real today, safe to plan
+    # with. "blocked": registered as a real capability but not implemented yet -- must
+    # never reach the planner's prompt (see context_builder.py/planner.py's catalog
+    # filtering). "experimental": implemented but not yet trusted enough to plan with by
+    # default -- reserved for future use, currently unused.
+    status: str = "available"
+
+
+# Real clip names from the animation library (mc_one_codey/*/context/animations/clips/),
+# grouped for the play_animation description below. This is the single source both that
+# description AND planner.py's BootstrapPlanner fallback are built from -- see
+# tests/test_animation_clip_catalog_consistency.py, which checks every name here actually
+# has a clip file on disk. Found live 2026-08-31: play_animation's description used to name
+# no clips at all, so the LLM planner invented plausible-sounding ones ("wave", "nod") that
+# don't exist and silently fail to play; BootstrapPlanner's own regex fallback had the exact
+# same bug hardcoded as a literal string. Curated, not exhaustive -- add to it as new clips
+# earn a place in the planner's vocabulary, but never let this drift from the real catalog.
+# The real wave/greeting clip -- named separately so planner.py's regex
+# fallback can import a real symbol instead of hardcoding the string again.
+WAVE_CLIP = "wave_and_jaw"
+
+KNOWN_ANIMATION_CLIPS: dict[str, tuple[str, ...]] = {
+    "greeting/gesture": (
+        WAVE_CLIP, "fist_bump", "both_beckon", "left_beckon", "right_beckon",
+        "both_present", "left_present", "right_present",
+    ),
+    "agreement": ("yes_once", "yes_eager", "no_subtle", "not_at_all", "exactly", "different"),
+    "expression": (
+        "smile", "smirk", "surprised", "confused", "frustrated", "disgusted", "angry",
+        "disappointment",
+    ),
+    "other": ("interjection", "thrilled_all", "excited_bouncing", "square_up", "stage_walk"),
+}
+
+
+def _play_animation_description() -> str:
+    groups = "; ".join(
+        f"{category} — {', '.join(names)}" for category, names in KNOWN_ANIMATION_CLIPS.items()
+    )
+    return (
+        "Play a named animator clip or generator. `animation` must be a REAL "
+        "clip name from the animation library — never invent a plausible-"
+        "sounding name (there is no 'wave' or 'nod' clip; an invented name "
+        f"silently fails to play). Known clips include: {groups}. If the "
+        "desired gesture isn't one of these, prefer a skill above instead of "
+        "guessing."
+    )
 
 
 DEFAULT_SKILLS: dict[str, SkillSpec] = {
+    # FOUND LIVE 2026-09-01 (3rd GPT review): locate_entity/get_pose/search_for_entity all
+    # dispatch to mc_embodied_skills' _locate_with_scan, which physically turns the robot
+    # base (SimpleMove) up to _SCAN_MAX_TURNS times when the target isn't in the current
+    # frame -- confirmed live runtime behavior, not hypothetical. "base" must be declared
+    # here so PolicyGuard's max_base_actions budget and validator.py's Parallel
+    # resource-conflict check both see this real motion; before this fix all three could
+    # be scheduled in "Parallel" alongside a dedicated base skill (go_to_place/simple_move)
+    # with zero declared conflict, while at runtime mc_embodied_skills acquired no "base"
+    # lease at all for its own SimpleMove goals -- an un-arbitrated race, not just budget
+    # undercounting.
     "locate_entity": SkillSpec(
         "locate_entity",
-        (),
+        ("base",),
         "Resolve an arbitrary entity from World State/perception without exposing hidden simulator truth.",
         {"target": "entity|entity_id|object|person"},
         ("entity_located",),
@@ -50,7 +116,7 @@ DEFAULT_SKILLS: dict[str, SkillSpec] = {
     ),
     "get_pose": SkillSpec(
         "get_pose",
-        (),
+        ("base",),  # see locate_entity's comment above -- same _locate_with_scan dispatch
         "Read the latest fresh pose for an entity/frame.",
         {"target": "entity|entity_id|target|frame"},
         ("pose_available",),
@@ -64,7 +130,7 @@ DEFAULT_SKILLS: dict[str, SkillSpec] = {
     ),
     "search_for_entity": SkillSpec(
         "search_for_entity",
-        ("gaze",),
+        ("base", "gaze"),  # see locate_entity's comment above -- same _locate_with_scan dispatch
         "Search perception space for an arbitrary entity.",
         {"target": "entity|entity_id|object|person"},
         ("search_for_entity_completed",),
@@ -100,6 +166,7 @@ DEFAULT_SKILLS: dict[str, SkillSpec] = {
         {"axis": "axis", "target": "entity|frame|x/y/z"},
         ("axis_aligned",),
         realtime=True,
+        status="blocked",  # requires new IK/pose-tracking work not yet built
     ),
     "move_along_axis": SkillSpec(
         "move_along_axis",
@@ -108,6 +175,7 @@ DEFAULT_SKILLS: dict[str, SkillSpec] = {
         {"axis": "axis", "distance_m": "number"},
         ("axis_motion_completed",),
         realtime=True,
+        status="blocked",  # requires new IK/pose-tracking work not yet built
     ),
     "maintain_distance": SkillSpec(
         "maintain_distance",
@@ -116,6 +184,7 @@ DEFAULT_SKILLS: dict[str, SkillSpec] = {
         {"target": "entity|person|object", "distance_m": "number"},
         ("distance_maintained",),
         realtime=True,
+        status="blocked",  # requires a dedicated closed-loop controller
     ),
     "hold_pose": SkillSpec(
         "hold_pose",
@@ -132,6 +201,7 @@ DEFAULT_SKILLS: dict[str, SkillSpec] = {
         {"target": "entity|object|person", "min_duration_sec": "number"},
         ("contact_detected",),
         realtime=True,
+        status="blocked",  # requires a dedicated closed-loop controller
     ),
     "detect_contact": SkillSpec(
         "detect_contact",
@@ -140,6 +210,7 @@ DEFAULT_SKILLS: dict[str, SkillSpec] = {
         {"target": "entity|object|person"},
         ("contact_detected",),
         realtime=True,
+        status="blocked",  # requires a dedicated closed-loop controller
     ),
     "oscillate": SkillSpec(
         "oscillate",
@@ -202,6 +273,43 @@ DEFAULT_SKILLS: dict[str, SkillSpec] = {
         ("place_remembered",),
         dispatch="dedicated",
     ),
+    # FOUND LIVE 2026-08-31: naming a person used to go through no skill at all -- bare
+    # chat text, no perception check, so a name could be "remembered" for a bearing the
+    # robot never actually looked at. Mirrors search_for_entity's real-evidence contract
+    # (checks the current view, then physically turns and looks before giving up) --
+    # the target must actually be found before the name is bound.
+    # FOUND LIVE 2026-09-01 (4th GPT review): calls _locate_with_scan (same as
+    # search_for_entity) -- turns the base, not just gaze. Was declared "gaze" only.
+    "remember_person": SkillSpec(
+        "remember_person",
+        ("base", "gaze"),
+        "Bind a name to a person the robot can currently see or can find by looking "
+        "around -- e.g. 'the person on your left is named Alice'. Actually locates the "
+        "person first (turning to look if needed, same as search_for_entity); refuses "
+        "to bind a name to someone it cannot actually find. `target` describes who "
+        "(a bearing, description, or an id from a prior locate_entity/search_for_entity "
+        "result), `name` is what to call them.",
+        {"target": "entity|entity_id|person", "name": "name to bind"},
+        ("person_named",),
+    ),
+    # FOUND LIVE 2026-08-31: "turn around and count everyone in the room" is one
+    # reasonable request, but needing several separate simple_move turns to do it
+    # blew the per-mission action budget outright (a real scan needs >=3 bounded
+    # turns before a single detect/report action is even added). One bounded,
+    # policy-counted skill for "sweep and count" instead of N base actions.
+    "scan_room": SkillSpec(
+        "scan_room",
+        ("base", "gaze"),
+        "Turn in place through a full sweep, reporting the most people seen in any "
+        "single view during the sweep -- use for 'how many people are in the room' / "
+        "'look around and count everyone'. This is a LOWER BOUND, not an exact "
+        "deduplicated count: people who are never in the same view together as each "
+        "other cannot be reliably told apart from one person seen twice, since this "
+        "perception pipeline has no stable per-person tracking across views. Takes no "
+        "arguments.",
+        {},
+        ("room_scanned",),
+    ),
     "guide_entity_to_place": SkillSpec(
         "guide_entity_to_place",
         ("base",),
@@ -254,7 +362,7 @@ DEFAULT_SKILLS: dict[str, SkillSpec] = {
     "play_animation": SkillSpec(
         "play_animation",
         ("body",),
-        "Play a named animator clip or generator.",
+        _play_animation_description(),
         {"animation": "string"},
         ("animation_played",),
         dispatch="dedicated",

@@ -99,6 +99,17 @@ PREDICATE_REGISTRY: dict[str, PredicateSpec] = {
     # its evidence -- but "matched" still reflects whether the Spin action itself
     # reported success, which is what this generic path reads.
     "entity_faced": PredicateSpec("entity_faced", ("robot", "objects", "people", "entities"), "robot"),
+    # remember_person (mc_embodied_skills) -- only ever produces evidence after actually
+    # locating the person (same _locate_with_scan real-evidence contract search_for_entity/
+    # locate_entity use); "matched" reflects whether a person was genuinely found and the
+    # name bound to it, same generic path as entity_located et al. above.
+    "person_named": PredicateSpec("person_named", ("people", "people_names"), "people_names"),
+    # scan_room (mc_embodied_skills) -- a bounded turn-and-count sweep; "matched"
+    # reflects whether the sweep could query world state at all, same generic path
+    # as entity_located et al. above. min_people_count/frames_checked are the
+    # skill's own evidence fields, read directly by whoever consumes the goal_spec
+    # args (e.g. query_world.py), not by this generic predicate check itself.
+    "room_scanned": PredicateSpec("room_scanned", ("people",), "people"),
 }
 
 

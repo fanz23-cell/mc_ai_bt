@@ -53,6 +53,12 @@ class ContextBuilder:
                     "policy_enabled": spec.name in POLICY_ENABLED_SKILLS,
                 }
                 for spec in (self._skills.get(name) for name in self._skills.names())
+                # FOUND LIVE 2026-08-31: a skill registered with status="blocked"
+                # (align_axis/move_along_axis/maintain_distance/wait_for_contact/
+                # detect_contact today) unconditionally returns STATUS_BLOCKED at the
+                # embodied-skills runtime -- it must never be advertised as something
+                # the planner can actually use.
+                if spec.status == "available"
             ],
             "constraints": {
                 "planner_output_schema": "mc_ai_bt.plan.v1",

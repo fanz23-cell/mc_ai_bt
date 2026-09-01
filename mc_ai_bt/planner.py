@@ -6,7 +6,7 @@ from typing import Any, Protocol
 
 from .goal_check import PREDICATE_REGISTRY
 from .policy_guard import LOOK_AT_DIRECTIONS, POLICY_ENABLED_SKILLS, PolicyLimits
-from .skill_registry import DEFAULT_SKILLS, SkillRegistry
+from .skill_registry import DEFAULT_SKILLS, WAVE_CLIP, SkillRegistry
 from .visual_check import visual_check_goal_spec
 
 # The complete set of real predicate names Condition/GoalCheck/WaitForEvent/goal_spec
@@ -210,7 +210,9 @@ class BootstrapPlanner:
     @staticmethod
     def _extract_animation(lowered: str) -> str:
         if "wave" in lowered or "挥手" in lowered:
-            return "wave"
+            # "wave" is not a real clip name — WAVE_CLIP (skill_registry.py)
+            # is the animation library's actual greeting/wave gesture.
+            return WAVE_CLIP
         match = re.search(r"\bplay animation (?P<name>[a-z0-9 _-]+)$", lowered)
         if match:
             return _slug(match.group("name"))
@@ -422,6 +424,13 @@ def build_planner_messages(
         if name not in POLICY_ENABLED_SKILLS:
             continue
         spec = skills.get(name)
+        if spec.status != "available":
+            # FOUND LIVE 2026-08-31: align_axis/move_along_axis/maintain_distance/
+            # wait_for_contact/detect_contact used to be serialized into this same
+            # prompt line, indistinguishable from any working skill -- the LLM
+            # planner had no way to know they always return STATUS_BLOCKED at the
+            # embodied-skills runtime short of trying them and finding out live.
+            continue
         resources = ",".join(spec.resources) if spec.resources else "none"
         # Found live 2026-08-29 building remember_place: this line used to omit
         # args_schema entirely, so the model had no idea what argument keys a new
@@ -561,9 +570,9 @@ def build_planner_messages(
             (
                 "locate_entity, get_pose and search_for_entity take exactly one arg, target: "
                 "the plain name of the object or person to look for, e.g. target=mystery_gadget. "
-                "They check current world-state knowledge, not an active physical search; an "
-                "UNKNOWN/not-found result means the entity has not been perceived recently, not "
-                "that it does not exist."
+                "They check current world-state knowledge first, then physically turn to look "
+                "(a real, budgeted base motion) before giving up; an UNKNOWN/not-found result "
+                "means the entity was not perceived after that search, not that it does not exist."
             ),
             (
                 "check_relation takes exactly one arg, relation: two entity/object names joined "

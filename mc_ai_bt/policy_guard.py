@@ -260,6 +260,15 @@ class PolicyGuard:
         if not self._skills.has(skill):
             errors.append(f"{path}.skill is not registered: {skill!r}")
             return
+        spec = self._skills.get(skill)
+        if spec is not None and spec.status != "available":
+            # Belt-and-braces: planner.py's prompt already omits non-available skills
+            # from the catalog, but a plan reaching here with one anyway (a stale
+            # cached plan, a hand-authored one, a future prompt regression) must be
+            # rejected structurally, not discovered by trying it and getting
+            # STATUS_BLOCKED back at execution time.
+            errors.append(f"{path}.skill is not available (status={spec.status!r}): {skill!r}")
+            return
         if skill == "say":
             text = str(args.get("text") or "")
             if len(text) > self._limits.max_say_chars:
@@ -277,6 +286,18 @@ class PolicyGuard:
             if not animation or len(animation) > 64:
                 errors.append(f"{path}.args.animation must be non-empty and <= 64 chars")
             self._check_optional_duration(args, path, errors)
+            # play_animation's nested "args" (generator args) is a raw
+            # passthrough all the way to mc_animator, unlike point_at's
+            # POINT_AT_ALLOWED_KEYS-checked args — a plan must never be able
+            # to set "_caller" itself; that key identifies the REAL caller to
+            # mc_animator's resource lease (see skill_adapters.py's
+            # _play_animation_skill) and is only ever trustworthy when the
+            # adapter sets it, not the planner.
+            nested = args.get("args")
+            if isinstance(nested, dict) and "_caller" in nested:
+                errors.append(f"{path}.args.args must not set reserved key '_caller'")
+
+
         elif skill == "look_at":
             self._check_look_at(args, path, errors)
         elif skill == "point_at":
@@ -303,6 +324,8 @@ class PolicyGuard:
             self._check_wait_for_participant(args, path, errors)
         elif skill == "remember_place":
             self._check_remember_place(args, path, errors)
+        elif skill == "remember_person":
+            self._check_remember_person(args, path, errors)
         elif skill not in POLICY_ENABLED_SKILLS:
             errors.append(f"{path}.skill is registered but not policy-enabled yet: {skill}")
 
@@ -535,6 +558,12 @@ class PolicyGuard:
         if not name or len(name) > 64:
             errors.append(f"{path}.args.name must be non-empty and <= 64 chars")
 
+    def _check_remember_person(self, args: dict[str, Any], path: str, errors: list[str]) -> None:
+        self._check_entity_target(args, path, errors, skill="remember_person")
+        name = _clean_label(args.get("name"))
+        if not name or len(name) > 64:
+            errors.append(f"{path}.args.name must be non-empty and <= 64 chars")
+
     def _check_totals(self, stats: "_Stats", errors: list[str]) -> None:
         limits = self._limits
         if stats.total_nodes > limits.max_total_nodes:
@@ -565,6 +594,26 @@ class PolicyGuard:
         errors: list[str],
     ) -> None:
         if not isinstance(goal_spec, dict):
+            return
+        # FOUND LIVE 2026-08-31 (real mission-journal audit): 83 of 84 planned missions
+        # used goal type "human" / verification "implicit_conversation" -- "the mission
+        # completed if execution didn't error" -- and most of those (66) contained a real
+        # physical skill (go_to_place/approach_entity/play_animation/...). A skill's own
+        # ROS-level SUCCEEDED is not the same claim as "the user's actual request was
+        # satisfied"; for a mission that moves the robot's body or base, implicit
+        # human/conversational success is not a real success criterion at all -- reject
+        # the plan and force a structured predicate instead of silently accepting it.
+        verification_mode = str((goal_spec.get("verification") or {}).get("mode") or "")
+        if (
+            stats.physical_skill_counts
+            and (goal_spec.get("type") == "human" or verification_mode == "implicit_conversation")
+        ):
+            errors.append(
+                "goal_spec uses implicit/human success verification but the plan contains "
+                f"physical skill(s) {sorted(stats.physical_skill_counts)} -- a physical "
+                "mission must declare a structured goal_spec.predicate, not rely on "
+                "'execution did not error' as its success criterion"
+            )
             return
         predicate = str(goal_spec.get("predicate") or "")
         if not predicate or not stats.physical_skill_counts:

@@ -46,6 +46,64 @@ class ActionBinding:
     resources: tuple[str, ...]
     timeout_sec: float
     success_facts: dict[str, Any]
+    # Optional Callable[[feedback, result], tuple[bool, dict[str, Any]]]. When set, called
+    # after the ROS action itself reports SUCCEEDED, with the LAST feedback message seen
+    # (or None) and the terminal result -- real, independently-produced telemetry, not
+    # something this adapter asserted about itself. Returning (False, ...) turns a
+    # ROS-level success into an ExecutionResult(False, ...): the action controller's own
+    # "I did it" is not enough on its own. Returning (True, facts) uses `facts` in place of
+    # the static success_facts. None (every skill except go_to_place/come_to_me right now)
+    # keeps today's behavior exactly -- see verify_go_to_place/verify_come_to_me for why
+    # only these two currently have real corroborating telemetry to check against.
+    verify: Any = None
+
+
+# go_to_place/come_to_me's own ARRIVAL_DISTANCE_TOLERANCE_M -- both actions' Feedback
+# carries distance_remaining, "metres left to the goal, as Nav2's planner estimates it"
+# (GoToPlace.action/ComeToMe.action's own comments), mirrored from real NavigateToPose
+# feedback -- Nav2's own telemetry, not something this adapter computed or asserted itself.
+_ARRIVAL_DISTANCE_TOLERANCE_M = 1.0
+
+
+def _arrival_verifier(facts_on_success: dict[str, Any]):
+    """go_to_place/come_to_me's real (if partial) success verification.
+
+    FOUND LIVE 2026-08-31: before this, ROS-level SUCCEEDED alone was enough --
+    success_facts (for come_to_me, a literal hardcoded {"...": True}) were applied
+    unconditionally, and goal_check later read that same self-report back as if it were
+    independent evidence. This checks the goal's own last-reported distance_remaining
+    against a real, small tolerance before trusting SUCCEEDED at all.
+
+    HONEST LIMIT, not papered over: this is corroboration against Nav2's own telemetry,
+    not a true independently-measured final pose. mc_ai_bt has no TF capability and
+    mc_world_state publishes no robot-pose fact (checked live 2026-08-29, see
+    mc_embodied_skills' _face_entity_skill's own comment on the same gap) -- closing this
+    the rest of the way needs one of those to exist first. This is deliberately scoped to
+    what's achievable with data already flowing through the action interface tonight.
+    """
+
+    def _verify(feedback, _result) -> tuple[bool, dict[str, Any]]:
+        distance = getattr(feedback, "distance_remaining", None) if feedback is not None else None
+        if distance is not None:
+            if float(distance) > _ARRIVAL_DISTANCE_TOLERANCE_M:
+                return False, {}
+            facts = dict(facts_on_success)
+            facts["_verification_basis"] = "distance_remaining_confirmed"
+            return True, facts
+        # FOUND LIVE 2026-09-01: a goal that completes before its first feedback tick
+        # (the common real case: the robot was already at/near the target, so Nav2
+        # never entered its "driving" phase at all) must not be punished with a false
+        # rejection here just because no feedback exists to check -- distance is
+        # genuinely None, not "far". But silently treating that the same as an
+        # actually-confirmed reading would recreate the exact gap this verifier exists
+        # to close, just one layer down: something claiming "verified" that never
+        # really was. Still accept (today's behavior, no new false failures), but mark
+        # it plainly as unverified rather than letting it masquerade as confirmed.
+        facts = dict(facts_on_success)
+        facts["_verification_basis"] = "no_feedback_received_trusted_at_face_value"
+        return True, facts
+
+    return _verify
 
 
 class RosSkillExecutor:
@@ -120,6 +178,7 @@ class RosSkillExecutor:
                     ("base",),
                     300.0,
                     {"robot_at_place": goal.name},
+                    verify=_arrival_verifier({"robot_at_place": goal.name}),
                 ),
                 timeout_sec,
                 goal,
@@ -134,6 +193,7 @@ class RosSkillExecutor:
                     ("base",),
                     300.0,
                     {"robot_near_interaction_owner": True},
+                    verify=_arrival_verifier({"robot_near_interaction_owner": True}),
                 ),
                 timeout_sec,
                 ComeToMe.Goal(),
@@ -404,9 +464,60 @@ class RosSkillExecutor:
         except (TypeError, ValueError):
             return ExecutionResult(False, f"{skill_name}.duration must be numeric")
         if isinstance(animation_args, dict):
-            goal.args = json.dumps(animation_args, sort_keys=True, separators=(",", ":"))
+            payload = dict(animation_args)
+        elif animation_args:
+            # play_animation's own "args" is a raw passthrough (unlike
+            # look_at/point_at, which build animation_args themselves from
+            # named fields) — a plan can legally hand this generator payload
+            # over pre-serialized as a JSON string. Parse it so "_caller" can
+            # still be merged in below.
+            try:
+                parsed = json.loads(animation_args) if isinstance(animation_args, str) else None
+            except (TypeError, ValueError):
+                parsed = None
+            payload = parsed if isinstance(parsed, dict) else None
         else:
-            goal.args = str(animation_args or "")
+            payload = {}
+        if payload is None:
+            # FAIL CLOSED, not open. A mission request that can't be tagged
+            # with a real caller identity would fall back to mc_animator's
+            # default identity — indistinguishable from idle or any other
+            # untagged caller — silently reproducing the exact preemption bug
+            # this whole change exists to close. Better to refuse the
+            # animation than to send it unprotected.
+            return ExecutionResult(
+                False, f"{skill_name}.args is malformed (not a JSON object): {animation_args!r}"
+            )
+        # PlayAnimation.action has no identity field of its own (unlike
+        # EmbodiedSkill/RequestHumanConfirmation) — "_caller" rides inside
+        # the generator-args JSON instead, which the .action's own
+        # contract already promises ignores unknown keys. mc_animator's
+        # resource lease reads it to tell "this mission" apart from
+        # another caller entirely, instead of every /mc_animator/play
+        # request looking identical to mc_resource_authority. See
+        # resource_gate.py's ResourceLeaseGate.acquire.
+        #
+        # TRUST BOUNDARY: "_caller" is trusted execution metadata ONLY
+        # because this method is the sole place that sets it, unconditionally
+        # overwriting anything a plan supplied under the same key (see the
+        # payload construction above and policy_guard.py's belt-and-braces
+        # rejection of a planner-supplied "_caller"). It is NOT an
+        # authenticated identity at the ROS layer — PlayAnimation.action
+        # carries it as plain JSON text, so any other node with a client for
+        # /mc_animator/play could claim to be "mc_ai_bt" and inherit its
+        # preemption priority. That is out of scope here (mc_animator's
+        # gate/mission planner are the only current senders, per the
+        # trust-boundary audit), but a real fix — identity as first-class
+        # Action metadata set by mc_animator's own goal-request middleware,
+        # not caller-supplied JSON — is the correct long-term shape.
+        identity = self._lease_identity_msg()
+        payload["_caller"] = {
+            "source": str(identity.source or "mc_ai_bt"),
+            "operator_id": str(identity.operator_id or ""),
+            "mission_id": str(identity.mission_id or ""),
+            "execution_id": str(identity.execution_id or ""),
+        }
+        goal.args = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return self._run_action(
             skill_name,
             ActionBinding(
@@ -536,8 +647,13 @@ class RosSkillExecutor:
         goal,
         cancel_event: Event | None,
     ) -> ExecutionResult:
+        last_feedback_box: dict[str, Any] = {}
+
+        def _on_feedback(feedback_msg) -> None:
+            last_feedback_box["value"] = getattr(feedback_msg, "feedback", feedback_msg)
+
         ok, goal_handle_or_message = _wait_future(
-            binding.client.send_goal_async(goal),
+            binding.client.send_goal_async(goal, feedback_callback=_on_feedback),
             timeout_sec=5.0,
             cancel_event=cancel_event,
         )
@@ -569,11 +685,17 @@ class RosSkillExecutor:
                 return ExecutionResult(False, f"{skill_name} ended with {_status_name(status)}: {message}")
             if not success_field:
                 return ExecutionResult(False, f"{skill_name} result was unsuccessful: {message}")
-            execution = ExecutionResult(
-                True,
-                message or f"{skill_name} succeeded",
-                dict(binding.success_facts),
-            )
+            if binding.verify is not None:
+                verified, facts = binding.verify(last_feedback_box.get("value"), result)
+                if not verified:
+                    return ExecutionResult(
+                        False,
+                        f"{skill_name} action reported success but independent verification "
+                        f"did not confirm it: {message}",
+                    )
+            else:
+                facts = dict(binding.success_facts)
+            execution = ExecutionResult(True, message or f"{skill_name} succeeded", facts)
             self._publish_success_facts(execution.facts)
             return execution
         finally:
@@ -670,10 +792,20 @@ def _service_ready(client, *, timeout_sec: float) -> bool:
 
 
 def _cancel_goal(goal_handle) -> None:
+    # FOUND LIVE 2026-09-01: this used to fire cancel_goal_async() and return
+    # immediately -- "requested a cancel" is not the same claim as "the action server
+    # actually accepted the cancel", and nothing here ever knew the difference. Waits
+    # briefly (bounded, best-effort) for that acknowledgement; still returns either way
+    # -- the caller already treats the goal as canceled regardless (see _wait_future's
+    # own on_cancel contract), so this only trades a small bounded delay for a real
+    # confirmation instead of none at all. Does NOT wait for the goal's own terminal
+    # status (CANCELED) -- that is a separate, potentially much longer wait for the
+    # controller to actually stop, which _wait_future's caller does not block on today.
     try:
-        goal_handle.cancel_goal_async()
+        future = goal_handle.cancel_goal_async()
     except Exception:
-        pass
+        return
+    _wait_future(future, timeout_sec=1.0)
 
 
 def _status_name(status: int) -> str:
@@ -797,4 +929,5 @@ def _binding_with_node_timeout(
         resources=binding.resources,
         timeout_sec=min(binding.timeout_sec, requested),
         success_facts=binding.success_facts,
+        verify=binding.verify,
     )
