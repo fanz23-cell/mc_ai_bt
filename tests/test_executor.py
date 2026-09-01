@@ -513,6 +513,36 @@ def test_needs_decision_propagates_through_sequence():
     assert skills.said == ["first"]
 
 
+def test_reexecuting_after_a_pause_replays_the_earlier_sequence_prefix():
+    # Diagnostic experiment B (3rd-party review, 2026-09-01): confirms in code (not just by
+    # reading mission.py's docstring/comments) that there is no checkpoint/continuation
+    # anywhere in this executor. node.py's _run_mission calls BtExecutor.execute_json on the
+    # mission's full bt_json on EVERY call, resume included -- there is no saved node
+    # position, call stack, or blackboard carried between the pausing call and the resuming
+    # one, just the same JSON tree and a fresh ExecutionResult. This test proves the
+    # observable consequence directly: an Action before a paused Condition genuinely re-runs
+    # when the same tree is executed again, it does not resume from the Condition.
+    skills = FakeSkills()
+    root = {
+        "type": "Sequence",
+        "children": [
+            {"type": "Action", "skill": "say", "args": {"text": "first"}},
+            {"type": "Condition", "predicate": "person_awake", "args": {}},
+        ],
+    }
+
+    paused = BtExecutor().execute(root, skills, checks=FakeChecks(TriState.UNKNOWN))
+    assert paused.blocked and paused.needs_decision
+    assert skills.said == ["first"]
+
+    # "Resume": the exact same tree, run again from the root, on the same skills provider --
+    # this is what mission.bt_json + a fresh execute_json call actually does. No mechanism
+    # anywhere skips straight to the Condition.
+    resumed = BtExecutor().execute(root, skills, checks=FakeChecks(TriState.TRUE))
+    assert resumed.success
+    assert skills.said == ["first", "first"]
+
+
 def test_needs_decision_propagates_through_fallback():
     skills = FakeSkills()
     checks = FakeChecks(TriState.UNKNOWN)

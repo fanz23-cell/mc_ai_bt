@@ -277,6 +277,41 @@ def test_entity_located_missing_evidence_is_unknown_not_false():
     assert result.state is TriState.UNKNOWN
 
 
+# --- Diagnostic experiment C (3rd-party review, 2026-09-01): is entity_located/person_named
+# genuinely "execution-fact-only", or does the generic world-state snapshot fallback also
+# apply to them? PREDICATE_REGISTRY's own comment says mc_world_state "never writes a fact
+# under these names, so the world-state snapshot fallback always reports UNKNOWN for them" --
+# that is an accurate description of today's OPERATIONAL practice (nothing currently writes
+# these keys), but was being read by an earlier analysis as an architectural restriction
+# (GoalChecker structurally cannot resolve these via world state at all). It cannot: _check_
+# snapshot's generic PREDICATE_REGISTRY fallthrough (reads facts[spec.snapshot_scope][predicate]
+# via _direct_predicate_result, the exact same shape execution facts already use) applies to
+# every predicate in the registry, entity_located/person_named included. These tests prove it,
+# settling the question with a real GoalChecker call instead of a comment's word choice.
+def test_world_snapshot_can_confirm_entity_located_when_execution_fact_missing():
+    world_json = json.dumps(
+        {"facts": {"objects": {"entity_located": {"value": {"matched": True, "target": "mystery_gadget"}}}}}
+    )
+    checker = GoalChecker(lambda _scopes, _max_age: world_json)
+    goal_spec = {"type": "structured", "predicate": "entity_located", "args": {"target": "mystery_gadget"}}
+
+    result = checker.check(goal_spec, ExecutionResult(True, "located", {}))
+
+    assert result.state is TriState.TRUE
+
+
+def test_world_snapshot_can_confirm_person_named_when_execution_fact_missing():
+    world_json = json.dumps(
+        {"facts": {"people_names": {"person_named": {"value": {"matched": True, "name": "Alice"}}}}}
+    )
+    checker = GoalChecker(lambda _scopes, _max_age: world_json)
+    goal_spec = {"type": "structured", "predicate": "person_named", "args": {"name": "Alice"}}
+
+    result = checker.check(goal_spec, ExecutionResult(True, "named", {}))
+
+    assert result.state is TriState.TRUE
+
+
 def test_search_for_entity_completed_confirmed_by_execution_fact():
     goal_spec = {"type": "structured", "predicate": "search_for_entity_completed", "args": {"target": "widget"}}
     execution = ExecutionResult(

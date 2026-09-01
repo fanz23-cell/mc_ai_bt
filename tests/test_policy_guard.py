@@ -250,21 +250,48 @@ def test_policy_rejects_invalid_point_at_target():
 
 
 def test_policy_accepts_bounded_embodied_skills():
-    reach = _plan({"type": "Action", "skill": "reach_to", "args": {"object": "test_object", "arm": "right"}})
-    contact = _plan({"type": "Action", "skill": "wait_for_contact", "args": {"target": "generic_target"}})
-    follow = _plan({"type": "Action", "skill": "follow_entity", "args": {"entity": "person:subject"}})
+    # Physical skills need a structured goal_spec, not the _plan() default implicit/human
+    # one -- see test_policy_rejects_physical_mission_with_implicit_success below.
+    # wait_for_contact is NOT in this list -- it's status="blocked", see
+    # test_policy_rejects_blocked_skills below.
+    reach = _plan(
+        {"type": "Action", "skill": "reach_to", "args": {"object": "test_object", "arm": "right"}},
+        {"predicate": "reach_completed"},
+    )
+    follow = _plan(
+        {"type": "Action", "skill": "follow_entity", "args": {"entity": "person:subject"}},
+        {"predicate": "entity_following"},
+    )
     guide = _plan(
         {
             "type": "Action",
             "skill": "guide_entity_to_place",
             "args": {"entity": "person:subject", "place": "target_place"},
-        }
+        },
+        {"predicate": "entity_at_place"},
     )
 
     assert PolicyGuard().check(reach).ok
-    assert PolicyGuard().check(contact).ok
     assert PolicyGuard().check(follow).ok
     assert PolicyGuard().check(guide).ok
+
+
+# --- status="blocked" skills must be structurally rejected, not discovered by trying them
+# (FOUND LIVE 2026-08-31) --------------------------------------------------------------
+
+
+def test_policy_rejects_blocked_skills():
+    for skill, args in [
+        ("align_axis", {"axis": "x", "target": "test_object"}),
+        ("move_along_axis", {"axis": "x", "distance_m": 0.1}),
+        ("maintain_distance", {"target": "person:subject", "distance_m": 1.0}),
+        ("wait_for_contact", {"target": "generic_target"}),
+        ("detect_contact", {"target": "generic_target"}),
+    ]:
+        plan = _plan({"type": "Action", "skill": skill, "args": args}, {"predicate": "contact_detected"})
+        result = PolicyGuard().check(plan)
+        assert not result.ok, f"{skill} should be rejected (status=blocked)"
+        assert any("not available" in error for error in result.errors), (skill, result.errors)
 
 
 def test_policy_rejects_embodied_skill_without_required_target():
@@ -277,7 +304,10 @@ def test_policy_rejects_embodied_skill_without_required_target():
 
 
 def test_policy_accepts_approach_entity_with_target():
-    plan = _plan({"type": "Action", "skill": "approach_entity", "args": {"target": "person"}})
+    plan = _plan(
+        {"type": "Action", "skill": "approach_entity", "args": {"target": "person"}},
+        {"predicate": "entity_approached"},
+    )
 
     assert PolicyGuard().check(plan).ok
 
@@ -291,7 +321,10 @@ def test_policy_rejects_approach_entity_without_target():
 
 
 def test_policy_accepts_face_entity_with_target():
-    plan = _plan({"type": "Action", "skill": "face_entity", "args": {"target": "person"}})
+    plan = _plan(
+        {"type": "Action", "skill": "face_entity", "args": {"target": "person"}},
+        {"predicate": "entity_faced"},
+    )
 
     assert PolicyGuard().check(plan).ok
 
@@ -302,6 +335,38 @@ def test_policy_rejects_face_entity_without_target():
     result = PolicyGuard().check(plan)
 
     assert not result.ok
+
+
+# --- physical missions must not use implicit/human success (FOUND LIVE 2026-08-31,
+# real mission-journal audit: 66 of 143 real missions were exactly this shape) --------
+
+
+def test_policy_rejects_physical_mission_with_implicit_success():
+    # _plan()'s default goal_spec IS the implicit/human shape -- this is the exact
+    # thing 66 real missions did.
+    plan = _plan({"type": "Action", "skill": "go_to_place", "args": {"name": "kitchen"}})
+
+    result = PolicyGuard().check(plan)
+
+    assert not result.ok
+    assert any("implicit" in error and "physical" in error for error in result.errors)
+
+
+def test_policy_accepts_non_physical_mission_with_implicit_success():
+    # say/request_human_confirmation are conversational, not physical -- implicit success
+    # is a legitimate criterion for them and must not be rejected by the new rule.
+    plan = _plan({"type": "Action", "skill": "say", "args": {"text": "hello"}})
+
+    assert PolicyGuard().check(plan).ok
+
+
+def test_policy_accepts_physical_mission_with_structured_success():
+    plan = _plan(
+        {"type": "Action", "skill": "go_to_place", "args": {"name": "kitchen"}},
+        {"predicate": "robot_at_place"},
+    )
+
+    assert PolicyGuard().check(plan).ok
 
 
 def test_policy_accepts_remember_place_with_name():
@@ -317,6 +382,38 @@ def test_policy_rejects_remember_place_without_name():
 
     assert not result.ok
     assert any("name" in error for error in result.errors)
+
+
+def test_policy_accepts_remember_person_with_target_and_name():
+    plan = _plan(
+        {"type": "Action", "skill": "remember_person", "args": {"target": "person on the left", "name": "Alice"}},
+        {"predicate": "person_named"},
+    )
+
+    assert PolicyGuard().check(plan).ok
+
+
+def test_policy_rejects_remember_person_without_name():
+    plan = _plan(
+        {"type": "Action", "skill": "remember_person", "args": {"target": "person on the left"}},
+        {"predicate": "person_named"},
+    )
+
+    result = PolicyGuard().check(plan)
+
+    assert not result.ok
+    assert any("name" in error for error in result.errors)
+
+
+def test_policy_rejects_remember_person_without_target():
+    plan = _plan(
+        {"type": "Action", "skill": "remember_person", "args": {"name": "Alice"}},
+        {"predicate": "person_named"},
+    )
+
+    result = PolicyGuard().check(plan)
+
+    assert not result.ok
 
 
 def test_policy_accepts_wait_for_participant_default_condition():

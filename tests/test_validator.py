@@ -353,6 +353,32 @@ def test_rejects_parallel_branches_with_cross_family_resource_conflict():
     assert any("conflicting resources" in error for error in result.errors)
 
 
+def test_rejects_parallel_branches_pairing_search_for_entity_with_a_base_skill():
+    # FOUND LIVE 2026-09-01 (3rd GPT review): locate_entity/get_pose/search_for_entity all
+    # physically turn the robot base (mc_embodied_skills' _locate_with_scan) when the
+    # target isn't in the current frame, but skill_registry.py used to declare no "base"
+    # resource for any of them -- this exact plan shape used to clear the validator with
+    # zero errors, while at runtime both branches genuinely fought over the base.
+    plan = {
+        "root": {
+            "type": "Parallel",
+            "children": [
+                {"type": "Action", "skill": "search_for_entity", "args": {"target": "alice"}},
+                {"type": "Action", "skill": "go_to_place", "args": {"place": "kitchen"}},
+            ],
+        },
+        "goal_spec": {
+            "type": "human",
+            "verification": {"mode": "implicit_conversation"},
+        },
+    }
+
+    result = PlanValidator().validate(plan)
+
+    assert not result.ok
+    assert any("conflicting resources" in error and "base" in error for error in result.errors)
+
+
 def test_accepts_parallel_branches_with_genuinely_unrelated_resources():
     plan = {
         "root": {

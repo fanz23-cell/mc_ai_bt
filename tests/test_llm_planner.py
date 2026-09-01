@@ -44,6 +44,20 @@ def test_planner_prompt_names_allowed_skills_and_constraints():
     assert "UNKNOWN" in system
 
 
+def test_planner_prompt_omits_blocked_skills():
+    # FOUND LIVE 2026-08-31: align_axis/move_along_axis/maintain_distance/
+    # wait_for_contact/detect_contact (status="blocked" in skill_registry.py) used to be
+    # serialized into this same prompt line, indistinguishable from a working skill.
+    messages = build_planner_messages("go to test_place", "{}")
+    system = messages[0][1]
+
+    for blocked in ("align_axis", "move_along_axis", "maintain_distance", "wait_for_contact", "detect_contact"):
+        assert f"- {blocked}:" not in system, f"{blocked} is status=blocked and must not be in the planner prompt"
+    # A representative still-available skill must still be present, proving this isn't
+    # just an empty/broken catalog.
+    assert "- go_to_place:" in system
+
+
 def test_planner_prompt_lists_known_predicate_names():
     # Found live 2026-08-29 (§C2): the planner had no idea which predicate names
     # actually exist, so it repeatedly either invented one ("root.children[1].

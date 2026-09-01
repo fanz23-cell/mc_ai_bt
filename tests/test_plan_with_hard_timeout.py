@@ -11,6 +11,7 @@ every other *_node.py file in this repo -- see mc_world_state's equivalent
 note), so this is the narrowest real thing to test without one.
 """
 
+import threading
 import time
 
 from mc_ai_bt.context_builder import ContextBuilder
@@ -88,3 +89,50 @@ def test_normal_planning_result_passes_through_unaffected():
     result = AiBtNode._plan_with_hard_timeout(fake_self, mission, missions)
     assert result.ok is True
     assert result.bt_json
+
+
+# --- _plan_and_start_async must not block the calling ROS service handler (FOUND LIVE
+# 2026-08-31, see _plan_and_start_async's own docstring) --------------------------------
+#
+# SubmitTaskIntent.srv documents the mission as running asynchronously, but
+# _handle_submit/_handle_resume/_handle_reprioritize used to call _plan_and_start directly
+# -- the service callback itself blocked on the full LLM planning latency, which is exactly
+# how the live incident _plan_with_hard_timeout was written for actually happened (a hung
+# planner call held the caller's own request hostage too, not just the mission).
+# _plan_with_hard_timeout alone does not fix this: it bounds ONE call's latency, but nothing
+# stopped the CALLING thread (the service callback) from blocking on it.
+
+
+class _BlockingPlanAndStart:
+    """Stands in for the real _plan_and_start: proves the caller does not wait for it."""
+
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.received_mission = None
+
+    def __call__(self, mission) -> None:
+        self.started.set()
+        self.release.wait(timeout=5.0)
+        self.received_mission = mission
+
+
+class _FakePlanAndStartSelf:
+    def __init__(self, plan_and_start) -> None:
+        self._plan_and_start = plan_and_start
+
+
+def test_plan_and_start_async_returns_before_planning_completes():
+    fake_plan_and_start = _BlockingPlanAndStart()
+    fake_self = _FakePlanAndStartSelf(fake_plan_and_start)
+    mission, _missions = _mission()
+
+    started = time.monotonic()
+    AiBtNode._plan_and_start_async(fake_self, mission)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.5, f"_plan_and_start_async blocked the caller for {elapsed:.2f}s"
+    assert fake_plan_and_start.started.wait(timeout=1.0), "background thread never ran _plan_and_start"
+    fake_plan_and_start.release.set()
+    time.sleep(0.05)
+    assert fake_plan_and_start.received_mission is mission

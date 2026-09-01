@@ -16,7 +16,7 @@ def test_local_smoke_runs_animation_end_to_end():
     result = run_smoke("wave hello")
 
     assert result.ok
-    assert result.facts == {"animation_played": "wave"}
+    assert result.facts == {"animation_played": "wave_and_jaw"}
 
 
 def test_local_smoke_runs_look_and_point_end_to_end():

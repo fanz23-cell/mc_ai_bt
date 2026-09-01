@@ -85,15 +85,20 @@ class _FakeGoalHandle:
 
 
 class FakeActionClient:
-    def __init__(self, *, accepted: bool = True, success: bool = True):
+    def __init__(self, *, accepted: bool = True, success: bool = True, feedback=None):
         self.sent_goals = []
+        self.feedback_callbacks = []
         self._goal_handle = _FakeGoalHandle(accepted=accepted, success=success)
+        self._feedback = feedback
 
     def server_is_ready(self):
         return True
 
-    def send_goal_async(self, goal):
+    def send_goal_async(self, goal, feedback_callback=None):
         self.sent_goals.append(goal)
+        self.feedback_callbacks.append(feedback_callback)
+        if feedback_callback is not None and self._feedback is not None:
+            feedback_callback(type("FeedbackMsg", (), {"feedback": self._feedback})())
         return _FakeFuture(self._goal_handle)
 
 
@@ -231,6 +236,108 @@ def test_run_action_releases_the_lease_even_when_the_action_fails():
             "identity": executor._leases.released[0]["identity"],
         }
     ]
+
+
+# --- ActionBinding.verify: real corroboration, not blind trust in ROS-level SUCCEEDED
+# (FOUND LIVE 2026-08-31) ------------------------------------------------------------
+#
+# go_to_place/come_to_me used to apply success_facts (come_to_me's a literal hardcoded
+# {"...": True}) the instant the ROS action reported SUCCEEDED, with zero corroboration --
+# goal_check later read that same self-report back as if it were independent evidence.
+# _arrival_verifier checks the action's own last-reported distance_remaining (real Nav2
+# telemetry, not something this adapter asserts about itself) before trusting SUCCEEDED.
+
+
+def _feedback(distance_remaining):
+    return type("Feedback", (), {"distance_remaining": distance_remaining, "number_of_recoveries": 0})()
+
+
+def test_verify_denies_success_when_last_feedback_distance_is_still_large():
+    from mc_ai_bt.skill_adapters import _arrival_verifier
+
+    executor = _executor(lease_result=LeaseResult(True, "ok", "lease-1"))
+    client = FakeActionClient(success=True, feedback=_feedback(distance_remaining=4.5))
+    binding = ActionBinding(
+        client, object, ("base",), 5.0, {"robot_at_place": "kitchen"},
+        verify=_arrival_verifier({"robot_at_place": "kitchen"}),
+    )
+
+    result = executor._run_action("go_to_place", binding, None, object(), None)
+
+    assert not result.success
+    assert "independent verification" in result.message
+    assert result.facts == {}
+
+
+def test_verify_accepts_success_when_last_feedback_distance_is_within_tolerance():
+    from mc_ai_bt.skill_adapters import _arrival_verifier
+
+    executor = _executor(lease_result=LeaseResult(True, "ok", "lease-1"))
+    client = FakeActionClient(success=True, feedback=_feedback(distance_remaining=0.2))
+    binding = ActionBinding(
+        client, object, ("base",), 5.0, {"robot_at_place": "kitchen"},
+        verify=_arrival_verifier({"robot_at_place": "kitchen"}),
+    )
+
+    result = executor._run_action("go_to_place", binding, None, object(), None)
+
+    assert result.success
+    assert result.facts == {"robot_at_place": "kitchen", "_verification_basis": "distance_remaining_confirmed"}
+
+
+def test_verify_accepts_success_when_no_feedback_was_ever_received():
+    # FOUND LIVE 2026-09-01: a goal that completes before its first feedback tick (the
+    # robot was already at/near the target) must not be punished with a false rejection
+    # just because no feedback exists to check against -- distance is genuinely None,
+    # not "far". But this must not be silently indistinguishable from a properly
+    # telemetry-confirmed success either -- see _verification_basis.
+    from mc_ai_bt.skill_adapters import _arrival_verifier
+
+    executor = _executor(lease_result=LeaseResult(True, "ok", "lease-1"))
+    client = FakeActionClient(success=True, feedback=None)
+    binding = ActionBinding(
+        client, object, ("base",), 5.0, {"robot_near_interaction_owner": True},
+        verify=_arrival_verifier({"robot_near_interaction_owner": True}),
+    )
+
+    result = executor._run_action("come_to_me", binding, None, object(), None)
+
+    assert result.success
+    assert result.facts == {
+        "robot_near_interaction_owner": True,
+        "_verification_basis": "no_feedback_received_trusted_at_face_value",
+    }
+
+
+def test_verify_denies_success_still_returns_no_facts_at_all():
+    # The rejection path must not carry a _verification_basis or anything else -- a
+    # denied verification has no facts to publish, full stop.
+    from mc_ai_bt.skill_adapters import _arrival_verifier
+
+    executor = _executor(lease_result=LeaseResult(True, "ok", "lease-1"))
+    client = FakeActionClient(success=True, feedback=_feedback(distance_remaining=4.5))
+    binding = ActionBinding(
+        client, object, ("base",), 5.0, {"robot_at_place": "kitchen"},
+        verify=_arrival_verifier({"robot_at_place": "kitchen"}),
+    )
+
+    result = executor._run_action("go_to_place", binding, None, object(), None)
+
+    assert not result.success
+    assert result.facts == {}
+
+
+def test_binding_without_verify_keeps_old_unconditional_behavior():
+    # Every OTHER dedicated skill (simple_move/play_animation/look_at/point_at) has no
+    # verify callable -- must behave byte-for-byte as before this change.
+    executor = _executor(lease_result=LeaseResult(True, "ok", "lease-1"))
+    client = FakeActionClient(success=True, feedback=_feedback(distance_remaining=99.0))
+    binding = ActionBinding(client, object, ("body",), 5.0, {"animation_played": "wave_and_jaw"})
+
+    result = executor._run_action("play_animation", binding, None, object(), None)
+
+    assert result.success
+    assert result.facts == {"animation_played": "wave_and_jaw"}
 
 
 def test_node_timeout_can_only_shorten_action_binding_timeout():

@@ -70,3 +70,23 @@ def test_world_fact_updates_map_embodied_skill_evidence():
         ("entities", "following"),
         ("entities", "entity_at_place"),
     }
+
+
+def test_world_fact_updates_map_person_named_to_a_separate_scope():
+    # FOUND LIVE 2026-08-31: naming a person used to write nothing at all -- a name
+    # binding gets its own scope, keyed by person_id, so the next unrelated
+    # pose-detection frame (people/semantic_people) never clobbers it.
+    updates = world_fact_updates_for_execution(
+        {"person_named": {"matched": True, "person_id": "person:track_7", "name": "Alice", "target": "left"}}
+    )
+
+    assert len(updates) == 1
+    assert updates[0].scope == "people_names"
+    assert updates[0].key == "person:track_7"
+    assert updates[0].value == {"person_id": "person:track_7", "name": "Alice"}
+
+
+def test_world_fact_updates_ignore_person_named_without_person_id_or_name():
+    updates = world_fact_updates_for_execution({"person_named": {"matched": False}})
+
+    assert updates == ()

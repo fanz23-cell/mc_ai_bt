@@ -39,7 +39,9 @@ def test_wave_intent_becomes_animation():
 
     assert PlanValidator().validate(plan).ok
     assert plan["root"]["skill"] == "play_animation"
-    assert plan["root"]["args"]["animation"] == "wave"
+    # "wave" is not a real clip -- wave_and_jaw is the library's actual
+    # greeting/wave gesture. See skill_registry.py's WAVE_CLIP.
+    assert plan["root"]["args"]["animation"] == "wave_and_jaw"
 
 
 def test_look_at_intent_becomes_look_at_skill():
@@ -139,7 +141,7 @@ def test_chinese_embodied_intents_use_existing_skills():
     cases = {
         "来我这里": ("come_to_me", {}),
         "左转90度": ("simple_move", {"action": "left", "value": 90.0}),
-        "挥手": ("play_animation", {"animation": "wave"}),
+        "挥手": ("play_animation", {"animation": "wave_and_jaw"}),
         "看左边": ("look_at", {"direction": "left"}),
         "指一下测试物体": ("point_at", {"arm": "right", "object": "测试物体"}),
     }
