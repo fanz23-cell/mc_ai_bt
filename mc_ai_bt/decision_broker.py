@@ -367,17 +367,34 @@ class DecisionBroker:
             "FALSE", f"{target} is {distance:.2f}m away, not within {_APPROACH_DISTANCE_TOLERANCE_M}m")
 
     def _check_entity_approached_by_id(self, entity_id: str) -> DecisionOutcome:
-        """C.3: identity confirmation only -- mc_world_state's entity_tracks
-        ingestion is ALREADY continuously re-running the same association
-        algorithm against every fresh detection (see entity_tracking.py), so a
-        current identity_state of ACTIVE for this exact entity_id already IS
-        the "still confirmed to be this one" answer. Deliberately does NOT
-        independently re-verify distance the way the class-based path above
-        does -- that would need this node to also carry TF (map->base_link),
-        which it does not today; mc_embodied_skills' own entity_id-aware
-        approach_entity path (which DOES have TF) is what actually enforces
-        the distance/approach semantics before this predicate is ever asked to
-        confirm anything. A known, explicit scope boundary, not an oversight.
+        """C.3: identity confirmation only, and -- as of the P0 fix below --
+        ONLY ever a step toward UNKNOWN, never a confident TRUE on its own.
+
+        mc_world_state's entity_tracks ingestion is ALREADY continuously
+        re-running the same association algorithm against every fresh
+        detection (see entity_tracking.py), so a current identity_state of
+        ACTIVE for this exact entity_id genuinely does confirm IDENTITY --
+        "this is still that specific entity". But "entity_approached" is a
+        claim about the ROBOT'S PHYSICAL PROXIMITY to that entity, and this
+        node has no robot-pose source (no TF) to check that against --
+        confirmed live, and unlikely to change without adding TF integration
+        to this node specifically, which is out of scope here.
+
+        P0 FIX (2026-09-02, GPT review): this used to return TRUE on
+        identity_state=="ACTIVE" alone, silently treating "confirmed to be
+        the same entity" as if it were "confirmed to be near the entity" --
+        a real false-TRUE path (an entity_id that stayed ACTIVE while the
+        actual physical entity moved somewhere else entirely). The genuine
+        distance verification lives in mc_embodied_skills' own entity_id-
+        aware approach_entity postcondition check (which DOES have TF, see
+        node.py's _verify_entity_approached_by_id) -- for a mission whose
+        approach_entity action already ran and asserted real distance-backed
+        evidence, GoalChecker reads that evidence directly and never needs
+        this predicate's own fresh check to return TRUE at all. This method
+        is therefore honestly UNKNOWN whenever it cannot back a TRUE with an
+        actual distance measurement -- which, without a pose source, is
+        always. Never FALSE either: identity being unconfirmable here says
+        nothing about whether the entity was actually approached.
         """
         if self._entity_tracks_reader is None:
             return DecisionOutcome("UNKNOWN", f"{entity_id}: entity_tracks reader is not configured")
@@ -387,7 +404,12 @@ class DecisionBroker:
             return DecisionOutcome("UNKNOWN", f"{entity_id}: not currently tracked")
         state = track.get("identity_state")
         if state == "ACTIVE":
-            return DecisionOutcome("TRUE", f"{entity_id}: confirmed (identity_state=ACTIVE)")
+            return DecisionOutcome(
+                "UNKNOWN",
+                f"{entity_id}: identity confirmed (identity_state=ACTIVE), but this node has no "
+                "robot-pose source to verify physical distance -- cannot confirm entity_approached "
+                "from identity alone",
+            )
         if state == "AMBIGUOUS":
             return DecisionOutcome("UNKNOWN", f"{entity_id}: currently ambiguous, cannot confirm")
         return DecisionOutcome("UNKNOWN", f"{entity_id}: not currently confirmed (identity_state={state!r})")

@@ -397,7 +397,18 @@ DEFAULT_SKILLS: dict[str, SkillSpec] = {
         ("body",),
         "Compatibility wrapper for look_at_static direction controls.",
         {"direction": "direction"},
-        ("look_at_static_completed",),
+        # 2026-09-02: "animation_played" restored alongside its own more
+        # specific predicate -- skill_adapters.py's dedicated dispatch for
+        # look_at genuinely writes evidence["animation_played"]="look_at" on
+        # execution (BootstrapPlanner/local_smoke.py's deterministic planner
+        # relies on exactly this), so it is a real, checkable claim this
+        # skill's execution evidence backs, not a looseness to remove. Found
+        # the hard way: policy_guard.py's PolICY_TO_SKILLS derivation
+        # (from result_predicates alone) initially omitted it and broke both
+        # of those real callers -- result_predicates must list EVERY
+        # predicate a skill's own evidence can actually satisfy, since it is
+        # now the single source of truth for goal-alignment checking too.
+        ("look_at_static_completed", "animation_played"),
         dispatch="dedicated",
     ),
     "point_at": SkillSpec(
@@ -405,7 +416,9 @@ DEFAULT_SKILLS: dict[str, SkillSpec] = {
         ("body",),
         "Compatibility wrapper that points at an arbitrary target.",
         {"target": "object|place|x/y/z"},
-        ("point_at",),
+        # Same reasoning as look_at above -- skill_adapters.py's point_at
+        # dispatch also writes evidence["animation_played"]="point_at".
+        ("point_at", "animation_played"),
         dispatch="dedicated",
     ),
     "come_to_me": SkillSpec(

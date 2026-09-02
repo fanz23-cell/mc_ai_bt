@@ -22,6 +22,26 @@ BODY_SKILLS = {
 PHYSICAL_SKILLS = BASE_SKILLS | BODY_SKILLS
 CONTINUOUS_BASE_SKILLS = {name for name in BASE_SKILLS if DEFAULT_SKILLS[name].realtime}
 POLICY_ENABLED_SKILLS = set(DEFAULT_SKILLS.keys())
+# goal predicate -> the skill name(s) whose result_predicates declare it.
+# FOUND 2026-09-02 (GPT review, confirmed live): _check_goal_alignment below
+# used to hand-maintain its own separate predicate->skill literal, the exact
+# same "one more place to forget" pattern the comment above already warns
+# about for the other five sets -- and it HAD been forgotten: it had no entry
+# for entity_alias_bound (remember_entity, C.2), so a mismatched goal
+# predicate on a remember_entity plan passed this check unchecked (the C.2
+# live test that round had to use the unrelated person_named predicate to
+# get past this gate at all). Deriving it here means adding a skill's
+# result_predicates to skill_registry.py is now the ONLY place a new
+# predicate<->skill pairing needs to be declared.
+def _build_predicate_to_skills() -> dict[str, tuple[str, ...]]:
+    mapping: dict[str, tuple[str, ...]] = {}
+    for skill_name, spec in DEFAULT_SKILLS.items():
+        for predicate in spec.result_predicates:
+            mapping[predicate] = mapping.get(predicate, ()) + (skill_name,)
+    return mapping
+
+
+PREDICATE_TO_SKILLS: dict[str, tuple[str, ...]] = _build_predicate_to_skills()
 LOOK_AT_DIRECTIONS = {
     "front",
     "front_up",
@@ -626,23 +646,15 @@ class PolicyGuard:
         predicate = str(goal_spec.get("predicate") or "")
         if not predicate or not stats.physical_skill_counts:
             return
-        expected = {
-            "robot_at_place": ("go_to_place",),
-            "entity_approached": ("approach_entity",),
-            "robot_near_interaction_owner": ("come_to_me",),
-            "relative_motion_completed": ("simple_move",),
-            "animation_played": ("play_animation", "look_at", "point_at"),
-            "reach_completed": ("reach_to",),
-            "entity_following": ("follow_entity",),
-            "entity_at_place": ("guide_entity_to_place",),
-            "contact_detected": ("wait_for_contact", "detect_contact"),
-            "axis_aligned": ("align_axis",),
-            "axis_motion_completed": ("move_along_axis",),
-            "distance_maintained": ("maintain_distance",),
-            "pose_held": ("hold_pose",),
-            "oscillation_completed": ("oscillate",),
-            "retracted": ("retract",),
-        }.get(predicate)
+        # Derived from DEFAULT_SKILLS.result_predicates -- see PREDICATE_TO_SKILLS's
+        # own comment. Only predicates a physical (non-voice) skill actually
+        # produces are checked here; a predicate no physical skill declares
+        # (e.g. a voice-only or purely world-state one) has nothing to align
+        # against and is silently allowed through, same as before.
+        expected = tuple(
+            skill for skill in PREDICATE_TO_SKILLS.get(predicate, ())
+            if skill in PHYSICAL_SKILLS
+        )
         if expected and not any(skill in stats.physical_skill_counts for skill in expected):
             errors.append(
                 f"goal predicate {predicate!r} does not match physical action "

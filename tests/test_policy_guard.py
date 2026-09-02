@@ -204,12 +204,22 @@ def test_policy_rejects_unbounded_human_confirmation():
 
 
 def test_policy_accepts_look_at_and_point_at_skills():
+    # 2026-09-02: goal alignment is now derived from
+    # DEFAULT_SKILLS[*].result_predicates (see policy_guard.py's
+    # PREDICATE_TO_SKILLS) instead of a hand-written table that used to
+    # loosely accept the generic "animation_played" for these two skills as
+    # well as play_animation -- look_at/point_at each declare their OWN more
+    # specific predicate (look_at_static_completed / point_at), which is what
+    # a real plan must use now; that tightening is intentional (a plan
+    # pairing look_at with predicate=point_at, or vice versa, is now
+    # correctly rejected instead of silently passing under the old shared
+    # "animation_played" bucket).
     look = _plan(
         {"type": "Action", "skill": "look_at", "args": {"direction": "left_up", "hold": 1.0}},
         {
             "type": "structured",
-            "predicate": "animation_played",
-            "args": {"animation": "look_at"},
+            "predicate": "look_at_static_completed",
+            "args": {"direction": "left_up"},
             "verification": {"mode": "action_result"},
         },
     )
@@ -217,14 +227,32 @@ def test_policy_accepts_look_at_and_point_at_skills():
         {"type": "Action", "skill": "point_at", "args": {"object": "test_object", "arm": "right", "hold": 2.0}},
         {
             "type": "structured",
-            "predicate": "animation_played",
-            "args": {"animation": "point_at"},
+            "predicate": "point_at",
+            "args": {"target": "test_object"},
             "verification": {"mode": "action_result"},
         },
     )
 
     assert PolicyGuard().check(look).ok
     assert PolicyGuard().check(point).ok
+
+
+def test_policy_rejects_look_at_paired_with_point_at_predicate():
+    # The specific class of bug the derive-from-registry fix catches: a
+    # non-voice skill's result predicate must actually be one of ITS OWN
+    # declared predicates, not another physical skill's.
+    mismatched = _plan(
+        {"type": "Action", "skill": "look_at", "args": {"direction": "left_up"}},
+        {
+            "type": "structured",
+            "predicate": "point_at",
+            "args": {"target": "test_object"},
+            "verification": {"mode": "action_result"},
+        },
+    )
+    result = PolicyGuard().check(mismatched)
+    assert not result.ok
+    assert any("point_at" in error and "does not match" in error for error in result.errors)
 
 
 def test_policy_rejects_invalid_look_at_direction():
@@ -418,16 +446,36 @@ def test_policy_rejects_remember_person_without_target():
 
 def test_policy_accepts_remember_entity_with_target_and_alias():
     # Same physical-skill-needs-a-structured-goal rule remember_person's own
-    # test above already works around (resources_for_skill declares "base")
-    # -- a non-implicit goal_spec type is enough to satisfy _check_goal_
-    # alignment regardless of whether PREDICATE_REGISTRY happens to know this
-    # particular predicate name (that is validator.py's separate job).
+    # test above already works around (resources_for_skill declares "base").
+    # 2026-09-02: entity_alias_bound is now a real, checked alignment entry
+    # (PREDICATE_TO_SKILLS, derived from remember_entity's own
+    # result_predicates) -- this must pass BECAUSE the predicate correctly
+    # names remember_entity's own result, not merely because the check used
+    # to be skipped for an unknown predicate name (see the rejection test
+    # right below, which is the regression this fix closes).
     plan = _plan(
         {"type": "Action", "skill": "remember_entity", "args": {"target": "chair", "alias": "my chair"}},
         {"predicate": "entity_alias_bound"},
     )
 
     assert PolicyGuard().check(plan).ok
+
+
+def test_policy_rejects_remember_entity_paired_with_an_unrelated_predicate():
+    # FOUND 2026-09-02 (GPT review): before this fix, PolicyGuard's
+    # hand-written alignment table had no entry at all for remember_entity,
+    # so ANY predicate silently passed alignment for it -- confirmed live:
+    # this round's own C.2 acceptance test had to fall back to the unrelated
+    # person_named predicate (remember_person's, not remember_entity's own)
+    # and PolicyGuard let it through unchecked. Must now be rejected.
+    plan = _plan(
+        {"type": "Action", "skill": "remember_entity", "args": {"target": "chair", "alias": "my chair"}},
+        {"predicate": "person_named"},
+    )
+
+    result = PolicyGuard().check(plan)
+    assert not result.ok
+    assert any("person_named" in error and "does not match" in error for error in result.errors)
 
 
 def test_policy_rejects_remember_entity_without_alias():

@@ -110,6 +110,20 @@ PREDICATE_REGISTRY: dict[str, PredicateSpec] = {
     # skill's own evidence fields, read directly by whoever consumes the goal_spec
     # args (e.g. query_world.py), not by this generic predicate check itself.
     "room_scanned": PredicateSpec("room_scanned", ("people",), "people"),
+    # remember_entity (mc_embodied_skills, C.2) -- bespoke handler below (not the
+    # generic PREDICATE_REGISTRY path): the evidence/world-state shape is
+    # {alias, entity_id, entity_class, created_by}, with no "matched"/"state"/
+    # "value" field for the generic _direct_predicate_result to key off of, and
+    # a real check needs to compare the SPECIFIC alias (and, if given, entity_id)
+    # this goal_spec asked for against what was actually bound -- "something got
+    # bound" is not the same claim as "the alias I asked about got bound".
+    # FOUND 2026-09-02 (GPT review, confirmed by direct code read): this entry
+    # did not exist until now, so a goal_spec using this predicate could never
+    # resolve past UNKNOWN -- a remember_entity mission's own C.2 result could
+    # never become the FINAL mission SUCCEEDED via its own natural predicate
+    # (the live test that round had to fall back to the unrelated person_named
+    # predicate to get a real SUCCEEDED at all).
+    "entity_alias_bound": PredicateSpec("entity_alias_bound", ("entity_aliases",), "entity_aliases"),
 }
 
 
@@ -274,6 +288,9 @@ class GoalChecker:
                 source="execution facts",
             )
 
+        if predicate == "entity_alias_bound":
+            return _entity_alias_bound_result(args, facts.get("entity_alias_bound"), source="execution facts")
+
         if predicate in PREDICATE_REGISTRY:
             return _direct_predicate_result(
                 predicate,
@@ -372,6 +389,11 @@ class GoalChecker:
                 args,
                 source="world state",
             )
+        if predicate == "entity_alias_bound":
+            scoped = facts.get("entity_aliases") if isinstance(facts.get("entity_aliases"), dict) else {}
+            alias_key = _normalize_alias(str(args.get("alias") or ""))
+            entry = scoped.get(alias_key) if alias_key else None
+            return _entity_alias_bound_result(args, entry, source="world state")
         if predicate in PREDICATE_REGISTRY:
             spec = PREDICATE_REGISTRY[predicate]
             scope = facts.get(spec.snapshot_scope) if isinstance(facts.get(spec.snapshot_scope), dict) else {}
@@ -523,6 +545,55 @@ def _person_following_result(
     if state is False:
         return CheckResult(TriState.FALSE, f"{source} contradicts following")
     return CheckResult(TriState.UNKNOWN, f"{source} following fact is inconclusive")
+
+
+def _normalize_alias(raw: str) -> str:
+    """Same contract as seattle_lab/mc_embodied_skills/semantic_verifier.py's
+    normalize_alias -- entity_aliases is keyed by THIS normalized form (see
+    world_facts.py's entity_alias_bound handler, which writes the already-
+    normalized alias the skill computed), so a reader comparing a goal_spec's
+    raw args.alias against it must apply the identical algorithm or a
+    case/whitespace-only difference would silently read as UNKNOWN. No
+    shared import path between these two Docker images -- same duplication
+    convention this integration already uses for entity_track_by_id."""
+    import unicodedata
+    return unicodedata.normalize("NFKC", str(raw or "")).strip().casefold()
+
+
+def _entity_alias_bound_result(
+    args: dict[str, Any],
+    entry: Any,
+    *,
+    source: str,
+) -> CheckResult:
+    if entry is None:
+        return CheckResult(TriState.UNKNOWN, "entity_alias_bound fact missing")
+    value = fact_value(entry)
+    if not isinstance(value, dict):
+        return CheckResult(TriState.UNKNOWN, f"{source} entity_alias_bound fact has unknown shape")
+
+    expected_alias = _normalize_alias(str(args.get("alias") or ""))
+    actual_alias = _normalize_alias(str(value.get("alias") or ""))
+    if expected_alias and actual_alias and actual_alias != expected_alias:
+        return CheckResult(
+            TriState.FALSE,
+            f"{source} entity_alias_bound alias mismatch: {actual_alias!r} != {expected_alias!r}",
+        )
+
+    expected_entity_id = str(args.get("entity_id") or "").strip()
+    actual_entity_id = str(value.get("entity_id") or "").strip()
+    if expected_entity_id and actual_entity_id and actual_entity_id != expected_entity_id:
+        return CheckResult(
+            TriState.FALSE,
+            f"{source} entity_alias_bound entity_id mismatch: {actual_entity_id} != {expected_entity_id}",
+        )
+
+    if actual_alias and actual_entity_id:
+        return CheckResult(
+            TriState.TRUE,
+            f"{source} confirms entity_alias_bound: {actual_alias!r} -> {actual_entity_id}",
+        )
+    return CheckResult(TriState.UNKNOWN, f"{source} entity_alias_bound fact is inconclusive")
 
 
 def _contact_verified(value: dict[str, Any]) -> bool:

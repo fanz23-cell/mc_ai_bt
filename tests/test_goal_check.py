@@ -4,6 +4,133 @@ from mc_ai_bt.executor import ExecutionResult
 from mc_ai_bt.goal_check import GoalChecker, TriState
 
 
+# --- C.2 (2026-09-02): entity_alias_bound -- FOUND by GPT's review, confirmed
+# by direct read: this predicate did not exist in PREDICATE_REGISTRY until
+# now, so a remember_entity mission's own natural goal predicate could never
+# resolve past UNKNOWN.
+
+def test_entity_alias_bound_true_from_execution_facts():
+    goal_spec = {
+        "type": "structured",
+        "predicate": "entity_alias_bound",
+        "args": {"alias": "33"},
+        "verification": {"mode": "world_state"},
+    }
+    execution = ExecutionResult(
+        True, "bound",
+        {"entity_alias_bound": {"alias": "33", "entity_id": "person_bad0fefe", "entity_class": "person", "created_by": "x"}},
+    )
+    result = GoalChecker().check(goal_spec, execution)
+    assert result.state is TriState.TRUE
+
+
+def test_entity_alias_bound_checks_the_specific_alias_asked_about():
+    # A goal_spec asking about "33" must not accept evidence that some OTHER
+    # alias got bound -- "something was bound" is not "33 was bound".
+    goal_spec = {
+        "type": "structured",
+        "predicate": "entity_alias_bound",
+        "args": {"alias": "33"},
+        "verification": {"mode": "world_state"},
+    }
+    execution = ExecutionResult(
+        True, "bound",
+        {"entity_alias_bound": {"alias": "22", "entity_id": "person_other", "entity_class": "person", "created_by": "x"}},
+    )
+    result = GoalChecker().check(goal_spec, execution)
+    assert result.state is TriState.FALSE
+
+
+def test_entity_alias_bound_checks_entity_id_when_given():
+    goal_spec = {
+        "type": "structured",
+        "predicate": "entity_alias_bound",
+        "args": {"alias": "33", "entity_id": "person_expected"},
+        "verification": {"mode": "world_state"},
+    }
+    execution = ExecutionResult(
+        True, "bound",
+        {"entity_alias_bound": {"alias": "33", "entity_id": "person_actual", "entity_class": "person", "created_by": "x"}},
+    )
+    result = GoalChecker().check(goal_spec, execution)
+    assert result.state is TriState.FALSE
+
+
+def test_entity_alias_bound_missing_evidence_is_unknown():
+    goal_spec = {
+        "type": "structured",
+        "predicate": "entity_alias_bound",
+        "args": {"alias": "33"},
+        "verification": {"mode": "world_state"},
+    }
+    execution = ExecutionResult(True, "ran", {})
+    result = GoalChecker().check(goal_spec, execution)
+    assert result.state is TriState.UNKNOWN
+
+
+def test_entity_alias_bound_alias_comparison_is_normalized():
+    # goal_spec args carry raw planner/user text; entity_aliases (and the
+    # skill's own evidence) is keyed by the normalized form (NFKC + strip +
+    # casefold) -- a case/whitespace-only difference must still match.
+    goal_spec = {
+        "type": "structured",
+        "predicate": "entity_alias_bound",
+        "args": {"alias": "  Ann "},
+        "verification": {"mode": "world_state"},
+    }
+    execution = ExecutionResult(
+        True, "bound",
+        {"entity_alias_bound": {"alias": "ann", "entity_id": "person_x", "entity_class": "person", "created_by": "x"}},
+    )
+    result = GoalChecker().check(goal_spec, execution)
+    assert result.state is TriState.TRUE
+
+
+def test_entity_alias_bound_true_from_world_state_snapshot():
+    def snapshot_provider(scopes, max_age_sec):
+        assert "entity_aliases" in scopes
+        return json.dumps({
+            "facts": {
+                "entity_aliases": {
+                    "33": {"value": {"alias": "33", "entity_id": "person_bad0fefe", "entity_class": "person", "created_by": "x"}},
+                },
+            },
+        })
+
+    goal_spec = {
+        "type": "structured",
+        "predicate": "entity_alias_bound",
+        "args": {"alias": "33"},
+        "verification": {"mode": "world_state"},
+    }
+    # ExecutionResult carries no matching evidence -- forces the fallback to
+    # the world-state snapshot path.
+    execution = ExecutionResult(True, "ran", {})
+    result = GoalChecker(snapshot_provider=snapshot_provider).check(goal_spec, execution)
+    assert result.state is TriState.TRUE
+
+
+def test_entity_alias_bound_world_state_snapshot_looks_up_the_normalized_key():
+    def snapshot_provider(scopes, max_age_sec):
+        return json.dumps({
+            "facts": {
+                "entity_aliases": {
+                    "ann": {"value": {"alias": "ann", "entity_id": "person_x", "entity_class": "person", "created_by": "x"}},
+                },
+            },
+        })
+
+    goal_spec = {
+        "type": "structured",
+        "predicate": "entity_alias_bound",
+        "args": {"alias": "Ann"},
+        "verification": {"mode": "world_state"},
+    }
+    execution = ExecutionResult(True, "ran", {})
+    result = GoalChecker(snapshot_provider=snapshot_provider).check(goal_spec, execution)
+    assert result.state is TriState.TRUE
+
+
 def test_structured_goal_uses_execution_facts():
     goal_spec = {
         "type": "structured",

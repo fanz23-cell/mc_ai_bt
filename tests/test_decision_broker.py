@@ -216,7 +216,14 @@ def test_entity_track_by_id_handles_missing_or_invalid_snapshot():
     assert entity_track_by_id(json.dumps({"facts": {}}), "x") is None
 
 
-def test_entity_approached_by_id_true_when_active():
+def test_entity_approached_by_id_unknown_when_active_but_no_pose_source():
+    # P0 fix (2026-09-02, GPT review): identity_state=="ACTIVE" alone used to
+    # return TRUE here -- confirming IDENTITY, not physical proximity, which
+    # this node has no TF/robot-pose source to verify. Must be honest UNKNOWN,
+    # never a confident TRUE from identity alone. The genuine distance check
+    # lives in mc_embodied_skills' own post-arrival verification (which DOES
+    # have TF) -- see test_embodied_skills.py's
+    # test_verify_entity_approached_by_id_fails_when_identity_confirmed_but_entity_moved_away.
     reader = _FixedEntityTracksReader(_tracks_world_json([{"entity_id": "person_1", "identity_state": "ACTIVE"}]))
     broker = _broker(entity_tracks_reader=reader)
 
@@ -225,7 +232,9 @@ def test_entity_approached_by_id_true_when_active():
         facts={}, cancel_event=None,
     )
 
-    assert outcome.state == "TRUE"
+    assert outcome.state == "UNKNOWN"
+    assert "identity confirmed" in outcome.message
+    assert "no robot-pose source" in outcome.message
 
 
 def test_entity_approached_by_id_unknown_when_ambiguous_never_guesses():
@@ -283,7 +292,11 @@ def test_entity_approached_by_id_never_falls_back_to_class_based_nearest_search(
         facts={}, cancel_event=None,
     )
 
-    assert outcome.state == "TRUE"
+    # UNKNOWN (not TRUE, since P0 fix above), but the point of THIS test is
+    # that _ExplodingLocator was never touched -- the class-based fallback
+    # must never be consulted just because entity_id resolution can't
+    # confirm distance either.
+    assert outcome.state == "UNKNOWN"
 
 
 def test_entity_approached_by_id_unknown_when_reader_not_configured():
