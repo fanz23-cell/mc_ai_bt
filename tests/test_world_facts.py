@@ -90,3 +90,28 @@ def test_world_fact_updates_ignore_person_named_without_person_id_or_name():
     updates = world_fact_updates_for_execution({"person_named": {"matched": False}})
 
     assert updates == ()
+
+
+def test_world_fact_updates_map_entity_alias_bound_to_the_entity_aliases_scope():
+    # C.2: remember_entity's own, real write path -- a separate scope from
+    # entity_tracks on purpose, same reasoning person_named/people_names had:
+    # a name binding must not be clobbered by the next unrelated detection.
+    updates = world_fact_updates_for_execution(
+        {"entity_alias_bound": {
+            "alias": "33", "entity_id": "person_aaaa1111", "entity_class": "person",
+            "created_by": "mc_embodied_skills.skill.remember_entity",
+        }}
+    )
+
+    assert len(updates) == 1
+    assert updates[0].scope == "entity_aliases"
+    assert updates[0].key == "33"
+    assert updates[0].value == {
+        "alias": "33", "entity_id": "person_aaaa1111", "entity_class": "person",
+        "created_by": "mc_embodied_skills.skill.remember_entity",
+    }
+
+
+def test_world_fact_updates_ignore_entity_alias_bound_without_alias_or_entity_id():
+    assert world_fact_updates_for_execution({"entity_alias_bound": {"entity_class": "person"}}) == ()
+    assert world_fact_updates_for_execution({"entity_alias_bound": {"alias": "33"}}) == ()

@@ -292,6 +292,26 @@ DEFAULT_SKILLS: dict[str, SkillSpec] = {
         {"target": "entity|entity_id|person", "name": "name to bind"},
         ("person_named",),
     ),
+    # C.2 (2026-09-02): remember_person's generalization to any entity_tracks-
+    # tracked class (person, chair, potted plant, ...), not just people --
+    # "that plant is 小绿"/"remember this chair as my chair". Same real-
+    # evidence contract (locates first, refuses if not genuinely found), plus
+    # a same-class-name collision refusal and an already-bound-elsewhere
+    # refusal neither of which remember_person itself needed to handle
+    # (mc_embodied_skills/node.py's _remember_entity_skill has the details).
+    "remember_entity": SkillSpec(
+        "remember_entity",
+        ("base", "gaze"),
+        "Bind an alias to a specific physical entity (person, chair, plant, ...) the "
+        "robot can currently see or can find by looking around -- e.g. 'that plant is "
+        "小绿'. Actually locates the entity first (turning to look if needed); refuses "
+        "to bind if it cannot find exactly one currently-tracked entity of that kind, "
+        "or if the alias is already bound to a different entity. `target` describes "
+        "what/who (a class name, description, or an id from a prior locate_entity/"
+        "search_for_entity result), `alias` is the name to bind.",
+        {"target": "entity|entity_id|object|person", "alias": "alias to bind"},
+        ("entity_alias_bound",),
+    ),
     # FOUND LIVE 2026-08-31: "turn around and count everyone in the room" is one
     # reasonable request, but needing several separate simple_move turns to do it
     # blew the per-mission action budget outright (a real scan needs >=3 bounded

@@ -416,6 +416,41 @@ def test_policy_rejects_remember_person_without_target():
     assert not result.ok
 
 
+def test_policy_accepts_remember_entity_with_target_and_alias():
+    # Same physical-skill-needs-a-structured-goal rule remember_person's own
+    # test above already works around (resources_for_skill declares "base")
+    # -- a non-implicit goal_spec type is enough to satisfy _check_goal_
+    # alignment regardless of whether PREDICATE_REGISTRY happens to know this
+    # particular predicate name (that is validator.py's separate job).
+    plan = _plan(
+        {"type": "Action", "skill": "remember_entity", "args": {"target": "chair", "alias": "my chair"}},
+        {"predicate": "entity_alias_bound"},
+    )
+
+    assert PolicyGuard().check(plan).ok
+
+
+def test_policy_rejects_remember_entity_without_alias():
+    plan = _plan(
+        {"type": "Action", "skill": "remember_entity", "args": {"target": "chair"}},
+    )
+
+    result = PolicyGuard().check(plan)
+
+    assert not result.ok
+    assert any("alias" in error for error in result.errors)
+
+
+def test_policy_rejects_remember_entity_without_target():
+    plan = _plan(
+        {"type": "Action", "skill": "remember_entity", "args": {"alias": "my chair"}},
+    )
+
+    result = PolicyGuard().check(plan)
+
+    assert not result.ok
+
+
 def test_policy_accepts_wait_for_participant_default_condition():
     plan = _plan({"type": "Action", "skill": "wait_for_participant", "args": {"role": "customer"}})
 

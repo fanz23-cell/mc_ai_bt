@@ -326,6 +326,8 @@ class PolicyGuard:
             self._check_remember_place(args, path, errors)
         elif skill == "remember_person":
             self._check_remember_person(args, path, errors)
+        elif skill == "remember_entity":
+            self._check_remember_entity(args, path, errors)
         elif skill not in POLICY_ENABLED_SKILLS:
             errors.append(f"{path}.skill is registered but not policy-enabled yet: {skill}")
 
@@ -563,6 +565,12 @@ class PolicyGuard:
         name = _clean_label(args.get("name"))
         if not name or len(name) > 64:
             errors.append(f"{path}.args.name must be non-empty and <= 64 chars")
+
+    def _check_remember_entity(self, args: dict[str, Any], path: str, errors: list[str]) -> None:
+        self._check_entity_target(args, path, errors, skill="remember_entity")
+        alias = _clean_label(args.get("alias"))
+        if not alias or len(alias) > 64:
+            errors.append(f"{path}.args.alias must be non-empty and <= 64 chars")
 
     def _check_totals(self, stats: "_Stats", errors: list[str]) -> None:
         limits = self._limits

@@ -149,4 +149,35 @@ def world_fact_updates_for_execution(facts: dict[str, Any]) -> tuple[WorldFactUp
             )
         )
 
+    # C.2 (2026-09-02): the real, read alias-binding path -- mc_embodied_skills'
+    # remember_entity (and remember_person, now a thin wrapper around it) only
+    # ever produces this fact after resolving to exactly one currently-ACTIVE
+    # entity_tracks candidate and checking for a conflicting existing binding
+    # (see mc_embodied_skills/node.py's _remember_entity_skill) -- this write
+    # is just recording that already-verified decision. A separate scope from
+    # "entity_tracks" on purpose, same reasoning "people_names" (this scope's
+    # now-unused predecessor) was kept separate from "people": a name binding
+    # must not be clobbered by the next unrelated detection update.
+    entity_alias_bound = facts.get("entity_alias_bound")
+    if (
+        isinstance(entity_alias_bound, dict)
+        and entity_alias_bound.get("alias")
+        and entity_alias_bound.get("entity_id")
+    ):
+        alias = str(entity_alias_bound["alias"])
+        updates.append(
+            WorldFactUpdate(
+                source="mc_ai_bt.skill.remember_entity",
+                scope="entity_aliases",
+                key=alias,
+                value={
+                    "alias": alias,
+                    "entity_id": str(entity_alias_bound["entity_id"]),
+                    "entity_class": str(entity_alias_bound.get("entity_class") or ""),
+                    "created_by": str(entity_alias_bound.get("created_by") or ""),
+                },
+                merge=False,
+            )
+        )
+
     return tuple(updates)
