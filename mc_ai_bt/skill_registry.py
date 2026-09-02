@@ -307,14 +307,20 @@ DEFAULT_SKILLS: dict[str, SkillSpec] = {
     "remember_entity": SkillSpec(
         "remember_entity",
         ("base", "gaze"),
-        "Bind an alias to a specific physical entity (person, chair, plant, ...) the "
-        "robot can currently see or can find by looking around -- e.g. 'that plant is "
-        "小绿'. Actually locates the entity first (turning to look if needed); refuses "
-        "to bind if it cannot find exactly one currently-tracked entity of that kind, "
-        "or if the alias is already bound to a different entity. `target` describes "
-        "what/who (a class name, description, or an id from a prior locate_entity/"
-        "search_for_entity result), `alias` is the name to bind.",
-        {"target": "entity|entity_id|object|person", "alias": "alias to bind"},
+        "Bind an alias to a specific physical entity (person, chair, plant, ...) -- "
+        "e.g. 'that plant is 小绿'. If a prior locate_entity/search_for_entity/"
+        "approach_entity result already resolved WHICH specific entity_id is meant "
+        "(the normal case when multiple same-class entities, e.g. several people, are "
+        "simultaneously visible -- pass that entity_id here, this is the ONLY way to "
+        "bind 11/22/33-style aliases to specific different people unambiguously), pass "
+        "`entity_id` and it is bound directly, no fresh look required. Otherwise pass "
+        "`target` (a class name or description) and the robot actually locates it first "
+        "(turning to look if needed); refuses to bind if it cannot find exactly one "
+        "currently-tracked entity of that kind (2+ simultaneously visible -> ambiguous, "
+        "use entity_id instead), or if the alias is already bound to a different entity.",
+        {"target": "entity|object|person (class/description; omit if entity_id given)",
+         "entity_id": "optional, exact entity_tracks id from a prior locate/search/approach result",
+         "alias": "alias to bind"},
         ("entity_alias_bound",),
     ),
     # FOUND LIVE 2026-08-31: "turn around and count everyone in the room" is one
