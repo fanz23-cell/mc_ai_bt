@@ -106,9 +106,12 @@ PREDICATE_REGISTRY: dict[str, PredicateSpec] = {
     "person_named": PredicateSpec("person_named", ("people", "people_names"), "people_names"),
     # scan_room (mc_embodied_skills) -- a bounded turn-and-count sweep; "matched"
     # reflects whether the sweep could query world state at all, same generic path
-    # as entity_located et al. above. min_people_count/frames_checked are the
-    # skill's own evidence fields, read directly by whoever consumes the goal_spec
-    # args (e.g. query_world.py), not by this generic predicate check itself.
+    # as entity_located et al. above. observed_track_count/frames_checked (renamed
+    # 2026-09-03 from min_people_count -- see node.py's own comment: the count can
+    # be an OVERcount from track-ID churn, not just an undercount, so it is not a
+    # lower bound) are the skill's own evidence fields, read directly by whoever
+    # consumes the goal_spec args (e.g. query_world.py), not by this generic
+    # predicate check itself.
     "room_scanned": PredicateSpec("room_scanned", ("people",), "people"),
     # remember_entity (mc_embodied_skills, C.2) -- bespoke handler below (not the
     # generic PREDICATE_REGISTRY path): the evidence/world-state shape is
