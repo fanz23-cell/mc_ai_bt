@@ -22,7 +22,7 @@ from mc_one.srv import (
 )
 
 from .context_builder import ContextBuilder
-from .executor import BtExecutor
+from .executor import BtExecutor, DecisionOutcome
 from .goal_check import GoalChecker, TriState
 from .identity import Identity
 from .mission import (
@@ -94,12 +94,14 @@ class AiBtNode(Node):
         # D v1: in-place resolution of an UNKNOWN Condition/GoalCheck for the handful
         # of predicates with an explicit, bespoke evidence/decision strategy (see
         # decision_broker.py's own module docstring) -- everything else keeps today's
-        # exact needs_decision=True -> pause/resume path unchanged.
+        # exact needs_decision=True -> pause/resume path unchanged. person_visible_checker
+        # is the plain GoalChecker (not MissionCheckExecutor -- neither VisualCheck
+        # fallback nor an identity/cancel_event binding matters for that one predicate's
+        # world_state-only re-poll).
         self._decision_broker = DecisionBroker(
             self,
-            checks=self._goal_checker,
             object_locator=self._live_object_locator,
-            world_writer=self._world_writer,
+            person_visible_checker=self._goal_checker,
             callback_group=self._client_callback_group,
         )
         self._visual_client = VisualCheckClient(
@@ -401,6 +403,7 @@ class AiBtNode(Node):
         runner_key: str,
     ) -> None:
         try:
+            mission_resolver = self._decision_broker.for_mission(mission.identity)
             with self._skill_executor.use_identity(mission.identity):
                 checks = MissionCheckExecutor(
                     goal_checker=self._goal_checker,
@@ -418,7 +421,7 @@ class AiBtNode(Node):
                         active_node,
                         progress,
                     ),
-                    decision_resolver=self._decision_broker,
+                    decision_resolver=mission_resolver,
                 )
             state = STATE_FAILED
             message = execution.message
@@ -447,8 +450,26 @@ class AiBtNode(Node):
                     state = STATE_SUCCEEDED
                     message = f"goal check TRUE: {check.message}"
                 elif check.state is TriState.UNKNOWN:
-                    escalate = True
-                    message = f"awaiting Omega decision: goal check UNKNOWN: {check.message}"
+                    # D v1 (FOUND LIVE 2026-09-01, correctness review): the mission's
+                    # own FINAL goal check used to bypass DecisionBroker entirely --
+                    # only BT-internal Condition/GoalCheck nodes went through it, but
+                    # a plan's real success criterion is very often expressed here
+                    # instead of as an explicit BT node (many planner outputs are
+                    # just Action;Action;Action with the real check only in
+                    # goal_spec), so this was D v1's single biggest coverage gap.
+                    # Same resolver, same fallback -- still-UNKNOWN escalates exactly
+                    # as before.
+                    resolved = self._resolve_final_goal_check(
+                        mission_resolver, mission.goal_spec_json, execution, check, cancel_event)
+                    if resolved.state == "TRUE":
+                        state = STATE_SUCCEEDED
+                        message = f"goal check TRUE (resolved): {resolved.message}"
+                    elif resolved.state == "FALSE":
+                        state = STATE_FAILED
+                        message = f"goal check FALSE (resolved): {resolved.message}"
+                    else:
+                        escalate = True
+                        message = f"awaiting Omega decision: goal check UNKNOWN: {check.message}"
                 else:
                     state = STATE_FAILED
                     message = f"goal check FALSE: {check.message}"
@@ -476,6 +497,30 @@ class AiBtNode(Node):
                 if self._mission_cancel_keys.get(mission.identity.mission_id) == runner_key:
                     self._mission_cancel_keys.pop(mission.identity.mission_id, None)
                 self._cancel_events.pop(runner_key, None)
+
+    def _resolve_final_goal_check(
+        self,
+        mission_resolver,
+        goal_spec_json: str,
+        execution,
+        check,
+        cancel_event: threading.Event,
+    ) -> DecisionOutcome:
+        try:
+            goal_spec = json.loads(goal_spec_json)
+        except (TypeError, ValueError):
+            return DecisionOutcome("UNKNOWN", "invalid goal_spec_json")
+        if not isinstance(goal_spec, dict):
+            return DecisionOutcome("UNKNOWN", "goal_spec_json is not an object")
+        predicate = str(goal_spec.get("predicate") or "")
+        args = goal_spec.get("args") if isinstance(goal_spec.get("args"), dict) else {}
+        return mission_resolver.resolve(
+            predicate=predicate,
+            args=args,
+            reason=check.message,
+            facts=execution.facts,
+            cancel_event=cancel_event,
+        )
 
     def _start_next_ready(self) -> None:
         with self._mission_lock:

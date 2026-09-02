@@ -14,22 +14,23 @@ pytest.importorskip("builtin_interfaces")
 pytest.importorskip("mc_one")
 
 from mc_ai_bt.decision_broker import (  # noqa: E402
+    _APPROACH_DISTANCE_TOLERANCE_M,
+    _D_V1_SEMANTIC_SMOKE_TEST_PREDICATE,
+    LocateResult,
+    MissionBoundDecisionResolver,
     PHYSICAL_PREDICATES,
     SEMANTIC_PREDICATES,
     DecisionBroker,
-    LiveObjectLocator,
-    _APPROACH_DISTANCE_TOLERANCE_M,
+    _match_available_classes,
 )
-from mc_ai_bt.executor import DecisionOutcome, ExecutionResult  # noqa: E402
 from mc_one.action import RequestHumanConfirmation  # noqa: E402
 
 
 def _broker(**overrides) -> DecisionBroker:
     broker = DecisionBroker.__new__(DecisionBroker)
     broker._node = None
-    broker._checks = overrides.get("checks")
     broker._object_locator = overrides.get("object_locator")
-    broker._world_writer = overrides.get("world_writer")
+    broker._person_visible_checker = overrides.get("person_visible_checker")
     broker._fast_window_sec = overrides.get("fast_window_sec", 1.0)
     broker._poll_interval_sec = overrides.get("poll_interval_sec", 0.05)
     broker._confirmation_timeout_sec = overrides.get("confirmation_timeout_sec", 1.0)
@@ -51,188 +52,293 @@ class _SequenceChecks:
         return type("Result", (), {"state": self.states[idx], "message": f"state={self.states[idx]}"})()
 
 
-class _RecordingWorldWriter:
-    def __init__(self):
-        self.calls = []
-
-    def update_fact(self, *, source, scope, key, value, merge=False, timeout_sec=0.5):
-        self.calls.append({"source": source, "scope": scope, "key": key, "value": value})
-        return True, "ok"
-
-
-class _FakeObjectLocator:
-    def __init__(self, result):
+class _FixedLocator:
+    def __init__(self, result: LocateResult):
         self._result = result
         self.calls = []
 
-    def locate(self, object_name, *, timeout_sec=2.0):
-        self.calls.append(object_name)
+    def locate(self, target, *, timeout_sec=2.0):
+        self.calls.append(target)
         return self._result
 
 
+class _SequenceLocator:
+    """Returns each LocateResult in order on successive .locate() calls."""
+
+    def __init__(self, results):
+        self._results = list(results)
+        self.calls = []
+
+    def locate(self, target, *, timeout_sec=2.0):
+        self.calls.append(target)
+        idx = min(len(self.calls) - 1, len(self._results) - 1)
+        return self._results[idx]
+
+
 def test_resolve_returns_unknown_immediately_for_a_predicate_with_no_strategy():
-    checks = _SequenceChecks(["UNKNOWN"])
-    broker = _broker(checks=checks)
+    broker = _broker()
 
     outcome = broker.resolve(
         predicate="robot_at_place", args={}, reason="no strategy", facts={}, cancel_event=None)
 
     assert outcome.state == "UNKNOWN"
-    assert checks.calls == 0  # never even asked the checker -- straight fallback
 
 
 def test_predicate_classification_matches_the_documented_sets():
     assert PHYSICAL_PREDICATES == {"entity_approached", "object_visible", "person_visible"}
-    assert SEMANTIC_PREDICATES == set()  # reserved, nothing registered yet
+    # Not empty: the semantic-smoke-test predicate exists purely to exercise the
+    # public resolve() -> confirmation -> DecisionOutcome path end to end, since no
+    # real PREDICATE_REGISTRY entry needs semantic resolution today.
+    assert SEMANTIC_PREDICATES == {_D_V1_SEMANTIC_SMOKE_TEST_PREDICATE}
 
 
-# --- poll_until_known: TRUE/FALSE return immediately, only UNKNOWN keeps polling ----
+def test_approach_distance_tolerance_matches_mc_embodied_skills():
+    assert _APPROACH_DISTANCE_TOLERANCE_M == 1.5
 
 
-def test_poll_until_known_returns_true_immediately_without_polling_again():
+# --- entity_approached: direct, check-local, no WorldState write at all ------------
+
+
+def test_entity_approached_true_when_fresh_locate_is_within_tolerance():
+    locator = _FixedLocator(LocateResult("FOUND", fact={"x": 0.9, "y": 0.0, "z": 0.0, "score": 0.8}))
+    broker = _broker(object_locator=locator)
+
+    outcome = broker.resolve(
+        predicate="entity_approached", args={"target": "alice"}, reason="unknown",
+        facts={}, cancel_event=None,
+    )
+
+    assert outcome.state == "TRUE"
+    assert locator.calls == ["alice"]
+
+
+def test_entity_approached_false_when_fresh_locate_is_still_far():
+    locator = _FixedLocator(LocateResult("FOUND", fact={"x": 3.0, "y": 4.0, "z": 0.0, "score": 0.8}))
+    broker = _broker(object_locator=locator)
+
+    outcome = broker.resolve(
+        predicate="entity_approached", args={"target": "alice"}, reason="unknown",
+        facts={}, cancel_event=None,
+    )
+
+    assert outcome.state == "FALSE"
+
+
+def test_entity_approached_stays_unknown_when_target_not_found():
+    # A single missed fresh locate is not proof the approach failed.
+    locator = _FixedLocator(LocateResult("NOT_FOUND", reason="not found"))
+    broker = _broker(object_locator=locator, fast_window_sec=0.1, poll_interval_sec=0.02)
+
+    outcome = broker.resolve(
+        predicate="entity_approached", args={"target": "alice"}, reason="unknown",
+        facts={}, cancel_event=None,
+    )
+
+    assert outcome.state == "UNKNOWN"
+
+
+def test_entity_approached_stays_unknown_when_localizer_service_is_down():
+    # FOUND LIVE 2026-09-01 (4th-party review): a perception OUTAGE must never read
+    # the same as a real, completed "not visible" query.
+    locator = _FixedLocator(LocateResult("INCONCLUSIVE", reason="object localization service unavailable"))
+    broker = _broker(object_locator=locator, fast_window_sec=0.1, poll_interval_sec=0.02)
+
+    outcome = broker.resolve(
+        predicate="entity_approached", args={"target": "alice"}, reason="unknown",
+        facts={}, cancel_event=None,
+    )
+
+    assert outcome.state == "UNKNOWN"
+
+
+def test_entity_approached_does_not_confuse_two_different_targets():
+    # FOUND LIVE 2026-09-01 (4th-party review): the first cut wrote a single GLOBAL
+    # objects.entity_approached key with no target scoping -- confirming Alice was
+    # approached could satisfy an unrelated later check for Bob reading the same
+    # stale key. Now there is no shared key at all: each resolve() call is entirely
+    # check-local, driven only by ITS OWN fresh locate of ITS OWN target.
+    locator = _SequenceLocator([
+        LocateResult("FOUND", fact={"x": 0.1, "y": 0.0, "z": 0.0, "score": 0.9}),   # alice: close
+        LocateResult("FOUND", fact={"x": 9.0, "y": 0.0, "z": 0.0, "score": 0.9}),   # bob: far
+    ])
+    broker = _broker(object_locator=locator)
+
+    alice = broker.resolve(
+        predicate="entity_approached", args={"target": "alice"}, reason="u", facts={}, cancel_event=None)
+    bob = broker.resolve(
+        predicate="entity_approached", args={"target": "bob"}, reason="u", facts={}, cancel_event=None)
+
+    assert alice.state == "TRUE"
+    assert bob.state == "FALSE"  # not contaminated by alice's TRUE
+    assert locator.calls == ["alice", "bob"]
+
+
+def test_entity_approached_retries_within_the_fast_window_and_can_still_succeed():
+    locator = _SequenceLocator([
+        LocateResult("NOT_FOUND", reason="not found"),
+        LocateResult("FOUND", fact={"x": 0.2, "y": 0.0, "z": 0.0, "score": 0.9}),
+    ])
+    broker = _broker(object_locator=locator, fast_window_sec=2.0, poll_interval_sec=0.02)
+
+    outcome = broker.resolve(
+        predicate="entity_approached", args={"target": "alice"}, reason="u", facts={}, cancel_event=None)
+
+    assert outcome.state == "TRUE"
+    assert len(locator.calls) >= 2
+
+
+# --- object_visible: direct, check-local, no synthetic fact that could shadow a real
+# multi-instance perception fact -----------------------------------------------------
+
+
+def test_object_visible_true_when_found_above_min_score():
+    locator = _FixedLocator(LocateResult("FOUND", fact={"x": 1.0, "y": 1.0, "z": 0.0, "score": 0.73}))
+    broker = _broker(object_locator=locator)
+
+    outcome = broker.resolve(
+        predicate="object_visible", args={"name": "chair"}, reason="u", facts={}, cancel_event=None)
+
+    assert outcome.state == "TRUE"
+
+
+def test_object_visible_false_below_min_score():
+    locator = _FixedLocator(LocateResult("FOUND", fact={"x": 1.0, "y": 1.0, "z": 0.0, "score": 0.2}))
+    broker = _broker(object_locator=locator)
+
+    outcome = broker.resolve(
+        predicate="object_visible", args={"name": "chair", "min_score": 0.5}, reason="u",
+        facts={}, cancel_event=None,
+    )
+
+    assert outcome.state == "FALSE"
+
+
+def test_object_visible_false_when_a_completed_query_finds_nothing():
+    # A completed, fresh query that conclusively found nothing IS a real answer for
+    # "is X visible right now" -- unlike entity_approached's past-tense claim.
+    locator = _FixedLocator(LocateResult("NOT_FOUND", reason="not found"))
+    broker = _broker(object_locator=locator, fast_window_sec=0.1, poll_interval_sec=0.02)
+
+    outcome = broker.resolve(
+        predicate="object_visible", args={"name": "medicine"}, reason="u", facts={}, cancel_event=None)
+
+    assert outcome.state == "FALSE"
+
+
+def test_object_visible_stays_unknown_on_service_outage_not_false():
+    # FOUND LIVE 2026-09-01 (4th-party review), the most dangerous bug in the first
+    # cut: service unavailable / timeout / exception must never read as a confirmed
+    # "not visible" -- that would make a plain perception outage look like real
+    # negative evidence.
+    for reason in ("object localization service unavailable", "localize_object call failed: timeout"):
+        locator = _FixedLocator(LocateResult("INCONCLUSIVE", reason=reason))
+        broker = _broker(object_locator=locator, fast_window_sec=0.1, poll_interval_sec=0.02)
+
+        outcome = broker.resolve(
+            predicate="object_visible", args={"name": "chair"}, reason="u", facts={}, cancel_event=None)
+
+        assert outcome.state == "UNKNOWN", reason
+
+
+def test_object_visible_never_touches_world_state():
+    # There is no world_writer on this broker at all -- if _check_object_visible
+    # tried to write anything, this would raise AttributeError instead of quietly
+    # succeeding, which is exactly the point: no synthetic "object:<name>" fact can
+    # ever again shadow mc_world_state's real per-instance "object:<name>:<cell>" keys.
+    locator = _FixedLocator(LocateResult("FOUND", fact={"x": 0.1, "y": 0.1, "z": 0.0, "score": 0.9}))
+    broker = _broker(object_locator=locator)
+    assert not hasattr(broker, "_world_writer")
+
+    outcome = broker.resolve(
+        predicate="object_visible", args={"name": "chair"}, reason="u", facts={}, cancel_event=None)
+
+    assert outcome.state == "TRUE"
+
+
+# --- LiveObjectLocator's own class-name matching (mirrors ObjectLocalizerClient) ---
+
+
+def test_match_available_classes_bare_noun_matches_multiword_class():
+    assert _match_available_classes("plant", ["chair", "potted plant"]) == ["potted plant"]
+
+
+def test_match_available_classes_exact_match():
+    assert _match_available_classes("chair", ["chair", "potted plant"]) == ["chair"]
+
+
+def test_match_available_classes_no_plausible_match_is_empty():
+    assert _match_available_classes("basketball", ["chair", "potted plant"]) == []
+
+
+# --- person_visible: the one predicate that legitimately still polls a checker ----
+
+
+def test_person_visible_returns_true_immediately():
     checks = _SequenceChecks(["TRUE"])
-    broker = _broker(checks=checks, fast_window_sec=5.0)
-    refreshed = []
+    broker = _broker(person_visible_checker=checks, fast_window_sec=5.0)
 
-    outcome = broker._poll_until_known({"predicate": "x"}, lambda: refreshed.append(1), None)
+    outcome = broker.resolve(
+        predicate="person_visible", args={}, reason="u", facts={}, cancel_event=None)
 
     assert outcome.state == "TRUE"
     assert checks.calls == 1
-    assert refreshed == [1]
 
 
-def test_poll_until_known_returns_false_immediately_not_continue_waiting():
+def test_person_visible_returns_false_immediately_not_continue_waiting():
     # The exact semantic _execute_wait_for_event gets wrong for this use case (FALSE
     # there means "keep waiting for it to become true") -- here FALSE is a real,
     # immediate answer.
     checks = _SequenceChecks(["FALSE"])
-    broker = _broker(checks=checks, fast_window_sec=5.0)
+    broker = _broker(person_visible_checker=checks, fast_window_sec=5.0)
 
-    outcome = broker._poll_until_known({"predicate": "x"}, lambda: None, None)
+    outcome = broker.resolve(
+        predicate="person_visible", args={}, reason="u", facts={}, cancel_event=None)
 
     assert outcome.state == "FALSE"
     assert checks.calls == 1
 
 
-def test_poll_until_known_keeps_polling_through_unknown_then_returns_true():
+def test_person_visible_keeps_polling_through_unknown_then_returns_true():
     checks = _SequenceChecks(["UNKNOWN", "UNKNOWN", "TRUE"])
-    broker = _broker(checks=checks, fast_window_sec=5.0, poll_interval_sec=0.01)
+    broker = _broker(person_visible_checker=checks, fast_window_sec=5.0, poll_interval_sec=0.01)
 
-    outcome = broker._poll_until_known({"predicate": "x"}, lambda: None, None)
+    outcome = broker.resolve(
+        predicate="person_visible", args={}, reason="u", facts={}, cancel_event=None)
 
     assert outcome.state == "TRUE"
     assert checks.calls == 3
 
 
-def test_poll_until_known_gives_up_as_unknown_after_the_fast_window():
+def test_person_visible_gives_up_as_unknown_after_the_fast_window():
     checks = _SequenceChecks(["UNKNOWN"])
-    broker = _broker(checks=checks, fast_window_sec=0.05, poll_interval_sec=0.02)
+    broker = _broker(person_visible_checker=checks, fast_window_sec=0.05, poll_interval_sec=0.02)
 
-    outcome = broker._poll_until_known({"predicate": "x"}, lambda: None, None)
+    outcome = broker.resolve(
+        predicate="person_visible", args={}, reason="u", facts={}, cancel_event=None)
 
     assert outcome.state == "UNKNOWN"
-    assert checks.calls > 1  # actually polled more than once before giving up
+    assert checks.calls > 1
 
 
-def test_poll_until_known_stops_promptly_when_canceled():
+def test_person_visible_stops_promptly_when_canceled():
     checks = _SequenceChecks(["UNKNOWN"])
-    broker = _broker(checks=checks, fast_window_sec=5.0, poll_interval_sec=0.01)
+    broker = _broker(person_visible_checker=checks, fast_window_sec=5.0, poll_interval_sec=0.01)
     cancel_event = threading.Event()
     cancel_event.set()
 
-    outcome = broker._poll_until_known({"predicate": "x"}, lambda: None, cancel_event)
+    outcome = broker.resolve(
+        predicate="person_visible", args={}, reason="u", facts={}, cancel_event=cancel_event)
 
     assert outcome.state == "UNKNOWN"
-    assert "canceled" in outcome.message
 
 
-# --- entity_approached: fresh live locate + distance, written to WorldState ---------
+def test_person_visible_unconfigured_checker_returns_unknown():
+    broker = _broker(person_visible_checker=None, fast_window_sec=0.1)
 
+    outcome = broker.resolve(
+        predicate="person_visible", args={}, reason="u", facts={}, cancel_event=None)
 
-def test_refresh_entity_approached_writes_matched_true_within_tolerance():
-    writer = _RecordingWorldWriter()
-    locator = _FakeObjectLocator(({"x": 0.9, "y": 0.0, "z": 0.0, "score": 0.8}, "found"))
-    broker = _broker(object_locator=locator, world_writer=writer)
-
-    broker._refresh_entity_approached({"target": "alice"})
-
-    assert locator.calls == ["alice"]
-    assert len(writer.calls) == 1
-    call = writer.calls[0]
-    assert call["scope"] == "objects" and call["key"] == "entity_approached"
-    assert call["value"]["matched"] is True
-    assert call["value"]["distance_after_arrival_m"] == pytest.approx(0.9)
-
-
-def test_refresh_entity_approached_writes_matched_false_when_still_far():
-    writer = _RecordingWorldWriter()
-    locator = _FakeObjectLocator(({"x": 3.0, "y": 4.0, "z": 0.0, "score": 0.8}, "found"))
-    broker = _broker(object_locator=locator, world_writer=writer)
-
-    broker._refresh_entity_approached({"target": "alice"})
-
-    assert writer.calls[0]["value"]["matched"] is False
-    assert writer.calls[0]["value"]["distance_after_arrival_m"] == pytest.approx(5.0)
-
-
-def test_refresh_entity_approached_writes_nothing_when_target_not_found():
-    # A single missed fresh locate is not proof the approach failed -- must stay
-    # UNKNOWN (no write at all), not become a confirmed matched=False. See the
-    # matching comment in decision_broker.py's _refresh_entity_approached, added
-    # after this exact scenario broke test_d_v1_inline_decision_resolution.py's
-    # fallback-to-pause test.
-    writer = _RecordingWorldWriter()
-    locator = _FakeObjectLocator((None, "not found"))
-    broker = _broker(object_locator=locator, world_writer=writer)
-
-    broker._refresh_entity_approached({"target": "alice"})
-
-    assert writer.calls == []
-
-
-def test_refresh_entity_approached_does_nothing_without_a_target():
-    writer = _RecordingWorldWriter()
-    locator = _FakeObjectLocator((None, "n/a"))
-    broker = _broker(object_locator=locator, world_writer=writer)
-
-    broker._refresh_entity_approached({})
-
-    assert locator.calls == []
-    assert writer.calls == []
-
-
-def test_approach_distance_tolerance_matches_mc_embodied_skills():
-    # Mirrors mc_embodied_skills/node.py's _APPROACH_DISTANCE_TOLERANCE_M exactly --
-    # no shared import path between the two images, so this pins the value so a
-    # future change to one side doesn't silently drift from the other.
-    assert _APPROACH_DISTANCE_TOLERANCE_M == 1.5
-
-
-# --- object_visible: fresh live locate, written under the real object_fact_key -----
-
-
-def test_refresh_object_visible_writes_visible_true_with_score():
-    writer = _RecordingWorldWriter()
-    locator = _FakeObjectLocator(({"x": 1.0, "y": 1.0, "z": 0.0, "score": 0.73}, "found"))
-    broker = _broker(object_locator=locator, world_writer=writer)
-
-    broker._refresh_object_visible({"object": "red chair"})
-
-    assert locator.calls == ["red chair"]
-    call = writer.calls[0]
-    assert call["scope"] == "objects"
-    assert call["key"] == "object:red chair"  # normalise_entity_name: lower + collapse
-    assert call["value"] == {"object_name": "red chair", "visible": True, "score": 0.73}
-
-
-def test_refresh_object_visible_writes_visible_false_when_not_found():
-    writer = _RecordingWorldWriter()
-    locator = _FakeObjectLocator((None, "not found"))
-    broker = _broker(object_locator=locator, world_writer=writer)
-
-    broker._refresh_object_visible({"name": "medicine"})
-
-    assert writer.calls[0]["value"] == {"object_name": "medicine", "visible": False}
+    assert outcome.state == "UNKNOWN"
 
 
 # --- semantic/policy: reuses RequestHumanConfirmation, mission-local outcome only ---
@@ -283,11 +389,17 @@ class _FakeConfirmationClient:
         return _FakeFuture(self._goal_handle)
 
 
-def test_resolve_semantic_approved_returns_true():
+def test_resolve_semantic_approved_returns_true_via_public_resolve():
+    # Exercises the PUBLIC resolve(), not the private method directly -- proves the
+    # smoke-test predicate is actually registered and dispatches correctly, not just
+    # that _resolve_semantic itself works in isolation.
     client = _FakeConfirmationClient(decision=RequestHumanConfirmation.Goal.DECISION_APPROVED, reason="fine")
     broker = _broker(confirmation_client=client)
 
-    outcome = broker._resolve_semantic("may_interrupt", {"person": "bob"}, "ambiguous", None)
+    outcome = broker.resolve(
+        predicate=_D_V1_SEMANTIC_SMOKE_TEST_PREDICATE, args={"person": "bob"}, reason="ambiguous",
+        facts={}, cancel_event=None,
+    )
 
     assert outcome.state == "TRUE"
     assert outcome.message == "fine"
@@ -299,7 +411,8 @@ def test_resolve_semantic_denied_returns_false():
     client = _FakeConfirmationClient(decision=RequestHumanConfirmation.Goal.DECISION_DENIED, reason="not now")
     broker = _broker(confirmation_client=client)
 
-    outcome = broker._resolve_semantic("may_interrupt", {}, "ambiguous", None)
+    outcome = broker.resolve(
+        predicate=_D_V1_SEMANTIC_SMOKE_TEST_PREDICATE, args={}, reason="ambiguous", facts={}, cancel_event=None)
 
     assert outcome.state == "FALSE"
     assert outcome.message == "not now"
@@ -309,7 +422,8 @@ def test_resolve_semantic_timeout_returns_unknown():
     client = _FakeConfirmationClient(decision=RequestHumanConfirmation.Goal.DECISION_TIMEOUT)
     broker = _broker(confirmation_client=client)
 
-    outcome = broker._resolve_semantic("may_interrupt", {}, "ambiguous", None)
+    outcome = broker.resolve(
+        predicate=_D_V1_SEMANTIC_SMOKE_TEST_PREDICATE, args={}, reason="ambiguous", facts={}, cancel_event=None)
 
     assert outcome.state == "UNKNOWN"
 
@@ -318,7 +432,8 @@ def test_resolve_semantic_unavailable_channel_returns_unknown_without_sending_a_
     client = _FakeConfirmationClient(ready=False)
     broker = _broker(confirmation_client=client)
 
-    outcome = broker._resolve_semantic("may_interrupt", {}, "ambiguous", None)
+    outcome = broker.resolve(
+        predicate=_D_V1_SEMANTIC_SMOKE_TEST_PREDICATE, args={}, reason="ambiguous", facts={}, cancel_event=None)
 
     assert outcome.state == "UNKNOWN"
     assert client.sent_goals == []
@@ -328,7 +443,8 @@ def test_resolve_semantic_rejected_goal_returns_unknown():
     client = _FakeConfirmationClient(accepted=False)
     broker = _broker(confirmation_client=client)
 
-    outcome = broker._resolve_semantic("may_interrupt", {}, "ambiguous", None)
+    outcome = broker.resolve(
+        predicate=_D_V1_SEMANTIC_SMOKE_TEST_PREDICATE, args={}, reason="ambiguous", facts={}, cancel_event=None)
 
     assert outcome.state == "UNKNOWN"
 
@@ -337,27 +453,83 @@ def test_resolve_semantic_each_call_gets_a_fresh_request_id():
     client = _FakeConfirmationClient()
     broker = _broker(confirmation_client=client)
 
-    broker._resolve_semantic("may_interrupt", {}, "first", None)
-    broker._resolve_semantic("may_interrupt", {}, "second", None)
+    broker.resolve(predicate=_D_V1_SEMANTIC_SMOKE_TEST_PREDICATE, args={}, reason="first", facts={}, cancel_event=None)
+    broker.resolve(predicate=_D_V1_SEMANTIC_SMOKE_TEST_PREDICATE, args={}, reason="second", facts={}, cancel_event=None)
 
     ids = [goal.request_id for goal in client.sent_goals]
     assert len(ids) == 2
     assert ids[0] != ids[1]
 
 
-# --- resolve() dispatch wiring, end to end (no ROS beyond the fakes above) ---------
+def test_resolve_semantic_sends_the_bound_mission_identity():
+    client = _FakeConfirmationClient()
+    broker = _broker(confirmation_client=client)
+    identity = object()  # a real AiBtIdentity in production; identity is opaque here
 
-
-def test_resolve_dispatches_physical_predicates_through_poll_until_known():
-    checks = _SequenceChecks(["TRUE"])
-    writer = _RecordingWorldWriter()
-    locator = _FakeObjectLocator(({"x": 0.1, "y": 0.0, "z": 0.0, "score": 0.9}, "found"))
-    broker = _broker(checks=checks, object_locator=locator, world_writer=writer, fast_window_sec=1.0)
-
-    outcome = broker.resolve(
-        predicate="entity_approached", args={"target": "alice"}, reason="unknown",
-        facts={}, cancel_event=None,
+    broker.resolve(
+        predicate=_D_V1_SEMANTIC_SMOKE_TEST_PREDICATE, args={}, reason="u", facts={},
+        cancel_event=None, identity=identity,
     )
 
-    assert outcome.state == "TRUE"
-    assert locator.calls == ["alice"]  # the physical refresh actually ran
+    assert client.sent_goals[0].identity is identity
+
+
+class _SlowGoalHandle(_FakeGoalHandle):
+    """get_result_async() never completes on its own -- only cancellation moves it,
+    simulating a real in-flight confirmation wait."""
+
+    def __init__(self):
+        super().__init__(accepted=True, decision=RequestHumanConfirmation.Goal.DECISION_CANCELED)
+        self._canceled = threading.Event()
+
+    def get_result_async(self):
+        return _NeverDoneFuture(self)
+
+    def cancel_goal_async(self):
+        self._canceled.set()
+        return _FakeFuture(None)
+
+
+class _NeverDoneFuture:
+    def __init__(self, goal_handle):
+        self._goal_handle = goal_handle
+
+    def add_done_callback(self, callback):
+        pass  # never fires -- this is the whole point
+
+    def result(self):
+        raise AssertionError("should never be called")
+
+
+def test_resolve_semantic_returns_promptly_on_cancel_not_the_full_timeout():
+    # FOUND LIVE 2026-09-01 (4th-party review): the earlier _wait_future called
+    # on_cancel() when cancel_event fired but then kept waiting for the ORIGINAL
+    # deadline anyway. Now a cancel gets its own short grace period.
+    goal_handle = _SlowGoalHandle()
+    client = _FakeConfirmationClient(accepted=True)
+    client._goal_handle = goal_handle
+    broker = _broker(confirmation_client=client, confirmation_timeout_sec=30.0)
+    cancel_event = threading.Event()
+    cancel_event.set()  # already canceled before the wait even starts
+
+    started = threading.Event()
+
+    def _run():
+        started.set()
+        outcome_box["outcome"] = broker.resolve(
+            predicate=_D_V1_SEMANTIC_SMOKE_TEST_PREDICATE, args={}, reason="u",
+            facts={}, cancel_event=cancel_event,
+        )
+        finished.set()
+
+    outcome_box = {}
+    finished = threading.Event()
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    started.wait(timeout=1.0)
+
+    # The ORIGINAL confirmation_timeout_sec is 30s -- if cancel didn't return
+    # promptly, this would still be running well within a couple of seconds.
+    assert finished.wait(timeout=3.0), "resolve() did not return promptly after cancel"
+    assert outcome_box["outcome"].state == "UNKNOWN"
+    thread.join(timeout=1.0)

@@ -84,7 +84,8 @@ class MissionManager:
             mission = self._synthetic_rejected(source, operator_id, parent_mission_id)
             return False, "intent_text is required", mission, MissionEvent(EVENT_REJECTED, mission)
 
-        if self._active_id and not allow_queue:
+        slot_busy = self._slot_busy()
+        if slot_busy and not allow_queue:
             mission = self._synthetic_rejected(source, operator_id, parent_mission_id)
             return False, "another mission is active", mission, MissionEvent(EVENT_REJECTED, mission)
 
@@ -93,7 +94,7 @@ class MissionManager:
             source=source,
             operator_id=operator_id,
         )
-        state = STATE_QUEUED if self._active_id else STATE_PLANNING
+        state = STATE_QUEUED if slot_busy else STATE_PLANNING
         mission = Mission(
             identity=identity,
             intent_text=intent_text,
@@ -107,9 +108,26 @@ class MissionManager:
             status_text="queued" if state == STATE_QUEUED else "planning",
         )
         self._missions[mission.identity.mission_id] = mission
-        if self._active_id is None:
+        if not slot_busy:
             self._active_id = mission.identity.mission_id
         return True, "accepted", mission, MissionEvent(EVENT_ACCEPTED, mission, "accepted")
+
+    def _slot_busy(self) -> bool:
+        # FOUND LIVE 2026-09-01 (D v1 correctness review): a PAUSED mission holds no
+        # real resources (see pause()'s own docstring -- mc_resource_authority never
+        # sees a lease held across a pause) and stays independently resumable
+        # regardless of _active_id (resume()'s own slot_free check already re-queues
+        # ITSELF if something else claims the slot meanwhile -- see resume()'s
+        # comment). _release_slot_for_pause only promotes a mission that was ALREADY
+        # queued at the moment of pausing; nothing re-checks the queue afterward, so
+        # treating a paused mission as still "active" here let it starve every
+        # mission submitted AFTER it paused (as opposed to the case already handled:
+        # one queued before it paused) -- forever, since only resuming/canceling
+        # THAT SAME mission was ever going to look at the queue again.
+        if self._active_id is None:
+            return False
+        active = self._missions.get(self._active_id)
+        return active is not None and active.state != STATE_PAUSED
 
     def set_plan(
         self,

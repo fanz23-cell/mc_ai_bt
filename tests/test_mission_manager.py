@@ -521,6 +521,36 @@ def test_pause_with_nothing_queued_keeps_current_alias_on_the_paused_mission():
     assert resumed.mission.state == STATE_RUNNING
 
 
+def test_mission_submitted_after_another_already_paused_still_starts():
+    # FOUND LIVE 2026-09-01 (D v1 correctness review): _release_slot_for_pause only
+    # promotes a mission that was ALREADY queued at the moment pause() ran -- nothing
+    # re-checks the queue afterward. Before this fix, a mission paused with nothing
+    # queued left _active_id pointed at it forever (deliberately, so it stays a valid
+    # ""/"active"/"current" resume target -- see the test above), which meant a
+    # mission submitted LATER got stuck QUEUED with no promotion trigger ever coming:
+    # only resuming/canceling the SAME paused mission would have looked at the queue
+    # again. A paused mission holds no real resources (pause()'s own docstring), so
+    # it must not block admission of new work the way a genuinely running one does.
+    manager = MissionManager()
+    first = _submit(manager, "first")
+    manager.set_plan(first.identity.mission_id, "bt", "goal")
+    manager.pause(first.identity.mission_id, "awaiting Omega decision")
+    assert manager.all()[0].state == STATE_PAUSED
+
+    second = _submit(manager, "second")
+
+    assert second.state == STATE_PLANNING  # not STATE_QUEUED -- this is the whole bug
+    accepted, _message, _mission, event = manager.submit(
+        intent_text="third", source="voice", operator_id="user",
+        parent_mission_id="", priority=10, allow_queue=True, context_json="{}",
+    )
+    assert accepted
+    # The paused mission is still independently resumable, just no longer "active":
+    # resume() re-queues itself since the slot now genuinely belongs to `second`.
+    resumed = manager.resume(first.identity.mission_id, "late evidence")
+    assert resumed.mission.state == STATE_QUEUED
+
+
 def test_resume_then_identical_repause_escalates_to_blocked_not_silent_limbo():
     # Found live 2026-08-30: resume() re-runs the exact BT node that raised the
     # escalation, with no way to carry new evidence into it. Omega separately
