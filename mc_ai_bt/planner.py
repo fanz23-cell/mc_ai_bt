@@ -42,11 +42,25 @@ class Planner(Protocol):
         ...
 
 
+# Raw-plan injection for live acceptance testing only (D v1 behavioral test round,
+# 2026-09-01): submit_task's public API only takes free-form intent_text, and no
+# real planner backend (BootstrapPlanner's own routing, nor the production LLM
+# planner) ever emits an explicit Condition/GoalCheck node or the non-production
+# _d_v1_semantic_smoke_test predicate -- there is otherwise no way to exercise
+# DecisionBroker's inline resolution paths against the real, deployed node/executor/
+# mission machinery instead of only against pytest fakes. Gated behind a sentinel
+# prefix that cannot occur in real user speech or Omega output; every other intent
+# is completely unaffected.
+_TEST_RAW_PLAN_PREFIX = "__mc_ai_bt_test_plan__:"
+
+
 class BootstrapPlanner:
     """Deterministic planner used until the production LLM planner is enabled."""
 
     def plan(self, intent_text: str, context_json: str = "") -> str:
         text = intent_text.strip()
+        if text.startswith(_TEST_RAW_PLAN_PREFIX):
+            return self._plan_from_raw_injection(text, context_json)
         lowered = text.lower()
         root = self._route_intent(text, lowered)
         goal_spec = self._goal_spec_for(root, text)
@@ -54,6 +68,22 @@ class BootstrapPlanner:
             "schema": "mc_ai_bt.plan.v1",
             "root": root,
             "goal_spec": goal_spec,
+            "context_json": context_json or "{}",
+        }
+        return json.dumps(plan, sort_keys=True, separators=(",", ":"))
+
+    @staticmethod
+    def _plan_from_raw_injection(text: str, context_json: str) -> str:
+        payload = json.loads(text[len(_TEST_RAW_PLAN_PREFIX):])
+        plan = {
+            "schema": "mc_ai_bt.plan.v1",
+            "root": payload["root"],
+            "goal_spec": payload.get("goal_spec")
+            or {
+                "type": "human",
+                "verification": {"mode": "implicit_conversation"},
+                "summary": text,
+            },
             "context_json": context_json or "{}",
         }
         return json.dumps(plan, sort_keys=True, separators=(",", ":"))

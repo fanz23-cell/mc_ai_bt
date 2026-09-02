@@ -110,6 +110,13 @@ PREDICATE_REGISTRY: dict[str, PredicateSpec] = {
     # skill's own evidence fields, read directly by whoever consumes the goal_spec
     # args (e.g. query_world.py), not by this generic predicate check itself.
     "room_scanned": PredicateSpec("room_scanned", ("people",), "people"),
+    # _d_v1_semantic_smoke_test -- deliberately non-production, registered only so
+    # this predicate can pass validator.py's KNOWN_PREDICATE_NAMES check for live
+    # acceptance testing of decision_broker.py's semantic (Omega confirmation)
+    # resolution path end-to-end. Scope "_test" is never populated by mc_world_state,
+    # so this generic snapshot path always reports UNKNOWN for it -- DecisionBroker's
+    # inline resolver is the only thing that can ever actually resolve it.
+    "_d_v1_semantic_smoke_test": PredicateSpec("_d_v1_semantic_smoke_test", ("_test",), "_test"),
 }
 
 
