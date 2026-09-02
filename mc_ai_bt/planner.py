@@ -516,6 +516,25 @@ def build_planner_messages(
                 "correct ONLY when nothing in this plan already ran a locate-type skill for the same target."
             ),
             (
+                # E.1 (2026-09-02): context_json.caller_context.grounded_entities, when
+                # present, is a Bridge-constructed (never Omega-authored) list of
+                # {alias, entity_id, entity_class} objects -- aliases the user has
+                # PREVIOUSLY bound (via remember_entity) to a specific real-world
+                # entity, whose text was found inside THIS intent_text. It establishes
+                # alias -> entity_id identity ONLY -- never current visibility,
+                # position, distance, or task success, all of which still require
+                # real, execution-time WorldState evidence.
+                "If context_json.caller_context.grounded_entities is present and one of its `alias` values "
+                "matches something the user said (e.g. intent_text contains \"33\" or \"小绿\"), use that entry's exact "
+                "`entity_id` value as the `entity_id` arg on approach_entity (alongside `target` as a plain "
+                "human-readable label) instead of inventing a bare class/description search. Never invent an "
+                "entity_id yourself, never copy one from a different alias than the one actually mentioned, "
+                "and never fall back to a class-based target search just because entity_id resolution might "
+                "fail at execution time -- entity_id, once supplied, is never dropped or substituted; a "
+                "genuinely unresolvable one correctly pauses the mission rather than silently approaching "
+                "the nearest same-class instance instead."
+            ),
+            (
                 # Found live 2026-08-30: "find/look for a woman in the room" planned
                 # search_for_entity(target="woman") -> Condition(entity_located). entity_located's real
                 # evidence comes from mc_perception's object/person classifier, which only recognizes a

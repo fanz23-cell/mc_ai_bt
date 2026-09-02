@@ -78,6 +78,19 @@ def test_planner_prompt_warns_against_pre_written_check_conclusions():
     assert "fixed at planning time" in system
 
 
+def test_planner_prompt_explains_grounded_entities():
+    # E.1 (2026-09-02): the model must be told to USE a resolved entity_id
+    # from context_json.caller_context.grounded_entities when present, and
+    # explicitly told never to invent one or fall back to a class-based
+    # search once entity_id resolution might fail at execution time.
+    messages = build_planner_messages("go to 33", "{}")
+    system = messages[0][1]
+
+    assert "grounded_entities" in system
+    assert "entity_id" in system
+    assert "never invent" in system.lower()
+
+
 def test_planner_prompt_lists_wait_for_event_node_type():
     messages = build_planner_messages("wait until a customer raises a hand", "{}")
     system = messages[0][1]
