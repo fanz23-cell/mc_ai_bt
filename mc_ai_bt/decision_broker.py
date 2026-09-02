@@ -91,6 +91,8 @@ from mc_one.msg import AiBtIdentity
 from mc_one.srv import LocalizeObject
 
 from .executor import DecisionOutcome
+from .identity import Identity
+from .ros_identity import identity_to_msg
 
 # FOUND LIVE 2026-08-31 (mc_embodied_skills/node.py's _verify_entity_approached):
 # "walked up to", not "standing on top of" -- mirrored here since this predicate's
@@ -365,7 +367,14 @@ class DecisionBroker:
         if not self._confirmation_client.wait_for_server(timeout_sec=1.0):
             return DecisionOutcome("UNKNOWN", "confirmation channel unavailable")
         goal = RequestHumanConfirmation.Goal()
-        goal.identity = identity if identity is not None else AiBtIdentity()
+        # FOUND LIVE 2026-09-01 (4th-party review): this used to assign `identity`
+        # straight onto goal.identity -- but the identity a mission-bound resolver
+        # actually passes is mc_ai_bt.identity.Identity, a plain internal Python
+        # dataclass, not the real mc_one.msg.AiBtIdentity ROS message this action's
+        # Goal field requires. Every other action adapter in this package (node.py,
+        # skill_adapters.py, visual_client.py) already converts via identity_to_msg()
+        # before crossing this exact boundary; this path just never did.
+        goal.identity = identity_to_msg(identity) if isinstance(identity, Identity) else AiBtIdentity()
         goal.request_id = uuid.uuid4().hex
         goal.prompt = f"{predicate} is unknown: {reason} (args={json.dumps(args, sort_keys=True)})"
         goal.context_json = "{}"

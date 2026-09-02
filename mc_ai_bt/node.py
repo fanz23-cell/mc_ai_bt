@@ -486,12 +486,19 @@ class AiBtNode(Node):
                         message=message,
                     )
             self._publish_event(outcome)
-            if not escalate:
-                # A paused mission keeps holding _active_id (pause() does not
-                # promote the next queued mission, unlike mark_terminal) --
-                # nothing else should start in its place while it is only
-                # waiting on a decision, not actually done.
-                self._start_next_ready()
+            # FOUND LIVE 2026-09-01 (D v1 correctness review): this used to skip
+            # _start_next_ready() whenever escalate=True, on the premise that
+            # "pause() does not promote the next queued mission" -- that premise is
+            # false: mission.py's pause()/_release_slot_for_pause DOES promote an
+            # already-queued mission straight to STATE_PLANNING when one is waiting
+            # (confirmed by reading _promote() directly -- it is pure MissionManager
+            # bookkeeping, it never itself starts planning). Skipping this call left
+            # that newly-promoted mission sitting in STATE_PLANNING forever -- the
+            # same starvation bug the mission.py scheduler fix closed, just on the
+            # "someone was already queued when the other mission paused" side of it
+            # instead of the "submitted afterward" side. _start_next_ready() is a
+            # no-op when nothing is actually ready, so this is safe unconditionally.
+            self._start_next_ready()
         finally:
             with self._mission_lock:
                 if self._mission_cancel_keys.get(mission.identity.mission_id) == runner_key:
@@ -575,6 +582,9 @@ class AiBtNode(Node):
             response.message = str(exc)
             return response
         self._publish_event(event)
+        # See _run_mission's matching comment: pause() can promote an already-queued
+        # mission to STATE_PLANNING, and nothing else was ever going to start it.
+        self._start_next_ready()
         response.success = True
         response.message = event.message
         return response

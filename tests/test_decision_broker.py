@@ -23,7 +23,9 @@ from mc_ai_bt.decision_broker import (  # noqa: E402
     DecisionBroker,
     _match_available_classes,
 )
+from mc_ai_bt.identity import Identity  # noqa: E402
 from mc_one.action import RequestHumanConfirmation  # noqa: E402
+from mc_one.msg import AiBtIdentity  # noqa: E402
 
 
 def _broker(**overrides) -> DecisionBroker:
@@ -461,17 +463,65 @@ def test_resolve_semantic_each_call_gets_a_fresh_request_id():
     assert ids[0] != ids[1]
 
 
-def test_resolve_semantic_sends_the_bound_mission_identity():
+def test_resolve_semantic_converts_the_bound_mission_identity_to_the_real_ros_type():
+    # FOUND LIVE 2026-09-01 (4th-party review): the earlier version of this test used
+    # identity = object() and asserted `is identity` -- which passed even though the
+    # real code path skipped identity_to_msg() entirely and would have handed a bare
+    # internal Identity dataclass straight to a ROS action Goal field expecting a
+    # real AiBtIdentity message (a boundary every OTHER action adapter in this
+    # package already converts at). This test now uses an actual Identity and checks
+    # the real converted type/fields, not object identity of an opaque stand-in.
     client = _FakeConfirmationClient()
     broker = _broker(confirmation_client=client)
-    identity = object()  # a real AiBtIdentity in production; identity is opaque here
+    identity = Identity(
+        mission_id="mission-1", plan_version=3, execution_id="exec-1",
+        parent_mission_id="parent-1", source="voice", operator_id="operator-1",
+    )
 
     broker.resolve(
         predicate=_D_V1_SEMANTIC_SMOKE_TEST_PREDICATE, args={}, reason="u", facts={},
         cancel_event=None, identity=identity,
     )
 
-    assert client.sent_goals[0].identity is identity
+    sent_identity = client.sent_goals[0].identity
+    assert isinstance(sent_identity, AiBtIdentity)
+    assert sent_identity.mission_id == "mission-1"
+    assert sent_identity.plan_version == 3
+    assert sent_identity.execution_id == "exec-1"
+    assert sent_identity.parent_mission_id == "parent-1"
+    assert sent_identity.source == "voice"
+    assert sent_identity.operator_id == "operator-1"
+
+
+def test_resolve_semantic_with_no_identity_sends_an_empty_ros_identity():
+    client = _FakeConfirmationClient()
+    broker = _broker(confirmation_client=client)
+
+    broker.resolve(
+        predicate=_D_V1_SEMANTIC_SMOKE_TEST_PREDICATE, args={}, reason="u", facts={},
+        cancel_event=None, identity=None,
+    )
+
+    assert isinstance(client.sent_goals[0].identity, AiBtIdentity)
+
+
+def test_mission_bound_resolver_forwards_the_real_identity_through_to_ros():
+    # node.py never calls DecisionBroker.resolve() directly -- it always goes through
+    # MissionBoundDecisionResolver.for_mission(mission.identity), which was the actual
+    # path that skipped identity_to_msg(). This exercises THAT wrapper, not just the
+    # broker's own resolve() in isolation.
+    client = _FakeConfirmationClient()
+    broker = _broker(confirmation_client=client)
+    identity = Identity(mission_id="mission-2", plan_version=1, execution_id="exec-2")
+    resolver = MissionBoundDecisionResolver(broker, identity)
+
+    resolver.resolve(
+        predicate=_D_V1_SEMANTIC_SMOKE_TEST_PREDICATE, args={}, reason="u", facts={}, cancel_event=None)
+
+    sent_identity = client.sent_goals[0].identity
+    assert isinstance(sent_identity, AiBtIdentity)
+    assert sent_identity.mission_id == "mission-2"
+    assert sent_identity.execution_id == "exec-2"
 
 
 class _SlowGoalHandle(_FakeGoalHandle):

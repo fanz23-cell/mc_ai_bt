@@ -19,6 +19,7 @@ end-to-end level, since the bug lived in what got written to (and read back from
 shared state between two resolve() calls.
 """
 import json
+import threading
 
 import pytest
 
@@ -28,7 +29,9 @@ pytest.importorskip("mc_one")
 from mc_ai_bt.decision_broker import DecisionBroker, LocateResult  # noqa: E402
 from mc_ai_bt.executor import BtExecutor, DecisionOutcome, ExecutionResult  # noqa: E402
 from mc_ai_bt.goal_check import CheckResult, GoalChecker, TriState  # noqa: E402
+from mc_ai_bt.mission import STATE_PLANNING, STATE_QUEUED, MissionManager  # noqa: E402
 from mc_ai_bt.node import AiBtNode  # noqa: E402
+from mc_one.srv import PauseMission  # noqa: E402
 
 
 class _CountingSkills:
@@ -265,3 +268,74 @@ def test_final_goal_check_handles_invalid_json_without_crashing():
 
     assert outcome.state == "UNKNOWN"
     assert resolver.calls == []
+
+
+# --- scheduler handoff: pause() promoting a queued mission must actually start it --
+# FOUND LIVE 2026-09-01 (4th-party review): mission.py's pause() already promotes an
+# already-queued mission to STATE_PLANNING (pure MissionManager bookkeeping -- see
+# mission.py's own _promote(), which never itself starts planning), but neither
+# _run_mission's escalate branch nor _handle_pause ever called _start_next_ready()
+# afterward -- so the promoted mission sat in STATE_PLANNING forever. A state-only
+# MissionManager test (test_mission_manager.py) cannot catch this at all: it would
+# show `promoted.state == STATE_PLANNING` and call that a pass. This has to be
+# checked at the node.py orchestration level, where the actual "start planning" call
+# happens.
+
+class _FakePlanAndStartAsync:
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, mission):
+        self.calls.append(mission.identity.mission_id)
+
+
+class _FakeNodeSelfForPause:
+    """Just enough of AiBtNode for _handle_pause to run: real MissionManager (so
+    promotion is the genuine mission.py logic, not a stand-in), no cancel_event
+    registered for either mission (skips the skill_executor.cancel_current call
+    entirely), and a recording _plan_and_start_async so _start_next_ready's own
+    effect is directly observable. _start_next_ready is borrowed from the real
+    class -- its own body only touches self._missions/self._mission_lock/
+    self._plan_and_start_async, all provided here -- so _handle_pause's call to it
+    exercises the genuine implementation, not a stand-in of the fix being tested."""
+
+    _start_next_ready = AiBtNode._start_next_ready
+
+    def __init__(self, missions: MissionManager):
+        self._missions = missions
+        self._mission_lock = threading.RLock()
+        self._cancel_events = {}
+        self._mission_cancel_keys = {}
+        self._skill_executor = None
+        self.published = []
+        self._plan_and_start_async = _FakePlanAndStartAsync()
+
+    def _publish_event(self, event):
+        self.published.append(event)
+
+
+def test_handle_pause_actually_starts_a_mission_it_promotes_from_the_queue():
+    manager = MissionManager()
+    accepted, _msg, first, _e = manager.submit(
+        intent_text="first", source="voice", operator_id="user",
+        parent_mission_id="", priority=10, allow_queue=True, context_json="{}")
+    manager.set_plan(first.identity.mission_id, "bt", "goal")
+    accepted, _msg, second, _e = manager.submit(
+        intent_text="second", source="voice", operator_id="user",
+        parent_mission_id="", priority=5, allow_queue=True, context_json="{}")
+    assert accepted and second.state == STATE_QUEUED  # first is still RUNNING
+
+    fake_self = _FakeNodeSelfForPause(manager)
+    request = PauseMission.Request()
+    request.mission_id = first.identity.mission_id
+    request.reason = "awaiting Omega decision"
+    response = PauseMission.Response()
+
+    result = AiBtNode._handle_pause(fake_self, request, response)
+
+    assert result.success
+    promoted = next(m for m in manager.all() if m.identity.mission_id == second.identity.mission_id)
+    assert promoted.state == STATE_PLANNING  # mission.py's own promotion, unchanged
+    # The actual fix: _start_next_ready() must have been called, and it must have
+    # found and started exactly this newly-promoted mission.
+    assert fake_self._plan_and_start_async.calls == [second.identity.mission_id]
