@@ -28,6 +28,55 @@ class ExecutionResult:
     needs_decision: bool = False
 
 
+@dataclass(frozen=True)
+class DecisionOutcome:
+    """What a DecisionResolver produced for one UNKNOWN Condition/GoalCheck.
+
+    state is TRUE/FALSE only when the resolver actually got a real answer in
+    time (a fresh, authoritative re-check for a physical predicate; an actual
+    Omega/human decision for a semantic one) -- UNKNOWN means "no answer yet,
+    do today's existing thing" (needs_decision=True -> mission.py's pause),
+    not "the predicate is false". See DecisionResolver's own docstring for
+    what BtExecutor does and does not know about how this gets produced.
+    """
+
+    state: str  # "TRUE" | "FALSE" | "UNKNOWN"
+    message: str = ""
+
+
+class DecisionResolver(Protocol):
+    """Injected, ROS/agent-free from BtExecutor's point of view -- exactly the
+    same boundary CheckExecutor already draws for goal_check.py's real
+    implementation. BtExecutor calls resolve() and only ever looks at the
+    returned DecisionOutcome.state; it has no idea whether that came from a
+    fresh perception re-check, an Omega confirmation, or nothing at all.
+
+    Called ONLY for a Condition/GoalCheck that just came back UNKNOWN, and
+    ONLY when inline resolution is allowed at this position in the tree (a
+    direct Sequence/Fallback/root position -- never inside Parallel/Retry/
+    Timeout, see execute()'s own _allow_inline_resolution threading). The
+    real implementation decides, per predicate, whether it has a defined
+    resolution policy at all (falling straight through to UNKNOWN if not --
+    that predicate keeps today's exact pause/resume behavior) and whether
+    that policy is a physical evidence-strategy (must re-derive TRUE/FALSE
+    from a real, independently-obtained observation -- never from a bare
+    cognitive assertion) or a semantic/policy one (an external decision is
+    itself the answer). Expected to return within a short, bounded window
+    regardless of which path it takes -- this blocks the calling thread.
+    """
+
+    def resolve(
+        self,
+        *,
+        predicate: str,
+        args: dict[str, Any],
+        reason: str,
+        facts: dict[str, Any],
+        cancel_event: Event | None,
+    ) -> DecisionOutcome:
+        ...
+
+
 class SkillExecutor(Protocol):
     def execute_skill(
         self,
@@ -70,6 +119,7 @@ class BtExecutor:
         cancel_event: Event | None = None,
         checks: CheckExecutor | None = None,
         progress_callback: ProgressCallback | None = None,
+        decision_resolver: DecisionResolver | None = None,
     ) -> ExecutionResult:
         try:
             root = json.loads(root_json)
@@ -81,6 +131,7 @@ class BtExecutor:
             cancel_event=cancel_event,
             checks=checks,
             progress_callback=progress_callback,
+            decision_resolver=decision_resolver,
         )
 
     def execute(
@@ -91,8 +142,10 @@ class BtExecutor:
         checks: CheckExecutor | None = None,
         blackboard: dict[str, Any] | None = None,
         progress_callback: ProgressCallback | None = None,
+        decision_resolver: DecisionResolver | None = None,
         _path: str = "root",
         _progress_state: _ProgressState | None = None,
+        _allow_inline_resolution: bool = True,
     ) -> ExecutionResult:
         if progress_callback is not None and _progress_state is None:
             _progress_state = _ProgressState(max(1, _count_progress_leaves(node)))
@@ -116,8 +169,10 @@ class BtExecutor:
                     checks=checks,
                     blackboard=facts,
                     progress_callback=progress_callback,
+                    decision_resolver=decision_resolver,
                     _path=f"{_path}.children[{idx}]",
                     _progress_state=_progress_state,
+                    _allow_inline_resolution=_allow_inline_resolution,
                 )
                 facts.update(result.facts)
                 if not result.success:
@@ -134,8 +189,10 @@ class BtExecutor:
                     checks=checks,
                     blackboard=facts,
                     progress_callback=progress_callback,
+                    decision_resolver=decision_resolver,
                     _path=f"{_path}.children[{idx}]",
                     _progress_state=_progress_state,
+                    _allow_inline_resolution=_allow_inline_resolution,
                 )
                 facts.update(last.facts)
                 if last.blocked:
@@ -160,6 +217,7 @@ class BtExecutor:
                 progress_callback,
                 _progress_state,
                 _path,
+                decision_resolver,
             )
         if node_type == "Parallel":
             return self._execute_parallel(
@@ -171,6 +229,7 @@ class BtExecutor:
                 progress_callback,
                 _progress_state,
                 _path,
+                decision_resolver,
             )
         if node_type == "Timeout":
             return self._execute_timeout(
@@ -182,6 +241,7 @@ class BtExecutor:
                 progress_callback,
                 _progress_state,
                 _path,
+                decision_resolver,
             )
         if node_type == "NoAction":
             return self._execute_progress_leaf(
@@ -193,14 +253,16 @@ class BtExecutor:
         if node_type == "Condition":
             return self._execute_progress_leaf(
                 _node_label(node, _path),
-                lambda: self._execute_condition(node, checks, facts),
+                lambda: self._execute_condition(
+                    node, checks, facts, decision_resolver, cancel_event, _allow_inline_resolution),
                 progress_callback,
                 _progress_state,
             )
         if node_type == "GoalCheck":
             return self._execute_progress_leaf(
                 _node_label(node, _path),
-                lambda: self._execute_goal_check(node, checks, facts),
+                lambda: self._execute_goal_check(
+                    node, checks, facts, decision_resolver, cancel_event, _allow_inline_resolution),
                 progress_callback,
                 _progress_state,
             )
@@ -284,6 +346,7 @@ class BtExecutor:
         progress_callback: ProgressCallback | None,
         progress_state: _ProgressState | None,
         path: str,
+        decision_resolver: DecisionResolver | None = None,
     ) -> ExecutionResult:
         child = node.get("child")
         if not isinstance(child, dict):
@@ -300,6 +363,9 @@ class BtExecutor:
         for attempt in range(1, max_attempts + 1):
             if cancel_event is not None and cancel_event.is_set():
                 return ExecutionResult(False, "mission canceled", facts)
+            # _allow_inline_resolution=False: a Condition/GoalCheck re-tried multiple
+            # times is not the simple "one direct Sequence position" shape D v1 scopes
+            # inline resolution to -- keep today's exact pause/resume behavior here.
             last = self.execute(
                 child,
                 skills,
@@ -307,8 +373,10 @@ class BtExecutor:
                 checks=checks,
                 blackboard=facts,
                 progress_callback=progress_callback,
+                decision_resolver=decision_resolver,
                 _path=f"{path}.child[{attempt}]",
                 _progress_state=progress_state,
+                _allow_inline_resolution=False,
             )
             facts.update(last.facts)
             if last.blocked:
@@ -331,6 +399,7 @@ class BtExecutor:
         progress_callback: ProgressCallback | None,
         progress_state: _ProgressState | None,
         path: str,
+        decision_resolver: DecisionResolver | None = None,
     ) -> ExecutionResult:
         children = node.get("children")
         if not isinstance(children, list) or not children:
@@ -340,6 +409,10 @@ class BtExecutor:
         results: list[ExecutionResult | None] = [None] * len(children)
 
         def _run(idx: int, child: dict[str, Any]) -> None:
+            # _allow_inline_resolution=False: a sibling branch may still be doing
+            # something physical while this one would otherwise block waiting on a
+            # decision -- D v1 explicitly does not support that (see
+            # DecisionResolver's own docstring); keep today's pause/resume behavior.
             result = self.execute(
                 child,
                 skills,
@@ -347,8 +420,10 @@ class BtExecutor:
                 checks=checks,
                 blackboard=dict(blackboard),
                 progress_callback=progress_callback,
+                decision_resolver=decision_resolver,
                 _path=f"{path}.children[{idx}]",
                 _progress_state=progress_state,
+                _allow_inline_resolution=False,
             )
             results[idx] = result
             if cancel_on_failure and not result.success:
@@ -394,6 +469,7 @@ class BtExecutor:
         progress_callback: ProgressCallback | None,
         progress_state: _ProgressState | None,
         path: str,
+        decision_resolver: DecisionResolver | None = None,
     ) -> ExecutionResult:
         child = node.get("child")
         if not isinstance(child, dict):
@@ -408,6 +484,9 @@ class BtExecutor:
         box: dict[str, ExecutionResult] = {}
 
         def _run() -> None:
+            # _allow_inline_resolution=False: an outer Timeout firing while an inline
+            # decision-wait is still blocked inside is exactly the orphan-thread hazard
+            # D v1 does not take on -- keep today's pause/resume behavior here.
             box["result"] = self.execute(
                 child,
                 skills,
@@ -415,8 +494,10 @@ class BtExecutor:
                 checks=checks,
                 blackboard=dict(blackboard),
                 progress_callback=progress_callback,
+                decision_resolver=decision_resolver,
                 _path=f"{path}.child",
                 _progress_state=progress_state,
+                _allow_inline_resolution=False,
             )
 
         thread = threading.Thread(target=_run, name="bt-timeout-child", daemon=True)
@@ -432,6 +513,9 @@ class BtExecutor:
         node: dict[str, Any],
         checks: CheckExecutor | None,
         facts: dict[str, Any],
+        decision_resolver: DecisionResolver | None = None,
+        cancel_event: Event | None = None,
+        allow_inline_resolution: bool = True,
     ) -> ExecutionResult:
         goal_spec = {
             "type": "structured",
@@ -439,19 +523,30 @@ class BtExecutor:
             "args": node.get("args") or {},
             "verification": node.get("verification") or {"mode": "world_state"},
         }
-        return _check_as_execution_result(checks, goal_spec, facts, label="condition")
+        return _check_as_execution_result(
+            checks, goal_spec, facts, label="condition",
+            decision_resolver=decision_resolver, cancel_event=cancel_event,
+            allow_inline_resolution=allow_inline_resolution,
+        )
 
     def _execute_goal_check(
         self,
         node: dict[str, Any],
         checks: CheckExecutor | None,
         facts: dict[str, Any],
+        decision_resolver: DecisionResolver | None = None,
+        cancel_event: Event | None = None,
+        allow_inline_resolution: bool = True,
     ) -> ExecutionResult:
         check = node.get("check")
         if not isinstance(check, dict):
             return ExecutionResult(False, "goal check requires check object")
         goal_spec = _normalise_goal_check_spec(check)
-        return _check_as_execution_result(checks, goal_spec, facts, label="goal check")
+        return _check_as_execution_result(
+            checks, goal_spec, facts, label="goal check",
+            decision_resolver=decision_resolver, cancel_event=cancel_event,
+            allow_inline_resolution=allow_inline_resolution,
+        )
 
     def _execute_wait_for_event(
         self,
@@ -521,6 +616,9 @@ def _check_as_execution_result(
     facts: dict[str, Any],
     *,
     label: str,
+    decision_resolver: DecisionResolver | None = None,
+    cancel_event: Event | None = None,
+    allow_inline_resolution: bool = True,
 ) -> ExecutionResult:
     if checks is None:
         return ExecutionResult(False, f"{label} checker is not configured", facts, True)
@@ -531,6 +629,26 @@ def _check_as_execution_result(
         return ExecutionResult(True, f"{label} TRUE: {message}", facts)
     if state == "FALSE":
         return ExecutionResult(False, f"{label} FALSE: {message}", facts)
+    # UNKNOWN: try an inline resolution first (D v1) -- never for a predicate/position
+    # the resolver itself doesn't recognize as safe/supported (it just returns UNKNOWN
+    # right back, same as no resolver at all), and never when this position in the
+    # tree isn't a direct Sequence/Fallback/root child (Parallel/Retry/Timeout thread
+    # this through as allow_inline_resolution=False -- see execute()'s own comments).
+    if allow_inline_resolution and decision_resolver is not None:
+        outcome = decision_resolver.resolve(
+            predicate=str(goal_spec.get("predicate") or ""),
+            args=goal_spec.get("args") or {},
+            reason=message,
+            facts=facts,
+            cancel_event=cancel_event,
+        )
+        outcome_state = _tri_state_value(getattr(outcome, "state", "UNKNOWN"))
+        outcome_message = str(getattr(outcome, "message", ""))
+        if outcome_state == "TRUE":
+            return ExecutionResult(True, f"{label} TRUE (resolved): {outcome_message}", facts)
+        if outcome_state == "FALSE":
+            return ExecutionResult(False, f"{label} FALSE (resolved): {outcome_message}", facts)
+        # Still UNKNOWN -- fully unresolved, fall through to exactly today's behavior.
     return ExecutionResult(False, f"{label} UNKNOWN: {message}", facts, True, needs_decision=True)
 
 

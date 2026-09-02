@@ -58,6 +58,7 @@ from .trigger_manager import (
     TriggerManager,
     trigger_decision_matches_mission,
 )
+from .decision_broker import DecisionBroker, LiveObjectLocator
 from .validator import PlanValidator
 from .visual_client import MissionCheckExecutor, VisualCheckClient, VisualCheckSettings
 from .world_state_client import WorldStateClient, WorldStateWriter
@@ -89,6 +90,18 @@ class AiBtNode(Node):
             callback_group=self._client_callback_group,
         )
         self._goal_checker = GoalChecker(self._world_state.snapshot_json)
+        self._live_object_locator = LiveObjectLocator(self, callback_group=self._client_callback_group)
+        # D v1: in-place resolution of an UNKNOWN Condition/GoalCheck for the handful
+        # of predicates with an explicit, bespoke evidence/decision strategy (see
+        # decision_broker.py's own module docstring) -- everything else keeps today's
+        # exact needs_decision=True -> pause/resume path unchanged.
+        self._decision_broker = DecisionBroker(
+            self,
+            checks=self._goal_checker,
+            object_locator=self._live_object_locator,
+            world_writer=self._world_writer,
+            callback_group=self._client_callback_group,
+        )
         self._visual_client = VisualCheckClient(
             self,
             settings=VisualCheckSettings(
@@ -405,6 +418,7 @@ class AiBtNode(Node):
                         active_node,
                         progress,
                     ),
+                    decision_resolver=self._decision_broker,
                 )
             state = STATE_FAILED
             message = execution.message
