@@ -144,9 +144,27 @@ class MissionCheckExecutor:
 
 
 def _allows_visual_fallback(goal_spec: dict[str, Any]) -> bool:
+    """Evidence policy (allowlist, not a blacklist): every "structured" goal_spec
+    names a structured physical predicate (object_visible, entity_approached,
+    robot_at_place, ...) whose truth must come from its own designated
+    authoritative verifier (DecisionBroker's fresh perception/localization
+    checks, world-state facts written by the skill that actually produced
+    them, navigation results, ...) -- never a generative VLM's opinion, even
+    when the goal_spec's own verification.mode string claims to allow it (that
+    string is planner-authored, not a safety boundary). Default-deny for
+    every structured predicate, not an enumerated blacklist a newly added
+    predicate could silently slip through.
+
+    A "visual" goal_spec (free-form visual QA, e.g. VisualCheck BT nodes /
+    robot_observe -- "do you see a red cup?") carries no structured predicate
+    at all, so there is no physical-truth boundary to protect: a VLM's answer
+    IS the intended evidence source for that case, unconditionally allowed.
+    """
     goal_type = goal_spec.get("type")
     if goal_type == "visual":
         return True
+    if goal_type == "structured":
+        return False
     verification = goal_spec.get("verification")
     if not isinstance(verification, dict):
         return False
