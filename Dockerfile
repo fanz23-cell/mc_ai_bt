@@ -1,4 +1,4 @@
-ARG BASE_IMAGE=mindchildren/mc_one:v0.1
+ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 
 # Optional production planner backend. The node still defaults to bootstrap,
