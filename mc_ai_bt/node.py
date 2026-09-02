@@ -102,6 +102,7 @@ class AiBtNode(Node):
             self,
             object_locator=self._live_object_locator,
             person_visible_checker=self._goal_checker,
+            entity_tracks_reader=self._world_state,
             callback_group=self._client_callback_group,
         )
         self._visual_client = VisualCheckClient(

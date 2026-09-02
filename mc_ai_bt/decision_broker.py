@@ -199,6 +199,28 @@ class LiveObjectLocator:
         })
 
 
+def entity_track_by_id(world_json: str, entity_id: str) -> dict[str, Any] | None:
+    """The current entity_tracks value for one specific entity_id, or None if
+    not (or no longer) tracked. Mirrors seattle_lab/mc_embodied_skills/
+    semantic_verifier.py's own entity_track_by_id verbatim (no shared import
+    path between these two Docker images, same convention this whole
+    integration already uses elsewhere)."""
+    try:
+        snapshot = json.loads(world_json) if world_json else {}
+    except json.JSONDecodeError:
+        return None
+    facts = snapshot.get("facts") if isinstance(snapshot, dict) else None
+    scope = facts.get("entity_tracks") if isinstance(facts, dict) else None
+    if not isinstance(scope, dict):
+        return None
+    wanted = str(entity_id or "").strip()
+    for entry in scope.values():
+        value = entry.get("value") if isinstance(entry, dict) else None
+        if isinstance(value, dict) and str(value.get("entity_id") or "") == wanted:
+            return value
+    return None
+
+
 def _match_available_classes(target: str, available: list[str]) -> list[str]:
     """Mirrors mc_embodied_skills/node.py's own _match_available_classes verbatim
     (no shared import path between the two images) -- see that function's docstring
@@ -231,6 +253,7 @@ class DecisionBroker:
         *,
         object_locator: LiveObjectLocator,
         person_visible_checker=None,
+        entity_tracks_reader=None,
         fast_window_sec: float = 4.0,
         poll_interval_sec: float = 0.5,
         confirmation_timeout_sec: float = 4.0,
@@ -241,6 +264,13 @@ class DecisionBroker:
         # Only person_visible ever calls this -- a real CheckExecutor (GoalChecker),
         # used exactly like _run_mission's own checks.check(), never written to.
         self._person_visible_checker = person_visible_checker
+        # C.3: entity_approached(entity_id=...) reads mc_world_state's entity_tracks
+        # scope directly -- WorldStateClient.snapshot_json(scopes, max_age_sec) is
+        # the exact shape needed (node.py already constructs one for GoalChecker),
+        # so this just reuses it rather than requiring a bespoke client type. None
+        # is a legal, honest default: entity_id checks simply stay UNKNOWN without
+        # crashing, same as any other resolver dependency that isn't wired up.
+        self._entity_tracks_reader = entity_tracks_reader
         self._fast_window_sec = max(0.5, float(fast_window_sec))
         self._poll_interval_sec = max(0.1, float(poll_interval_sec))
         self._confirmation_timeout_sec = max(0.5, float(confirmation_timeout_sec))
@@ -296,7 +326,15 @@ class DecisionBroker:
                 return DecisionOutcome("UNKNOWN", "canceled while awaiting resolution")
 
     def _check_entity_approached(self, args: dict[str, Any]) -> DecisionOutcome:
-        target = str(args.get("target") or args.get("entity") or args.get("entity_id") or "").strip()
+        # C.3: entity_id present -> identity-aware path, NEVER the class-based
+        # nearest-instance search below (that fallback is exactly the "confirms
+        # the wrong instance" risk this predicate's own ambiguity guard, a few
+        # lines down, exists to close). `target`/`entity` alone (no entity_id)
+        # keeps today's exact class-based behavior, unchanged.
+        entity_id = str(args.get("entity_id") or "").strip()
+        if entity_id:
+            return self._check_entity_approached_by_id(entity_id)
+        target = str(args.get("target") or args.get("entity") or "").strip()
         if not target:
             return DecisionOutcome("UNKNOWN", "entity_approached requires a target")
         located = self._object_locator.locate(target)
@@ -327,6 +365,32 @@ class DecisionBroker:
             return DecisionOutcome("TRUE", f"{target} is {distance:.2f}m away (fresh check)")
         return DecisionOutcome(
             "FALSE", f"{target} is {distance:.2f}m away, not within {_APPROACH_DISTANCE_TOLERANCE_M}m")
+
+    def _check_entity_approached_by_id(self, entity_id: str) -> DecisionOutcome:
+        """C.3: identity confirmation only -- mc_world_state's entity_tracks
+        ingestion is ALREADY continuously re-running the same association
+        algorithm against every fresh detection (see entity_tracking.py), so a
+        current identity_state of ACTIVE for this exact entity_id already IS
+        the "still confirmed to be this one" answer. Deliberately does NOT
+        independently re-verify distance the way the class-based path above
+        does -- that would need this node to also carry TF (map->base_link),
+        which it does not today; mc_embodied_skills' own entity_id-aware
+        approach_entity path (which DOES have TF) is what actually enforces
+        the distance/approach semantics before this predicate is ever asked to
+        confirm anything. A known, explicit scope boundary, not an oversight.
+        """
+        if self._entity_tracks_reader is None:
+            return DecisionOutcome("UNKNOWN", f"{entity_id}: entity_tracks reader is not configured")
+        world_json = self._entity_tracks_reader.snapshot_json(("entity_tracks",), max_age_sec=self._fast_window_sec)
+        track = entity_track_by_id(world_json, entity_id)
+        if track is None:
+            return DecisionOutcome("UNKNOWN", f"{entity_id}: not currently tracked")
+        state = track.get("identity_state")
+        if state == "ACTIVE":
+            return DecisionOutcome("TRUE", f"{entity_id}: confirmed (identity_state=ACTIVE)")
+        if state == "AMBIGUOUS":
+            return DecisionOutcome("UNKNOWN", f"{entity_id}: currently ambiguous, cannot confirm")
+        return DecisionOutcome("UNKNOWN", f"{entity_id}: not currently confirmed (identity_state={state!r})")
 
     def _check_object_visible(self, args: dict[str, Any]) -> DecisionOutcome:
         object_name = str(

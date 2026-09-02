@@ -241,8 +241,13 @@ DEFAULT_SKILLS: dict[str, SkillSpec] = {
         ("base",),
         "Navigate to an entity's current live position (from locate_entity/perception), "
         "not a preconfigured place -- use this for 'go to <person/object>' when no named "
-        "place applies. Fails if the entity has not been perceived recently.",
-        {"target": "entity|entity_id|object|person"},
+        "place applies. Fails if the entity has not been perceived recently. If a prior "
+        "remember_entity call bound an alias to a specific `entity_id`, pass that "
+        "entity_id too (alongside `target` as a human-readable label) -- this makes the "
+        "approach identity-aware: it navigates to and re-verifies that SPECIFIC tracked "
+        "entity, never falling back to 'nearest same-class instance' the way a bare "
+        "`target` search does.",
+        {"target": "entity|entity_id|object|person", "entity_id": "optional, from remember_entity/entity_tracks"},
         ("entity_approached",),
     ),
     "face_entity": SkillSpec(

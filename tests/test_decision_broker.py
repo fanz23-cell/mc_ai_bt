@@ -6,6 +6,7 @@ unbound-instance pattern used throughout this test suite (e.g.
 test_skill_adapters.py's _executor helper) for anything that would otherwise
 need a live rclpy node.
 """
+import json
 import threading
 
 import pytest
@@ -22,6 +23,7 @@ from mc_ai_bt.decision_broker import (  # noqa: E402
     SEMANTIC_PREDICATES,
     DecisionBroker,
     _match_available_classes,
+    entity_track_by_id,
 )
 from mc_ai_bt.identity import Identity  # noqa: E402
 from mc_one.action import RequestHumanConfirmation  # noqa: E402
@@ -33,6 +35,7 @@ def _broker(**overrides) -> DecisionBroker:
     broker._node = None
     broker._object_locator = overrides.get("object_locator")
     broker._person_visible_checker = overrides.get("person_visible_checker")
+    broker._entity_tracks_reader = overrides.get("entity_tracks_reader")
     broker._fast_window_sec = overrides.get("fast_window_sec", 1.0)
     broker._poll_interval_sec = overrides.get("poll_interval_sec", 0.05)
     broker._confirmation_timeout_sec = overrides.get("confirmation_timeout_sec", 1.0)
@@ -179,6 +182,119 @@ def test_object_visible_ignores_match_count_ambiguity_by_design():
     )
 
     assert outcome.state == "TRUE"
+
+
+# --- C.3: entity_approached(entity_id=...) -- identity-aware, never nearest-class ---
+
+class _FixedEntityTracksReader:
+    def __init__(self, world_json: str) -> None:
+        self._world_json = world_json
+        self.calls = []
+
+    def snapshot_json(self, scopes, max_age_sec):
+        self.calls.append((scopes, max_age_sec))
+        return self._world_json
+
+
+def _tracks_world_json(entries: list[dict]) -> str:
+    scope = {f"t{i}": {"value": v} for i, v in enumerate(entries)}
+    return json.dumps({"facts": {"entity_tracks": scope}})
+
+
+def test_entity_track_by_id_finds_matching_entry_and_ignores_others():
+    world_json = _tracks_world_json([
+        {"entity_id": "person_1", "identity_state": "ACTIVE"},
+        {"entity_id": "chair_1", "identity_state": "ACTIVE"},
+    ])
+    assert entity_track_by_id(world_json, "chair_1") == {"entity_id": "chair_1", "identity_state": "ACTIVE"}
+    assert entity_track_by_id(world_json, "nope") is None
+
+
+def test_entity_track_by_id_handles_missing_or_invalid_snapshot():
+    assert entity_track_by_id("", "x") is None
+    assert entity_track_by_id("not json", "x") is None
+    assert entity_track_by_id(json.dumps({"facts": {}}), "x") is None
+
+
+def test_entity_approached_by_id_true_when_active():
+    reader = _FixedEntityTracksReader(_tracks_world_json([{"entity_id": "person_1", "identity_state": "ACTIVE"}]))
+    broker = _broker(entity_tracks_reader=reader)
+
+    outcome = broker.resolve(
+        predicate="entity_approached", args={"entity_id": "person_1"}, reason="unknown",
+        facts={}, cancel_event=None,
+    )
+
+    assert outcome.state == "TRUE"
+
+
+def test_entity_approached_by_id_unknown_when_ambiguous_never_guesses():
+    reader = _FixedEntityTracksReader(_tracks_world_json([{"entity_id": "person_1", "identity_state": "AMBIGUOUS"}]))
+    broker = _broker(entity_tracks_reader=reader)
+
+    outcome = broker.resolve(
+        predicate="entity_approached", args={"entity_id": "person_1"}, reason="unknown",
+        facts={}, cancel_event=None,
+    )
+
+    assert outcome.state == "UNKNOWN"
+    assert "ambiguous" in outcome.message
+
+
+def test_entity_approached_by_id_unknown_when_not_tracked():
+    reader = _FixedEntityTracksReader(_tracks_world_json([]))
+    broker = _broker(entity_tracks_reader=reader)
+
+    outcome = broker.resolve(
+        predicate="entity_approached", args={"entity_id": "person_1"}, reason="unknown",
+        facts={}, cancel_event=None,
+    )
+
+    assert outcome.state == "UNKNOWN"
+
+
+def test_entity_approached_by_id_unknown_when_stale():
+    reader = _FixedEntityTracksReader(_tracks_world_json([{"entity_id": "person_1", "identity_state": "STALE"}]))
+    broker = _broker(entity_tracks_reader=reader)
+
+    outcome = broker.resolve(
+        predicate="entity_approached", args={"entity_id": "person_1"}, reason="unknown",
+        facts={}, cancel_event=None,
+    )
+
+    assert outcome.state == "UNKNOWN"
+
+
+def test_entity_approached_by_id_never_falls_back_to_class_based_nearest_search():
+    # The core C.3 safety property: even if a `target` is ALSO present
+    # (a human-readable label, per skill_registry.py's own docs), entity_id
+    # takes over the whole decision -- the class-based LiveObjectLocator path
+    # (which would happily confirm "nearest same-class instance") must never
+    # be consulted at all.
+    class _ExplodingLocator:
+        def locate(self, target, *, timeout_sec=2.0):
+            raise AssertionError("class-based locator must not be used when entity_id is present")
+
+    reader = _FixedEntityTracksReader(_tracks_world_json([{"entity_id": "person_1", "identity_state": "ACTIVE"}]))
+    broker = _broker(object_locator=_ExplodingLocator(), entity_tracks_reader=reader)
+
+    outcome = broker.resolve(
+        predicate="entity_approached", args={"entity_id": "person_1", "target": "alice"}, reason="unknown",
+        facts={}, cancel_event=None,
+    )
+
+    assert outcome.state == "TRUE"
+
+
+def test_entity_approached_by_id_unknown_when_reader_not_configured():
+    broker = _broker(entity_tracks_reader=None)
+
+    outcome = broker.resolve(
+        predicate="entity_approached", args={"entity_id": "person_1"}, reason="unknown",
+        facts={}, cancel_event=None,
+    )
+
+    assert outcome.state == "UNKNOWN"
 
 
 def test_entity_approached_stays_unknown_when_target_not_found():
