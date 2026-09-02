@@ -126,6 +126,61 @@ def test_entity_approached_false_when_fresh_locate_is_still_far():
     assert outcome.state == "FALSE"
 
 
+def test_entity_approached_stays_unknown_when_multiple_same_class_matches_are_visible():
+    # A2 ambiguity guard, ahead of C's real entity-identity layer: today's
+    # class-based lookup has no notion of WHICH instance was actually
+    # approached. LocalizeObject.srv sorts nearest-first, so without this
+    # guard a SECOND same-class instance now closer than the one actually
+    # navigated to (e.g. two chairs, robot ends up between them) would
+    # silently confirm "approached" against the wrong one. Must never guess.
+    locator = _FixedLocator(
+        LocateResult("FOUND", fact={"x": 0.1, "y": 0.0, "z": 0.0, "score": 0.8, "match_count": 2})
+    )
+    broker = _broker(object_locator=locator, fast_window_sec=0.1, poll_interval_sec=0.02)
+
+    outcome = broker.resolve(
+        predicate="entity_approached", args={"target": "chair"}, reason="unknown",
+        facts={}, cancel_event=None,
+    )
+
+    assert outcome.state == "UNKNOWN"
+    assert "2 matching instances" in outcome.message
+
+
+def test_entity_approached_true_when_exactly_one_match_even_with_match_count_field_present():
+    # Regression: match_count=1 (the normal/common case) must not accidentally
+    # trip the ambiguity guard.
+    locator = _FixedLocator(
+        LocateResult("FOUND", fact={"x": 0.5, "y": 0.0, "z": 0.0, "score": 0.8, "match_count": 1})
+    )
+    broker = _broker(object_locator=locator)
+
+    outcome = broker.resolve(
+        predicate="entity_approached", args={"target": "chair"}, reason="unknown",
+        facts={}, cancel_event=None,
+    )
+
+    assert outcome.state == "TRUE"
+
+
+def test_object_visible_ignores_match_count_ambiguity_by_design():
+    # object_visible only asks "is ANY instance of this class visible" --
+    # identity/which-instance is irrelevant to that question, unlike
+    # entity_approached's "did I successfully reach THIS ONE". The ambiguity
+    # guard must be scoped to entity_approached only.
+    locator = _FixedLocator(
+        LocateResult("FOUND", fact={"x": 0.5, "y": 0.0, "z": 0.0, "score": 0.8, "match_count": 3})
+    )
+    broker = _broker(object_locator=locator)
+
+    outcome = broker.resolve(
+        predicate="object_visible", args={"name": "chair"}, reason="unknown",
+        facts={}, cancel_event=None,
+    )
+
+    assert outcome.state == "TRUE"
+
+
 def test_entity_approached_stays_unknown_when_target_not_found():
     # A single missed fresh locate is not proof the approach failed.
     locator = _FixedLocator(LocateResult("NOT_FOUND", reason="not found"))

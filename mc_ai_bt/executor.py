@@ -10,6 +10,19 @@ from typing import Any, Callable, Protocol
 from .visual_check import visual_check_goal_spec
 
 
+# A2: which (skill, predicate) pairs may have their Action-level
+# blocked=True postcondition escalated to DecisionBroker at all. Explicit
+# allowlist, not "any skill whose evidence_json happens to carry a
+# _resolution_request key" -- keeps a future skill's mistaken/unrelated
+# evidence field from silently triggering resolution against a predicate it
+# was never vetted for. Only entity_approached has an authoritative
+# DecisionBroker resolver among PHYSICAL_PREDICATES today, so approach_entity
+# is the only entry -- see decision_broker.py's own PHYSICAL_PREDICATES.
+ACTION_POSTCONDITION_POLICY: dict[str, set[str]] = {
+    "approach_entity": {"entity_approached"},
+}
+
+
 @dataclass(frozen=True)
 class ExecutionResult:
     success: bool
@@ -156,7 +169,11 @@ class BtExecutor:
         if node_type == "Action":
             return self._execute_progress_leaf(
                 _node_label(node, _path),
-                lambda: self._execute_action(node, skills, cancel_event),
+                lambda: self._execute_action(
+                    node, skills, cancel_event,
+                    decision_resolver=decision_resolver,
+                    allow_inline_resolution=_allow_inline_resolution,
+                ),
                 progress_callback,
                 _progress_state,
             )
@@ -306,6 +323,9 @@ class BtExecutor:
         node: dict[str, Any],
         skills: SkillExecutor,
         cancel_event: Event | None,
+        *,
+        decision_resolver: DecisionResolver | None = None,
+        allow_inline_resolution: bool = True,
     ) -> ExecutionResult:
         skill = node.get("skill")
         args = node.get("args") or {}
@@ -316,7 +336,68 @@ class BtExecutor:
         timeout = _optional_positive_timeout(node)
         if isinstance(timeout, str):
             return ExecutionResult(False, timeout)
-        return skills.execute_skill(skill, args, cancel_event, timeout_sec=timeout)
+        result = skills.execute_skill(skill, args, cancel_event, timeout_sec=timeout)
+        return self._resolve_action_postcondition(
+            skill, args, result, decision_resolver, allow_inline_resolution, cancel_event)
+
+    def _resolve_action_postcondition(
+        self,
+        skill: str,
+        args: dict[str, Any],
+        result: ExecutionResult,
+        decision_resolver: DecisionResolver | None,
+        allow_inline_resolution: bool,
+        cancel_event: Event | None,
+    ) -> ExecutionResult:
+        """A2: the physical action already ran -- this is the ONLY place that
+        happens, exactly once, regardless of what follows. If the skill's own
+        post-execution verification came back genuinely unknown (a specific,
+        reserved evidence shape, never inferred from a bare `blocked=True`),
+        try DecisionBroker's fresh-evidence resolver ONE more time, still
+        within this same Action node, before mc_ai_bt's mission-level
+        escalation logic ever sees this result. Gated by
+        ACTION_POSTCONDITION_POLICY so an unrelated skill's evidence_json
+        cannot accidentally trigger a resolver call for a predicate it was
+        never approved for.
+
+        Still-UNKNOWN after the resolver's own attempt is returned as an
+        ordinary blocked=True, needs_decision=False failure -- node.py's
+        _run_mission maps that to a terminal STATE_BLOCKED (mark_terminal),
+        never mission.py's pause()/resume(). This is deliberate, not an
+        oversight: resume() replays the BT from its root (proven earlier this
+        integration effort), which would re-run this Action -- an already-
+        executed physical side effect -- a second time. A dead end that
+        cannot be safely retried without repeating a real-world action is a
+        BLOCKED mission, not a resumable one.
+        """
+        if not result.blocked:
+            return result
+        request = result.facts.get("_resolution_request") if isinstance(result.facts, dict) else None
+        if not isinstance(request, dict) or request.get("kind") != "postcondition_unknown":
+            return result
+        predicate = str(request.get("predicate") or "")
+        approved = ACTION_POSTCONDITION_POLICY.get(skill) or set()
+        if not predicate or predicate not in approved:
+            return result
+        if not allow_inline_resolution or decision_resolver is None:
+            return result
+        resolver_args = request.get("args") if isinstance(request.get("args"), dict) else args
+        outcome = decision_resolver.resolve(
+            predicate=predicate, args=resolver_args, reason=result.message,
+            facts=result.facts, cancel_event=cancel_event,
+        )
+        state = _tri_state_value(getattr(outcome, "state", "UNKNOWN"))
+        message = str(getattr(outcome, "message", ""))
+        if state == "TRUE":
+            return ExecutionResult(True, f"{skill} succeeded (resolved): {message}", result.facts)
+        if state == "FALSE":
+            return ExecutionResult(False, f"{skill} failed (resolved): {message}", result.facts)
+        return ExecutionResult(
+            False,
+            f"{skill} blocked, postcondition unresolved after side effect "
+            f"(POSTCONDITION_UNRESOLVED_AFTER_SIDE_EFFECT): {result.message}",
+            result.facts, blocked=True, needs_decision=False,
+        )
 
     def _execute_wait(
         self,

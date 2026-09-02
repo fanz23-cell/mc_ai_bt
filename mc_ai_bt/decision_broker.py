@@ -195,6 +195,7 @@ class LiveObjectLocator:
         return LocateResult("FOUND", fact={
             "x": float(nearest.x), "y": float(nearest.y), "z": float(nearest.z),
             "score": float(nearest.score), "available": available,
+            "match_count": len(objects),
         })
 
 
@@ -307,6 +308,20 @@ class DecisionBroker:
             # already established.
             return DecisionOutcome("UNKNOWN", f"{target}: {located.reason}")
         fact = located.fact
+        match_count = int(fact.get("match_count") or 1)
+        if match_count > 1:
+            # Ambiguity guard (A2, ahead of C's real entity-identity layer): today's
+            # class-based lookup has no notion of WHICH instance was actually
+            # approached -- LocalizeObject.srv sorts nearest-first and this code used
+            # to just trust objects[0], so a second same-class instance now closer
+            # than the one actually navigated to (e.g. two chairs, robot ends up
+            # between them) would silently confirm "approached" against the WRONG
+            # instance. Never guess which one is real; C's entity_id-aware
+            # verification replaces this with genuine same-entity association.
+            return DecisionOutcome(
+                "UNKNOWN",
+                f"{target}: {match_count} matching instances currently visible, cannot confirm which one was approached",
+            )
         distance = math.hypot(float(fact["x"]), float(fact["y"]))
         if distance <= _APPROACH_DISTANCE_TOLERANCE_M:
             return DecisionOutcome("TRUE", f"{target} is {distance:.2f}m away (fresh check)")

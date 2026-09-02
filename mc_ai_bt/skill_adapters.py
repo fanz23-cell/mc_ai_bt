@@ -430,10 +430,20 @@ class RosSkillExecutor:
             skill_status = int(getattr(result, "status", EmbodiedSkill.Goal.STATUS_UNKNOWN))
             success = bool(getattr(result, "success", False))
             if status != GoalStatus.STATUS_SUCCEEDED or not success:
+                blocked = _is_blocked(skill_status)
+                # A2: evidence_json used to be silently discarded on this whole
+                # branch -- only parsed when blocked, so a skill's own
+                # "_resolution_request" marker (see decision_broker.py's
+                # ACTION_POSTCONDITION_POLICY / executor.py's
+                # _resolve_action_postcondition) can actually reach the executor.
+                # Harmless for every skill that doesn't use this: its facts just
+                # go unread, exactly as before.
+                blocked_facts = _loads_evidence_json(str(getattr(result, "evidence_json", "") or "")) if blocked else {}
                 return ExecutionResult(
                     False,
                     f"{skill_name} blocked/failed: {message}",
-                    blocked=_is_blocked(skill_status),
+                    blocked_facts,
+                    blocked=blocked,
                 )
             facts = _loads_evidence_json(str(getattr(result, "evidence_json", "") or ""))
             execution = ExecutionResult(True, message or f"{skill_name} succeeded", facts)
