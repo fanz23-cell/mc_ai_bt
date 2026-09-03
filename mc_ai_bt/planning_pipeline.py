@@ -205,8 +205,23 @@ def _apply_grounding_normalizer(plan: dict[str, Any], context_json: str) -> str 
 # locate_entity are unaffected -- they carry an explicit target entity
 # reference of their own, independently compared against the terminal
 # action's target below, so keeping them redundant-eligible loses nothing.
-_REDUNDANT_LOCATE_SKILLS = frozenset({"search_for_entity", "locate_entity"})
-_SELF_LOCATING_TERMINAL_SKILLS = frozenset({"remember_person", "remember_entity"})
+#
+# D1 (2026-09-03, GPT review): these used to be hand-written literal sets --
+# exactly the "one more place to forget" pattern policy_guard.py's own
+# PHYSICAL_SKILLS/PREDICATE_TO_SKILLS derivation comment already warns
+# about (that file was hand-copying skill-name sets independently until a
+# real production bug traced back to one drifting out of sync). Computed
+# from skill_registry.py's own subsumes_locate_skills field instead: adding
+# a new self-locating skill now means declaring it there, once -- these two
+# sets recompute automatically, the same pattern PHYSICAL_SKILLS uses.
+_SELF_LOCATING_TERMINAL_SKILLS = frozenset(
+    name for name, spec in DEFAULT_SKILLS.items() if spec.subsumes_locate_skills
+)
+_REDUNDANT_LOCATE_SKILLS = frozenset(
+    skill
+    for spec in DEFAULT_SKILLS.values()
+    for skill in spec.subsumes_locate_skills
+)
 
 
 def _redundant_locate_matches_terminal(action: dict[str, Any], terminal_target: str) -> bool:

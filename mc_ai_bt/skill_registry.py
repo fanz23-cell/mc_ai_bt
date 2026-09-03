@@ -37,6 +37,20 @@ class SkillSpec:
     # filtering). "experimental": implemented but not yet trusted enough to plan with by
     # default -- reserved for future use, currently unused.
     status: str = "available"
+    # 2026-09-03 (GPT review, D1): which OTHER skill names this skill already
+    # performs internally, making a separate planned Action for them purely
+    # redundant -- e.g. remember_entity/remember_person locate the target
+    # themselves (turning to look if needed), so a planner-authored
+    # search_for_entity/locate_entity Action immediately before one of them
+    # is dead weight. planning_pipeline.py's canonicalizer derives its
+    # redundant-skill set from this field instead of a hand-maintained
+    # literal set -- the exact "one more place to forget" pattern
+    # `dispatch`'s own comment above already warns about. Deliberately does
+    # NOT include look_at: its direction arg can itself carry reference
+    # semantics (see planning_pipeline.py's own D0 comment for the real,
+    # live information-loss bug that caused), so it is never safe to treat
+    # as unconditionally redundant.
+    subsumes_locate_skills: tuple[str, ...] = ()
 
 
 # Real clip names from the animation library (mc_one_codey/*/context/animations/clips/),
@@ -296,6 +310,7 @@ DEFAULT_SKILLS: dict[str, SkillSpec] = {
         "result), `name` is what to call them.",
         {"target": "entity|entity_id|person", "name": "name to bind"},
         ("person_named",),
+        subsumes_locate_skills=("search_for_entity", "locate_entity"),
     ),
     # C.2 (2026-09-02): remember_person's generalization to any entity_tracks-
     # tracked class (person, chair, potted plant, ...), not just people --
@@ -322,6 +337,7 @@ DEFAULT_SKILLS: dict[str, SkillSpec] = {
          "entity_id": "optional, exact entity_tracks id from a prior locate/search/approach result",
          "alias": "alias to bind"},
         ("entity_alias_bound",),
+        subsumes_locate_skills=("search_for_entity", "locate_entity"),
     ),
     # FOUND LIVE 2026-08-31: "turn around and count everyone in the room" is one
     # reasonable request, but needing several separate simple_move turns to do it
