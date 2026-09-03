@@ -564,6 +564,29 @@ def build_planner_messages(
                 "forcing search_for_entity on a name it cannot possibly resolve."
             ),
             (
+                # Found live 2026-09-03 (E.1 final closed-loop test): three real,
+                # unmodified attempts at "remember this person as 33" / "there is a
+                # person right in front of you, remember them as 33" all planned a
+                # SEPARATE look_at or search_for_entity Action before remember_person/
+                # remember_entity, producing a plan with two physical skills and no
+                # structured goal_spec -- PolicyGuard correctly refused every one of
+                # them ("a physical mission must declare a structured goal_spec.
+                # predicate"), since the deterministic single-action auto-fill (see
+                # planning_pipeline.py's _apply_deterministic_goal_spec) deliberately
+                # only fills in the unambiguous single-physical-action case, on
+                # purpose, never a two-physical-action one. remember_person/
+                # remember_entity's own descriptions already say they locate the
+                # target first internally (turning to look if needed) -- exactly the
+                # same work search_for_entity/look_at would separately do.
+                "remember_person and remember_entity already locate the target "
+                "themselves before binding (turning to look if needed, the same work "
+                "search_for_entity/look_at would do) -- never plan a separate look_at "
+                "or search_for_entity Action immediately before remember_person/"
+                "remember_entity for the same target; call remember_person/"
+                "remember_entity directly as the plan's only physical Action so the "
+                "goal_spec can be filled in unambiguously."
+            ),
+            (
                 "Never write a say node whose text states the outcome of a Condition/GoalCheck/"
                 "VisualCheck/check_relation/locate_entity-family step that has not run yet -- a say node's "
                 "text is fixed at planning time, before any check has actually executed, so writing 'Yes, "
