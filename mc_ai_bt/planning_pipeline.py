@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .context_builder import ContextBuilder
+from .goal_check import _normalize_alias
 from .mission import Mission
 from .planner import Planner
 from .policy_guard import PHYSICAL_SKILLS, PolicyGuard
@@ -44,6 +45,108 @@ def _physical_actions_in(node: Any) -> list[dict[str, Any]]:
         if skill in PHYSICAL_SKILLS:
             found.append(node)
     return found
+
+
+def _all_actions_in(node: Any) -> list[dict[str, Any]]:
+    """Every {"type": "Action"} node anywhere in the tree, regardless of
+    skill -- broader than _physical_actions_in above, since entity_id
+    grounding (below) applies to any skill that accepts an entity_id arg,
+    not just physical ones."""
+    found: list[dict[str, Any]] = []
+    if not isinstance(node, dict):
+        return found
+    node_type = node.get("type")
+    if node_type in {"Sequence", "Fallback", "Parallel"}:
+        for child in node.get("children", []) or []:
+            found.extend(_all_actions_in(child))
+        return found
+    if node_type in {"Retry", "Timeout"}:
+        return _all_actions_in(node.get("child"))
+    if node_type == "Action":
+        found.append(node)
+    return found
+
+
+def _grounded_entity_ids(context_json: str) -> dict[str, str]:
+    """normalized alias -> entity_id, from context_json.caller_context.
+    grounded_entities (E.1, mc_voice_pipeline_legacy's RobotGatewayBridge --
+    a real, Bridge-constructed, never-Omega-authored identity source, see
+    that repo's own _grounded_entities_for_intent). Empty dict if absent or
+    malformed -- never raises."""
+    try:
+        context = json.loads(context_json) if context_json else {}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    caller_context = context.get("caller_context") if isinstance(context, dict) else None
+    if not isinstance(caller_context, dict):
+        return {}
+    grounded = caller_context.get("grounded_entities")
+    if not isinstance(grounded, list):
+        return {}
+    result: dict[str, str] = {}
+    for entry in grounded:
+        if not isinstance(entry, dict):
+            continue
+        alias = str(entry.get("alias") or "")
+        entity_id = str(entry.get("entity_id") or "")
+        if alias and entity_id:
+            result[_normalize_alias(alias)] = entity_id
+    return result
+
+
+def _apply_grounding_normalizer(plan: dict[str, Any], context_json: str) -> str | None:
+    """E.1 follow-up (2026-09-03, GPT spec): planner.py's own system prompt
+    already INSTRUCTS the model to copy an exact entity_id from
+    context_json.caller_context.grounded_entities when the intent
+    references a bound alias, and to never invent one -- but instruction
+    compliance from a real LLM is not a guarantee, and entity identity is
+    exactly the kind of physical-truth boundary A1's evidence policy
+    already established must never rest on a generative model's say-so
+    alone. This is the deterministic enforcement layer:
+
+    - VALIDATION: any entity_id an Action node actually specifies must be
+      one of THIS mission's real grounded_entities -- anything else
+      (hallucinated outright, or copied from a different alias than the
+      one the intent actually mentioned) is rejected before the plan ever
+      reaches PolicyGuard or execution. Returns a non-empty error message
+      in this case.
+    - INJECTION: any Action node whose `target` (a plain human-readable
+      label) exactly matches -- after the SAME NFKC+strip+casefold
+      normalization the alias binding itself uses -- one grounded alias,
+      and does not already carry an entity_id, gets the correct entity_id
+      filled in automatically. This is not a guess: it is copying identity
+      data the mission's own real grounding source already established:
+      the model correctly identified WHO was meant (used the right target
+      text) but simply did not also copy entity_id despite the
+      instruction. A target that does not exactly match any grounded
+      alias is left alone entirely -- normal class-based behavior,
+      unchanged from before this fix.
+
+    Mutates `plan` in place for the injection case. Returns None when the
+    plan needs no rejection (whether or not anything was injected).
+    """
+    grounded = _grounded_entity_ids(context_json)
+    for action in _all_actions_in(plan.get("root")):
+        args = action.get("args") if isinstance(action.get("args"), dict) else None
+        if args is None:
+            continue
+        entity_id = str(args.get("entity_id") or "").strip()
+        if entity_id:
+            if entity_id not in grounded.values():
+                skill = str(action.get("skill") or "")
+                return (
+                    f"plan uses entity_id {entity_id!r} on skill {skill!r} that does not match "
+                    "any of this mission's grounded_entities -- entity_id must come from "
+                    "context_json.caller_context.grounded_entities, never invented"
+                )
+            continue  # already has a validated entity_id -- nothing to inject
+        target = str(args.get("target") or "").strip()
+        if not target:
+            continue
+        matched_entity_id = grounded.get(_normalize_alias(target))
+        if matched_entity_id:
+            args["entity_id"] = matched_entity_id
+    return None
 
 
 def _apply_deterministic_goal_spec(plan: dict[str, Any]) -> None:
@@ -141,6 +244,16 @@ class PlanningPipeline:
                 False,
                 "validator",
                 f"invalid json after validation: {exc}",
+                context_json=context_json,
+                plan_json=plan_json,
+            )
+
+        grounding_error = _apply_grounding_normalizer(plan, context_json)
+        if grounding_error:
+            return PlanningResult(
+                False,
+                "grounding",
+                grounding_error,
                 context_json=context_json,
                 plan_json=plan_json,
             )

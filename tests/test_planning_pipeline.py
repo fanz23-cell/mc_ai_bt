@@ -21,7 +21,7 @@ class RaisingPlanner:
         raise RuntimeError("no model")
 
 
-def _mission(intent: str = "go to test_place"):
+def _mission(intent: str = "go to test_place", context_json: str = '{"language":"en-US"}'):
     manager = MissionManager()
     _accepted, _message, mission, _event = manager.submit(
         intent_text=intent,
@@ -30,7 +30,7 @@ def _mission(intent: str = "go to test_place"):
         parent_mission_id="",
         priority=10,
         allow_queue=True,
-        context_json='{"language":"en-US"}',
+        context_json=context_json,
     )
     return mission, manager.all()
 
@@ -104,7 +104,12 @@ def _implicit_plan_with_single_action(skill: str, args: dict) -> str:
 
 
 def test_planning_pipeline_fills_in_the_only_possible_goal_predicate():
-    mission, missions = _mission("go check on 33")
+    mission, missions = _mission(
+        "go check on 33",
+        context_json=json.dumps({
+            "grounded_entities": [{"alias": "33", "entity_id": "person_bad0fefe"}],
+        }),
+    )
     plan_json = _implicit_plan_with_single_action(
         "approach_entity", {"target": "33", "entity_id": "person_bad0fefe"})
 
@@ -213,3 +218,82 @@ def test_planning_pipeline_reports_policy_error():
     assert not result.ok
     assert result.stage == "policy"
     assert "1m" in result.message
+
+
+# --- GroundingNormalizer (2026-09-03, E.1 follow-up) -----------------------
+# planner.py's system prompt already INSTRUCTS the model to copy an exact
+# entity_id from context_json.caller_context.grounded_entities and never
+# invent one -- these tests cover the deterministic enforcement of that same
+# rule, independent of whether the LLM actually complied.
+
+def _grounded_context(*entries: dict) -> str:
+    return json.dumps({"grounded_entities": list(entries)})
+
+
+def test_grounding_normalizer_accepts_an_entity_id_that_matches_grounded_entities():
+    mission, missions = _mission(
+        "go check on 33",
+        context_json=_grounded_context({"alias": "33", "entity_id": "person_real0001"}),
+    )
+    plan_json = _implicit_plan_with_single_action(
+        "approach_entity", {"target": "33", "entity_id": "person_real0001"})
+
+    result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
+
+    assert result.ok, result.message
+
+
+def test_grounding_normalizer_rejects_a_hallucinated_entity_id():
+    mission, missions = _mission(
+        "go check on 33",
+        context_json=_grounded_context({"alias": "33", "entity_id": "person_real0001"}),
+    )
+    plan_json = _implicit_plan_with_single_action(
+        "approach_entity", {"target": "33", "entity_id": "person_made_up"})
+
+    result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
+
+    assert not result.ok
+    assert result.stage == "grounding"
+    assert "person_made_up" in result.message
+
+
+def test_grounding_normalizer_rejects_an_entity_id_when_nothing_is_grounded():
+    mission, missions = _mission("go check on 33")  # default context has no grounded_entities
+    plan_json = _implicit_plan_with_single_action(
+        "approach_entity", {"target": "33", "entity_id": "person_made_up"})
+
+    result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
+
+    assert not result.ok
+    assert result.stage == "grounding"
+
+
+def test_grounding_normalizer_injects_entity_id_from_an_exact_alias_match():
+    mission, missions = _mission(
+        "go check on 33",
+        context_json=_grounded_context({"alias": "33", "entity_id": "person_real0001"}),
+    )
+    # No entity_id -- as if the planner correctly picked the right target but
+    # forgot to also copy the id, despite the instruction.
+    plan_json = _implicit_plan_with_single_action("approach_entity", {"target": "33"})
+
+    result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
+
+    assert result.ok, result.message
+    goal_spec = json.loads(result.goal_spec_json)
+    assert goal_spec["args"]["entity_id"] == "person_real0001"
+
+
+def test_grounding_normalizer_leaves_a_target_alone_when_no_alias_matches():
+    mission, missions = _mission(
+        "go check on the stranger",
+        context_json=_grounded_context({"alias": "33", "entity_id": "person_real0001"}),
+    )
+    plan_json = _implicit_plan_with_single_action("approach_entity", {"target": "the stranger"})
+
+    result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
+
+    assert result.ok, result.message
+    goal_spec = json.loads(result.goal_spec_json)
+    assert "entity_id" not in goal_spec["args"]
