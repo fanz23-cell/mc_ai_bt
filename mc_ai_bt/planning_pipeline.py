@@ -122,6 +122,18 @@ def _apply_grounding_normalizer(plan: dict[str, Any], context_json: str) -> str 
       alias is left alone entirely -- normal class-based behavior,
       unchanged from before this fix.
 
+    FOUND LIVE 2026-09-03 (GPT review): the check below used to be flat
+    set-membership against ALL of this mission's grounded entity_ids
+    (`entity_id not in grounded.values()`) -- correct with only one alias
+    grounded, wrong the moment two or more are: with both "33"->A and
+    "22"->B grounded, target="33"+entity_id=B used to PASS, because B is a
+    real grounded id, just for the WRONG alias -- exactly the cross-wired
+    mistake this stage exists to catch. Now: when `target` itself exactly
+    matches a grounded alias, entity_id (if present) must equal THAT
+    alias's own entity_id, not merely be somewhere in the grounded set. The
+    flat membership check remains as the fallback for a target that is not
+    itself a recognizable alias.
+
     Mutates `plan` in place for the injection case. Returns None when the
     plan needs no rejection (whether or not anything was injected).
     """
@@ -131,21 +143,28 @@ def _apply_grounding_normalizer(plan: dict[str, Any], context_json: str) -> str 
         if args is None:
             continue
         entity_id = str(args.get("entity_id") or "").strip()
+        target = str(args.get("target") or "").strip()
+        expected_entity_id = grounded.get(_normalize_alias(target)) if target else None
+
         if entity_id:
-            if entity_id not in grounded.values():
-                skill = str(action.get("skill") or "")
+            skill = str(action.get("skill") or "")
+            if expected_entity_id is not None:
+                if entity_id != expected_entity_id:
+                    return (
+                        f"plan uses entity_id {entity_id!r} on skill {skill!r} whose target "
+                        f"{target!r} is grounded to a DIFFERENT entity_id ({expected_entity_id!r}) "
+                        "-- entity_id must match the specific alias actually mentioned, never a "
+                        "different one from this mission's grounded_entities"
+                    )
+            elif entity_id not in grounded.values():
                 return (
                     f"plan uses entity_id {entity_id!r} on skill {skill!r} that does not match "
                     "any of this mission's grounded_entities -- entity_id must come from "
                     "context_json.caller_context.grounded_entities, never invented"
                 )
             continue  # already has a validated entity_id -- nothing to inject
-        target = str(args.get("target") or "").strip()
-        if not target:
-            continue
-        matched_entity_id = grounded.get(_normalize_alias(target))
-        if matched_entity_id:
-            args["entity_id"] = matched_entity_id
+        if expected_entity_id:
+            args["entity_id"] = expected_entity_id
     return None
 
 
@@ -156,30 +175,114 @@ def _apply_grounding_normalizer(plan: dict[str, Any], context_json: str) -> str 
 # look_at or search_for_entity Action immediately before remember_person/
 # remember_entity despite an added planner.py prompt instruction against
 # it (prompting an LLM is never a guarantee, and this one measurably did
-# not change its behavior on retry). Rather than keep iterating on prompt
-# wording indefinitely, this closes the gap deterministically instead: a
-# plan whose only non-redundant physical action is a remember_person/
-# remember_entity call, preceded by nothing but locate-type skills whose
-# own result is not what a "remember" intent's goal actually is, is exactly
-# as unambiguous as the single-physical-action case below -- the
-# preparatory actions are structurally vestigial once the terminal skill's
-# own documented behavior already subsumes them.
+# not change its behavior on retry). A first fix only made the goal_spec
+# auto-fill below TREAT the redundant action as if absent -- but the BT
+# tree itself was untouched, so the redundant action still actually
+# EXECUTED (confirmed live: active_node became the redundant look_at, which
+# then failed for an unrelated reason -- a robot/sim torso-control
+# degradation -- meaning that Action being left in the tree at all was
+# itself blocking the mission, not just noise). FOUND LIVE 2026-09-03 (GPT
+# review): fixed properly now as a real plan-rewrite (canonicalization)
+# instead of a goal-spec-only workaround -- the redundant action is
+# actually removed from the tree that gets executed, not merely skipped
+# when deriving the goal.
 _REDUNDANT_LOCATE_SKILLS = frozenset({"look_at", "search_for_entity", "locate_entity"})
 _SELF_LOCATING_TERMINAL_SKILLS = frozenset({"remember_person", "remember_entity"})
 
 
-def _terminal_self_locating_action(actions: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """The single remember_person/remember_entity Action in `actions`, if every
-    OTHER action in the list is one of the redundant locate-type skills its own
-    SkillSpec description says it already performs internally -- None otherwise
-    (zero or 2+ remember-type actions, or a non-locate action alongside one)."""
+def _redundant_locate_matches_terminal(action: dict[str, Any], terminal_target: str) -> bool:
+    """True if `action` (a look_at/search_for_entity/locate_entity Action) is
+    safe to drop as a redundant duplicate of the terminal remember_person/
+    remember_entity action's own internal locate step.
+
+    look_at's real args_schema (skill_registry.py) is direction-only --
+    {"direction": "direction"}, no entity reference at all -- so it can
+    never assert a conflicting target in the first place; always safe.
+    search_for_entity/locate_entity DO carry a real target entity reference
+    (their own args_schema is {"target": ...}) -- only safe to drop when it
+    normalizes to the SAME target the terminal action itself names. A
+    search/locate for something else entirely (e.g. search_for_entity
+    target="chair" ahead of remember_person target="the person") must never
+    be silently dropped -- it may be there for an unrelated reason."""
+    if str(action.get("skill") or "") == "look_at":
+        return True
+    args = action.get("args") if isinstance(action.get("args"), dict) else {}
+    action_target = _normalize_alias(str(args.get("target") or ""))
+    return bool(terminal_target) and action_target == terminal_target
+
+
+def _terminal_self_locating_action(
+    actions: list[dict[str, Any]],
+) -> tuple[dict[str, Any], list[dict[str, Any]]] | None:
+    """(terminal, redundant_prefix_actions) for a plan whose only
+    non-redundant physical action is remember_person/remember_entity, where
+    every other physical action is a locate-type skill that ALSO targets
+    the same entity as the terminal action (see
+    _redundant_locate_matches_terminal) -- None if the pattern does not
+    hold (zero or 2+ remember-type actions, a non-locate action alongside
+    one, or a locate action that targets something else)."""
     terminal = [a for a in actions if str(a.get("skill") or "") in _SELF_LOCATING_TERMINAL_SKILLS]
     if len(terminal) != 1:
         return None
-    others = [a for a in actions if a is not terminal[0]]
-    if any(str(a.get("skill") or "") not in _REDUNDANT_LOCATE_SKILLS for a in others):
-        return None
-    return terminal[0]
+    term = terminal[0]
+    term_args = term.get("args") if isinstance(term.get("args"), dict) else {}
+    term_target = _normalize_alias(str(term_args.get("target") or ""))
+    others = [a for a in actions if a is not term]
+    for a in others:
+        if str(a.get("skill") or "") not in _REDUNDANT_LOCATE_SKILLS:
+            return None
+        if not _redundant_locate_matches_terminal(a, term_target):
+            return None
+    return term, others
+
+
+def _without_redundant_locate_actions(node: Any, redundant_ids: set[int]) -> Any | None:
+    """A copy of `node` with any Action node whose id() is in redundant_ids
+    removed -- dropped from a Sequence/Fallback/Parallel's children list
+    directly, or by dropping the whole Retry/Timeout wrapper when its sole
+    child is one of them. Returns None when `node` itself was removed."""
+    if not isinstance(node, dict):
+        return node
+    node_type = node.get("type")
+    if node_type == "Action":
+        return None if id(node) in redundant_ids else node
+    if node_type in {"Sequence", "Fallback", "Parallel"}:
+        new_children = []
+        for child in node.get("children", []) or []:
+            rewritten = _without_redundant_locate_actions(child, redundant_ids)
+            if rewritten is not None:
+                new_children.append(rewritten)
+        new_node = dict(node)
+        new_node["children"] = new_children
+        return new_node
+    if node_type in {"Retry", "Timeout"}:
+        rewritten_child = _without_redundant_locate_actions(node.get("child"), redundant_ids)
+        if rewritten_child is None:
+            return None
+        new_node = dict(node)
+        new_node["child"] = rewritten_child
+        return new_node
+    return node
+
+
+def _canonicalize_redundant_locate_prefix(plan: dict[str, Any]) -> None:
+    """Actually remove a redundant look_at/search_for_entity/locate_entity
+    Action from the executable BT tree when it immediately duplicates work
+    remember_person/remember_entity already does internally for the SAME
+    target (see _terminal_self_locating_action) -- not just skip it when
+    deriving goal_spec (that alone left it in the tree to actually run,
+    which is what a real live E.1 attempt showed blocking the mission).
+    Mutates plan["root"] in place. A no-op when the pattern does not match
+    (including a locate action that targets something else -- never
+    touched)."""
+    match = _terminal_self_locating_action(_physical_actions_in(plan.get("root")))
+    if match is None:
+        return
+    _terminal, redundant = match
+    if not redundant:
+        return
+    redundant_ids = {id(a) for a in redundant}
+    plan["root"] = _without_redundant_locate_actions(plan.get("root"), redundant_ids)
 
 
 def _apply_deterministic_goal_spec(plan: dict[str, Any]) -> None:
@@ -199,17 +302,16 @@ def _apply_deterministic_goal_spec(plan: dict[str, Any]) -> None:
     goal_spec's args (goal_check.py's existing predicate handlers already
     read the same argument names a skill's own args_schema uses -- e.g.
     robot_at_place reads args.name, exactly what go_to_place's own args
-    already carry). A second, narrower case (2026-09-03) is handled the same
-    way when there is more than one physical Action: if exactly one of them
-    is remember_person/remember_entity and every other one is a redundant
-    locate-type skill that terminal action's own SkillSpec description says
-    it already performs internally (see _terminal_self_locating_action),
-    the remember action is treated as if it were the plan's only physical
-    Action. Anything less clean than either case -- 0 physical actions, 2+
-    "real" (non-redundant) physical actions, or a skill whose
-    result_predicates has 0 or 2+ entries -- is left alone, falling straight
-    through to PolicyGuard's existing rejection, exactly as before this fix:
-    replanning/rejecting beats guessing wrong."""
+    already carry). Anything less clean -- zero or 2+ physical actions, or a
+    skill whose result_predicates has 0 or 2+ entries -- is left alone,
+    falling straight through to PolicyGuard's existing rejection, exactly as
+    before this fix: replanning/rejecting beats guessing wrong. (2026-09-03:
+    the "N redundant locate actions + 1 self-locating remember" case used to
+    be handled here too, as a goal-spec-only special case; it is now
+    _canonicalize_redundant_locate_prefix, called earlier in plan(), which
+    actually strips those actions from the tree -- so by the time this
+    function runs, a matching plan already has exactly one physical Action
+    and needs no special case here at all.)"""
     goal_spec = plan.get("goal_spec")
     if not isinstance(goal_spec, dict):
         return
@@ -219,12 +321,9 @@ def _apply_deterministic_goal_spec(plan: dict[str, Any]) -> None:
         return
 
     actions = _physical_actions_in(plan.get("root"))
-    if len(actions) == 1:
-        action = actions[0]
-    else:
-        action = _terminal_self_locating_action(actions)
-        if action is None:
-            return
+    if len(actions) != 1:
+        return
+    action = actions[0]
     skill = str(action.get("skill") or "")
     spec = DEFAULT_SKILLS.get(skill)
     if spec is None or len(spec.result_predicates) != 1:
@@ -290,6 +389,8 @@ class PlanningPipeline:
                 context_json=context_json,
                 plan_json=plan_json,
             )
+
+        _canonicalize_redundant_locate_prefix(plan)
 
         grounding_error = _apply_grounding_normalizer(plan, context_json)
         if grounding_error:

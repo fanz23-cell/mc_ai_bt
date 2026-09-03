@@ -164,12 +164,24 @@ def test_planning_pipeline_fills_in_goal_predicate_past_a_redundant_look_at():
     goal_spec = json.loads(result.goal_spec_json)
     assert goal_spec["predicate"] == "entity_alias_bound"
     assert goal_spec["args"] == {"target": "the person", "alias": "33"}
+    # 2026-09-03 (GPT review): the redundant look_at must actually be gone
+    # from the executable tree, not merely ignored when deriving goal_spec
+    # -- a live E.1 attempt showed the tree-untouched version still
+    # EXECUTES the redundant action, which then failed for an unrelated
+    # reason and blocked the whole mission.
+    bt = json.loads(result.bt_json)
+    assert bt == {
+        "type": "Sequence",
+        "children": [
+            {"type": "Action", "skill": "remember_entity", "args": {"target": "the person", "alias": "33"}},
+        ],
+    }
 
 
 def test_planning_pipeline_fills_in_goal_predicate_past_a_redundant_search_for_entity():
     mission, missions = _mission("remember this person as 33")
     plan_json = _implicit_plan_with_actions([
-        {"type": "Action", "skill": "search_for_entity", "args": {"target": "person"}},
+        {"type": "Action", "skill": "search_for_entity", "args": {"target": "the person"}},
         {"type": "Action", "skill": "remember_person", "args": {"target": "the person", "name": "33"}},
     ])
 
@@ -178,6 +190,30 @@ def test_planning_pipeline_fills_in_goal_predicate_past_a_redundant_search_for_e
     assert result.ok, result.message
     goal_spec = json.loads(result.goal_spec_json)
     assert goal_spec["predicate"] == "person_named"
+    bt = json.loads(result.bt_json)
+    assert bt["children"] == [
+        {"type": "Action", "skill": "remember_person", "args": {"target": "the person", "name": "33"}},
+    ]
+
+
+def test_planning_pipeline_does_not_drop_a_search_for_entity_targeting_something_else():
+    # 2026-09-03 (GPT review): search_for_entity/locate_entity DO carry a
+    # real target entity reference (unlike look_at, which is direction-only)
+    # -- a search for something UNRELATED to the remember action's own
+    # target must never be silently dropped, since it may be there for a
+    # genuinely different reason.
+    mission, missions = _mission("look for the chair, then remember this person as 33")
+    plan_json = _implicit_plan_with_actions([
+        {"type": "Action", "skill": "search_for_entity", "args": {"target": "chair"}},
+        {"type": "Action", "skill": "remember_person", "args": {"target": "the person", "name": "33"}},
+    ])
+
+    result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
+
+    # Not canonicalized (different targets) -- still 2 real physical
+    # actions, correctly rejected exactly as before this round's fixes.
+    assert not result.ok
+    assert result.stage == "policy"
 
 
 def test_planning_pipeline_does_not_guess_when_remember_entity_follows_a_non_locate_action():
@@ -370,3 +406,44 @@ def test_grounding_normalizer_leaves_a_target_alone_when_no_alias_matches():
     assert result.ok, result.message
     goal_spec = json.loads(result.goal_spec_json)
     assert "entity_id" not in goal_spec["args"]
+
+
+def test_grounding_normalizer_rejects_an_entity_id_cross_wired_to_a_different_alias():
+    # 2026-09-03 (GPT review): found live -- with TWO aliases grounded in
+    # the same mission, the old check only asked "is this entity_id
+    # SOMEWHERE in the grounded set", which a cross-wired id (the real
+    # entity_id of a DIFFERENT alias than the one the target names) would
+    # pass. target="33" names person_A specifically; entity_id=person_B
+    # (22's real id) must be rejected, not treated as merely "some real id".
+    mission, missions = _mission(
+        "go check on 33",
+        context_json=_grounded_context(
+            {"alias": "33", "entity_id": "person_A"},
+            {"alias": "22", "entity_id": "person_B"},
+        ),
+    )
+    plan_json = _implicit_plan_with_single_action(
+        "approach_entity", {"target": "33", "entity_id": "person_B"})
+
+    result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
+
+    assert not result.ok
+    assert result.stage == "grounding"
+    assert "person_B" in result.message
+    assert "person_A" in result.message
+
+
+def test_grounding_normalizer_accepts_the_correct_id_when_multiple_aliases_are_grounded():
+    mission, missions = _mission(
+        "go check on 33",
+        context_json=_grounded_context(
+            {"alias": "33", "entity_id": "person_A"},
+            {"alias": "22", "entity_id": "person_B"},
+        ),
+    )
+    plan_json = _implicit_plan_with_single_action(
+        "approach_entity", {"target": "33", "entity_id": "person_A"})
+
+    result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
+
+    assert result.ok, result.message
