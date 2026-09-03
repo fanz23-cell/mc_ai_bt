@@ -331,12 +331,13 @@ DEFAULT_SKILLS: dict[str, SkillSpec] = {
     "scan_room": SkillSpec(
         "scan_room",
         ("base", "gaze"),
-        "Turn in place through a full sweep, reporting the most people seen in any "
-        "single view during the sweep -- use for 'how many people are in the room' / "
-        "'look around and count everyone'. This is a LOWER BOUND, not an exact "
-        "deduplicated count: people who are never in the same view together as each "
-        "other cannot be reliably told apart from one person seen twice, since this "
-        "perception pipeline has no stable per-person tracking across views. Takes no "
+        "Turn in place through a full sweep, counting DISTINCT people via stable "
+        "cross-view identity tracking -- use for 'how many people are in the room' / "
+        "'look around and count everyone'. observed_track_count is the number of "
+        "distinct tracked identities confirmed during the sweep -- NOT a guaranteed-"
+        "exact count in either direction: someone never detected during the sweep "
+        "(occluded, out of view) is missed, and someone whose track is briefly lost "
+        "and re-detected under a new identity could be double-counted. Takes no "
         "arguments.",
         {},
         ("room_scanned",),
