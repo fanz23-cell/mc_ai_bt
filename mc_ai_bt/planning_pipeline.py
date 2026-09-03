@@ -186,26 +186,37 @@ def _apply_grounding_normalizer(plan: dict[str, Any], context_json: str) -> str 
 # instead of a goal-spec-only workaround -- the redundant action is
 # actually removed from the tree that gets executed, not merely skipped
 # when deriving the goal.
-_REDUNDANT_LOCATE_SKILLS = frozenset({"look_at", "search_for_entity", "locate_entity"})
+#
+# FOUND LIVE 2026-09-03 (GPT review, D0): look_at was REMOVED from this set
+# again, one round later. The live trace for exactly this pattern --
+# "There is a person right in front of you. Remember them as 33." ->
+# look_at(direction="front") + remember_person(target="person", name="33")
+# -- showed remember_person's own target is the bare class name "person";
+# the ONLY place "front" (the one piece of information that could actually
+# disambiguate WHICH person) was ever recorded was look_at's own args, which
+# this canonicalizer was silently deleting. look_at's args_schema is
+# direction-only with no entity reference, which is exactly why it was
+# treated as always-safe to drop -- but "direction" can itself BE a
+# reference (a bearing pointing at a specific entity), so "carries no
+# entity reference" does not mean "carries no reference semantics". Until a
+# real reference-resolution stage (see the C.5/E.1 architecture
+# consolidation work) exists to consume that bearing, dropping look_at is a
+# real information-loss bug, not a convenience. search_for_entity/
+# locate_entity are unaffected -- they carry an explicit target entity
+# reference of their own, independently compared against the terminal
+# action's target below, so keeping them redundant-eligible loses nothing.
+_REDUNDANT_LOCATE_SKILLS = frozenset({"search_for_entity", "locate_entity"})
 _SELF_LOCATING_TERMINAL_SKILLS = frozenset({"remember_person", "remember_entity"})
 
 
 def _redundant_locate_matches_terminal(action: dict[str, Any], terminal_target: str) -> bool:
-    """True if `action` (a look_at/search_for_entity/locate_entity Action) is
-    safe to drop as a redundant duplicate of the terminal remember_person/
-    remember_entity action's own internal locate step.
-
-    look_at's real args_schema (skill_registry.py) is direction-only --
-    {"direction": "direction"}, no entity reference at all -- so it can
-    never assert a conflicting target in the first place; always safe.
-    search_for_entity/locate_entity DO carry a real target entity reference
-    (their own args_schema is {"target": ...}) -- only safe to drop when it
-    normalizes to the SAME target the terminal action itself names. A
-    search/locate for something else entirely (e.g. search_for_entity
+    """True if `action` (a search_for_entity/locate_entity Action) is safe
+    to drop as a redundant duplicate of the terminal remember_person/
+    remember_entity action's own internal locate step -- only when its own
+    target normalizes to the SAME target the terminal action itself names.
+    A search/locate for something else entirely (e.g. search_for_entity
     target="chair" ahead of remember_person target="the person") must never
     be silently dropped -- it may be there for an unrelated reason."""
-    if str(action.get("skill") or "") == "look_at":
-        return True
     args = action.get("args") if isinstance(action.get("args"), dict) else {}
     action_target = _normalize_alias(str(args.get("target") or ""))
     return bool(terminal_target) and action_target == terminal_target

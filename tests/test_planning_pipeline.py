@@ -151,7 +151,17 @@ def _implicit_plan_with_actions(actions: list) -> str:
 # auto-fill above never covers this (2 physical actions), so it used to
 # fall straight through to PolicyGuard's rejection every time.
 
-def test_planning_pipeline_fills_in_goal_predicate_past_a_redundant_look_at():
+def test_planning_pipeline_does_not_drop_a_redundant_look_at():
+    # 2026-09-03 (GPT review, D0): look_at used to be treated as always-safe
+    # to drop (its args_schema is direction-only, no entity target to
+    # conflict with a mismatched remember target) -- but a live trace of
+    # EXACTLY this plan showed the "front" direction was the only piece of
+    # information that could have disambiguated WHICH person was meant, and
+    # it lived only in look_at's own args. Dropping it lost real
+    # information, not just noise. Until a real reference-resolution stage
+    # exists to consume a bearing like this, look_at must be left alone --
+    # safe regression back to the pre-canonicalization behavior: still 2
+    # physical actions, still correctly policy-rejected.
     mission, missions = _mission("remember this as 33")
     plan_json = _implicit_plan_with_actions([
         {"type": "Action", "skill": "look_at", "args": {"direction": "front"}},
@@ -160,22 +170,13 @@ def test_planning_pipeline_fills_in_goal_predicate_past_a_redundant_look_at():
 
     result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
 
-    assert result.ok, result.message
-    goal_spec = json.loads(result.goal_spec_json)
-    assert goal_spec["predicate"] == "entity_alias_bound"
-    assert goal_spec["args"] == {"target": "the person", "alias": "33"}
-    # 2026-09-03 (GPT review): the redundant look_at must actually be gone
-    # from the executable tree, not merely ignored when deriving goal_spec
-    # -- a live E.1 attempt showed the tree-untouched version still
-    # EXECUTES the redundant action, which then failed for an unrelated
-    # reason and blocked the whole mission.
-    bt = json.loads(result.bt_json)
-    assert bt == {
-        "type": "Sequence",
-        "children": [
-            {"type": "Action", "skill": "remember_entity", "args": {"target": "the person", "alias": "33"}},
-        ],
-    }
+    assert not result.ok
+    assert result.stage == "policy"
+    # bt_json is empty on a policy rejection (PlanningResult never reaches
+    # the point of serializing it) -- the real assertion here is result.ok
+    # being False: look_at was never stripped, so the plan still has 2
+    # physical actions and PolicyGuard rejects it exactly as it did before
+    # any redundant-locate canonicalization existed.
 
 
 def test_planning_pipeline_fills_in_goal_predicate_past_a_redundant_search_for_entity():
