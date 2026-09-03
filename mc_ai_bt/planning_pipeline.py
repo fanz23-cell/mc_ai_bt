@@ -237,16 +237,46 @@ def _redundant_locate_matches_terminal(action: dict[str, Any], terminal_target: 
     return bool(terminal_target) and action_target == terminal_target
 
 
+# Phase C follow-up (2026-09-03): found live, immediately after Phase C
+# shipped -- the deployed gpt-4o-mini planner still reliably prepends
+# look_at before remember_person/remember_entity (unaffected by any of
+# this session's other fixes), and D0 correctly stopped auto-dropping it,
+# so this exact real pattern goes right back to a policy rejection, never
+# even reaching the point where relation-based disambiguation could help.
+# The fix is not to drop look_at again -- it is to actually USE the
+# information it carries: look_at's own `direction` is real disambiguating
+# content (see D0's own comment), and ResolveEntityReference (Phase C) can
+# now consume exactly that content via the terminal action's `relation`
+# arg. So a look_at whose direction maps to a real relation, immediately
+# before a self-locating terminal action that does not already specify one,
+# gets ABSORBED: its direction is copied into the terminal action's own
+# `relation` arg, and only THEN is it safe to remove -- no information is
+# lost, unlike the original (reverted) unconditional-drop behavior. A
+# direction with no relation mapping (front_up/front_down/etc -- vertical,
+# meaningless to ResolveEntityReference's ground-plane geometry), or a
+# terminal action that already specifies its own relation/entity_id (do not
+# override an already-more-specific disambiguation), is left completely
+# untouched -- same conservative fallback as before this fix.
+_DIRECTION_TO_RELATION = {
+    "front": "front", "front_up": "front", "front_down": "front",
+    "left": "left", "left_up": "left", "left_down": "left",
+    "right": "right", "right_up": "right", "right_down": "right",
+}
+
+
 def _terminal_self_locating_action(
     actions: list[dict[str, Any]],
 ) -> tuple[dict[str, Any], list[dict[str, Any]]] | None:
     """(terminal, redundant_prefix_actions) for a plan whose only
     non-redundant physical action is remember_person/remember_entity, where
-    every other physical action is a locate-type skill that ALSO targets
-    the same entity as the terminal action (see
-    _redundant_locate_matches_terminal) -- None if the pattern does not
-    hold (zero or 2+ remember-type actions, a non-locate action alongside
-    one, or a locate action that targets something else)."""
+    every other physical action is either a locate-type skill that ALSO
+    targets the same entity as the terminal action (see
+    _redundant_locate_matches_terminal), or a single look_at whose
+    direction gets absorbed into the terminal action's own `relation` arg
+    (mutating `actions` in place -- see the module comment above). None if
+    the pattern does not hold (zero or 2+ remember-type actions, a
+    non-locate action alongside one, a locate action that targets something
+    else, or a look_at that cannot be safely absorbed)."""
     terminal = [a for a in actions if str(a.get("skill") or "") in _SELF_LOCATING_TERMINAL_SKILLS]
     if len(terminal) != 1:
         return None
@@ -254,11 +284,30 @@ def _terminal_self_locating_action(
     term_args = term.get("args") if isinstance(term.get("args"), dict) else {}
     term_target = _normalize_alias(str(term_args.get("target") or ""))
     others = [a for a in actions if a is not term]
-    for a in others:
+
+    look_at_actions = [a for a in others if str(a.get("skill") or "") == "look_at"]
+    other_locates = [a for a in others if str(a.get("skill") or "") != "look_at"]
+
+    for a in other_locates:
         if str(a.get("skill") or "") not in _REDUNDANT_LOCATE_SKILLS:
             return None
         if not _redundant_locate_matches_terminal(a, term_target):
             return None
+
+    if len(look_at_actions) > 1:
+        return None  # more than one bearing -- not a pattern worth guessing at
+    if look_at_actions:
+        look_at = look_at_actions[0]
+        if term_args.get("relation") or term_args.get("entity_id"):
+            return None  # terminal already has its own, more specific disambiguation
+        look_at_args = look_at.get("args") if isinstance(look_at.get("args"), dict) else {}
+        direction = str(look_at_args.get("direction") or "").strip().lower()
+        relation = _DIRECTION_TO_RELATION.get(direction)
+        if relation is None:
+            return None  # unmappable (or missing) direction -- never guess
+        term_args["relation"] = relation
+        term["args"] = term_args
+
     return term, others
 
 

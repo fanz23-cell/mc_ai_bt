@@ -151,17 +151,17 @@ def _implicit_plan_with_actions(actions: list) -> str:
 # auto-fill above never covers this (2 physical actions), so it used to
 # fall straight through to PolicyGuard's rejection every time.
 
-def test_planning_pipeline_does_not_drop_a_redundant_look_at():
-    # 2026-09-03 (GPT review, D0): look_at used to be treated as always-safe
-    # to drop (its args_schema is direction-only, no entity target to
-    # conflict with a mismatched remember target) -- but a live trace of
-    # EXACTLY this plan showed the "front" direction was the only piece of
-    # information that could have disambiguated WHICH person was meant, and
-    # it lived only in look_at's own args. Dropping it lost real
-    # information, not just noise. Until a real reference-resolution stage
-    # exists to consume a bearing like this, look_at must be left alone --
-    # safe regression back to the pre-canonicalization behavior: still 2
-    # physical actions, still correctly policy-rejected.
+def test_planning_pipeline_absorbs_a_redundant_look_at_into_relation():
+    # 2026-09-03 (GPT review, D0, then a Phase C follow-up found live one
+    # round later): look_at used to be dropped unconditionally (a real
+    # information-loss bug -- D0 reverted that), then left completely
+    # untouched (safe, but blocked a real live mission that no longer even
+    # needed to be blocked once ResolveEntityReference/relation existed).
+    # The actual fix: "front" is copied into remember_entity's own
+    # `relation` arg (which ResolveEntityReference can now genuinely
+    # consume to disambiguate 2+ candidates), and ONLY THEN is look_at
+    # removed -- no information lost, unlike the original bug, and no
+    # longer needlessly blocked either.
     mission, missions = _mission("remember this as 33")
     plan_json = _implicit_plan_with_actions([
         {"type": "Action", "skill": "look_at", "args": {"direction": "front"}},
@@ -170,13 +170,52 @@ def test_planning_pipeline_does_not_drop_a_redundant_look_at():
 
     result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
 
+    assert result.ok, result.message
+    bt = json.loads(result.bt_json)
+    assert bt == {
+        "type": "Sequence",
+        "children": [
+            {
+                "type": "Action", "skill": "remember_entity",
+                "args": {"target": "the person", "alias": "33", "relation": "front"},
+            },
+        ],
+    }
+    goal_spec = json.loads(result.goal_spec_json)
+    assert goal_spec["args"]["relation"] == "front"
+
+
+def test_planning_pipeline_does_not_absorb_a_look_at_with_an_unmappable_direction():
+    # No relation corresponds to a bare "up"/"down" bearing (ResolveEntityReference
+    # only understands ground-plane front/left/right/nearest) -- never guess,
+    # same conservative fallback as before the absorption feature existed.
+    mission, missions = _mission("remember this as 33")
+    plan_json = _implicit_plan_with_actions([
+        {"type": "Action", "skill": "look_at", "args": {"direction": "up"}},
+        {"type": "Action", "skill": "remember_entity", "args": {"target": "the person", "alias": "33"}},
+    ])
+
+    result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
+
     assert not result.ok
     assert result.stage == "policy"
-    # bt_json is empty on a policy rejection (PlanningResult never reaches
-    # the point of serializing it) -- the real assertion here is result.ok
-    # being False: look_at was never stripped, so the plan still has 2
-    # physical actions and PolicyGuard rejects it exactly as it did before
-    # any redundant-locate canonicalization existed.
+
+
+def test_planning_pipeline_does_not_override_an_already_specific_terminal_action():
+    # remember_entity already specifies its own relation -- a preceding
+    # look_at's bearing must never override or duplicate that; left
+    # completely untouched (still 2 physical actions, still policy-rejected).
+    mission, missions = _mission("remember this as 33")
+    plan_json = _implicit_plan_with_actions([
+        {"type": "Action", "skill": "look_at", "args": {"direction": "left"}},
+        {"type": "Action", "skill": "remember_entity",
+         "args": {"target": "the person", "alias": "33", "relation": "nearest"}},
+    ])
+
+    result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
+
+    assert not result.ok
+    assert result.stage == "policy"
 
 
 def test_planning_pipeline_fills_in_goal_predicate_past_a_redundant_search_for_entity():
