@@ -135,6 +135,79 @@ def test_planning_pipeline_fills_in_remember_entity_goal_predicate():
     assert goal_spec["args"]["alias"] == "33"
 
 
+def _implicit_plan_with_actions(actions: list) -> str:
+    return json.dumps({
+        "schema": "mc_ai_bt.plan.v1",
+        "root": {"type": "Sequence", "children": actions},
+        "goal_spec": {"type": "human", "verification": {"mode": "implicit_conversation"}},
+    })
+
+
+# --- remember_person/remember_entity preceded by a redundant locate action
+# (2026-09-03, E.1 follow-up) -- remember_person/remember_entity already
+# locate the target internally, so a real gpt-4o-mini planner reliably (and
+# a prompt instruction against it measurably did not stop it) prepends a
+# look_at/search_for_entity/locate_entity Action first. The single-action
+# auto-fill above never covers this (2 physical actions), so it used to
+# fall straight through to PolicyGuard's rejection every time.
+
+def test_planning_pipeline_fills_in_goal_predicate_past_a_redundant_look_at():
+    mission, missions = _mission("remember this as 33")
+    plan_json = _implicit_plan_with_actions([
+        {"type": "Action", "skill": "look_at", "args": {"direction": "front"}},
+        {"type": "Action", "skill": "remember_entity", "args": {"target": "the person", "alias": "33"}},
+    ])
+
+    result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
+
+    assert result.ok, result.message
+    goal_spec = json.loads(result.goal_spec_json)
+    assert goal_spec["predicate"] == "entity_alias_bound"
+    assert goal_spec["args"] == {"target": "the person", "alias": "33"}
+
+
+def test_planning_pipeline_fills_in_goal_predicate_past_a_redundant_search_for_entity():
+    mission, missions = _mission("remember this person as 33")
+    plan_json = _implicit_plan_with_actions([
+        {"type": "Action", "skill": "search_for_entity", "args": {"target": "person"}},
+        {"type": "Action", "skill": "remember_person", "args": {"target": "the person", "name": "33"}},
+    ])
+
+    result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
+
+    assert result.ok, result.message
+    goal_spec = json.loads(result.goal_spec_json)
+    assert goal_spec["predicate"] == "person_named"
+
+
+def test_planning_pipeline_does_not_guess_when_remember_entity_follows_a_non_locate_action():
+    mission, missions = _mission("go there and remember this as 33")
+    plan_json = _implicit_plan_with_actions([
+        {"type": "Action", "skill": "go_to_place", "args": {"name": "test_place"}},
+        {"type": "Action", "skill": "remember_entity", "args": {"target": "the person", "alias": "33"}},
+    ])
+
+    result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
+
+    # go_to_place is a real, non-redundant physical action -- must not guess.
+    assert not result.ok
+    assert result.stage == "policy"
+
+
+def test_planning_pipeline_does_not_guess_with_two_remember_actions():
+    mission, missions = _mission("remember both of them")
+    plan_json = _implicit_plan_with_actions([
+        {"type": "Action", "skill": "remember_entity", "args": {"target": "person A", "alias": "A"}},
+        {"type": "Action", "skill": "remember_entity", "args": {"target": "person B", "alias": "B"}},
+    ])
+
+    result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
+
+    # Two remember-type actions -- genuinely ambiguous which one the goal means.
+    assert not result.ok
+    assert result.stage == "policy"
+
+
 def test_planning_pipeline_does_not_guess_with_two_physical_actions():
     mission, missions = _mission("go there and then wave")
     plan_json = json.dumps({

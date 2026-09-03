@@ -149,6 +149,39 @@ def _apply_grounding_normalizer(plan: dict[str, Any], context_json: str) -> str 
     return None
 
 
+# E.1 follow-up (2026-09-03): remember_person/remember_entity's own
+# descriptions already say they locate the target internally (turning to
+# look if needed) -- confirmed live, three separate real E.1 test attempts
+# through the deployed gpt-4o-mini planner all still planned a redundant
+# look_at or search_for_entity Action immediately before remember_person/
+# remember_entity despite an added planner.py prompt instruction against
+# it (prompting an LLM is never a guarantee, and this one measurably did
+# not change its behavior on retry). Rather than keep iterating on prompt
+# wording indefinitely, this closes the gap deterministically instead: a
+# plan whose only non-redundant physical action is a remember_person/
+# remember_entity call, preceded by nothing but locate-type skills whose
+# own result is not what a "remember" intent's goal actually is, is exactly
+# as unambiguous as the single-physical-action case below -- the
+# preparatory actions are structurally vestigial once the terminal skill's
+# own documented behavior already subsumes them.
+_REDUNDANT_LOCATE_SKILLS = frozenset({"look_at", "search_for_entity", "locate_entity"})
+_SELF_LOCATING_TERMINAL_SKILLS = frozenset({"remember_person", "remember_entity"})
+
+
+def _terminal_self_locating_action(actions: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The single remember_person/remember_entity Action in `actions`, if every
+    OTHER action in the list is one of the redundant locate-type skills its own
+    SkillSpec description says it already performs internally -- None otherwise
+    (zero or 2+ remember-type actions, or a non-locate action alongside one)."""
+    terminal = [a for a in actions if str(a.get("skill") or "") in _SELF_LOCATING_TERMINAL_SKILLS]
+    if len(terminal) != 1:
+        return None
+    others = [a for a in actions if a is not terminal[0]]
+    if any(str(a.get("skill") or "") not in _REDUNDANT_LOCATE_SKILLS for a in others):
+        return None
+    return terminal[0]
+
+
 def _apply_deterministic_goal_spec(plan: dict[str, Any]) -> None:
     """E.1 follow-up (2026-09-02, GPT spec): the LLM/bootstrap planner does
     not always produce a structured goal_spec for a mission containing a
@@ -166,10 +199,17 @@ def _apply_deterministic_goal_spec(plan: dict[str, Any]) -> None:
     goal_spec's args (goal_check.py's existing predicate handlers already
     read the same argument names a skill's own args_schema uses -- e.g.
     robot_at_place reads args.name, exactly what go_to_place's own args
-    already carry). Anything less clean -- zero or 2+ physical actions, or a
-    skill whose result_predicates has 0 or 2+ entries -- is left alone,
-    falling straight through to PolicyGuard's existing rejection, exactly as
-    before this fix: replanning/rejecting beats guessing wrong."""
+    already carry). A second, narrower case (2026-09-03) is handled the same
+    way when there is more than one physical Action: if exactly one of them
+    is remember_person/remember_entity and every other one is a redundant
+    locate-type skill that terminal action's own SkillSpec description says
+    it already performs internally (see _terminal_self_locating_action),
+    the remember action is treated as if it were the plan's only physical
+    Action. Anything less clean than either case -- 0 physical actions, 2+
+    "real" (non-redundant) physical actions, or a skill whose
+    result_predicates has 0 or 2+ entries -- is left alone, falling straight
+    through to PolicyGuard's existing rejection, exactly as before this fix:
+    replanning/rejecting beats guessing wrong."""
     goal_spec = plan.get("goal_spec")
     if not isinstance(goal_spec, dict):
         return
@@ -179,9 +219,12 @@ def _apply_deterministic_goal_spec(plan: dict[str, Any]) -> None:
         return
 
     actions = _physical_actions_in(plan.get("root"))
-    if len(actions) != 1:
-        return
-    action = actions[0]
+    if len(actions) == 1:
+        action = actions[0]
+    else:
+        action = _terminal_self_locating_action(actions)
+        if action is None:
+            return
     skill = str(action.get("skill") or "")
     spec = DEFAULT_SKILLS.get(skill)
     if spec is None or len(spec.result_predicates) != 1:
