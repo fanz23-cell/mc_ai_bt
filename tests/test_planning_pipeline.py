@@ -107,7 +107,7 @@ def test_planning_pipeline_fills_in_the_only_possible_goal_predicate():
     mission, missions = _mission(
         "go check on 33",
         context_json=json.dumps({
-            "grounded_entities": [{"alias": "33", "entity_id": "person_bad0fefe"}],
+            "grounded_entities": [{"alias": "33", "entity_id": "person_bad0fefe", "grounding_state": "RESOLVED"}],
         }),
     )
     plan_json = _implicit_plan_with_single_action(
@@ -211,6 +211,51 @@ def test_planning_pipeline_does_not_override_an_already_specific_terminal_action
         {"type": "Action", "skill": "remember_entity",
          "args": {"target": "the person", "alias": "33", "relation": "nearest"}},
     ])
+
+    result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
+
+    assert not result.ok
+    assert result.stage == "policy"
+
+
+def test_planning_pipeline_does_not_absorb_a_look_at_that_comes_after_the_terminal_action():
+    # P1-1 (2026-09-03, GPT review, Gate-1): _terminal_self_locating_action
+    # used to operate on a flat, order-blind list of physical actions --
+    # look_at AFTER remember_entity in the same Sequence (not a real
+    # "redundant prefix" at all) could previously still be absorbed. Now
+    # requires a strictly SMALLER index than the terminal action in the
+    # same Sequence; this plan has none, so it is left completely untouched.
+    mission, missions = _mission("remember this as 33")
+    plan_json = _implicit_plan_with_actions([
+        {"type": "Action", "skill": "remember_entity", "args": {"target": "the person", "alias": "33"}},
+        {"type": "Action", "skill": "look_at", "args": {"direction": "left"}},
+    ])
+
+    result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
+
+    assert not result.ok
+    assert result.stage == "policy"
+
+
+def test_planning_pipeline_does_not_absorb_a_look_at_from_a_different_fallback_branch():
+    # P1-1 (2026-09-03, GPT review, Gate-1): a look_at and a remember_entity
+    # that are alternatives in a Fallback (mutually exclusive branches, not
+    # a sequence at all) must never be treated as a "prefix" relationship --
+    # neither is a direct child of any Sequence, so the terminal action
+    # itself fails the same-Sequence-child requirement and the whole
+    # pattern is left completely untouched.
+    mission, missions = _mission("remember this as 33")
+    plan_json = json.dumps({
+        "schema": "mc_ai_bt.plan.v1",
+        "root": {
+            "type": "Fallback",
+            "children": [
+                {"type": "Action", "skill": "look_at", "args": {"direction": "left"}},
+                {"type": "Action", "skill": "remember_entity", "args": {"target": "the person", "alias": "33"}},
+            ],
+        },
+        "goal_spec": {"type": "human", "verification": {"mode": "implicit_conversation"}},
+    })
 
     result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
 
@@ -376,7 +421,16 @@ def test_planning_pipeline_reports_policy_error():
 # rule, independent of whether the LLM actually complied.
 
 def _grounded_context(*entries: dict) -> str:
-    return json.dumps({"grounded_entities": list(entries)})
+    # Auto-fill grounding_state=RESOLVED whenever an entry has a real
+    # entity_id and doesn't say otherwise -- every pre-existing call site
+    # below only ever set alias/entity_id, matching a real Bridge-resolved
+    # alias; a test that cares about the UNRESOLVED case sets it explicitly.
+    filled = []
+    for entry in entries:
+        entry = dict(entry)
+        entry.setdefault("grounding_state", "RESOLVED" if entry.get("entity_id") else "UNRESOLVED")
+        filled.append(entry)
+    return json.dumps({"grounded_entities": filled})
 
 
 def test_grounding_normalizer_accepts_an_entity_id_that_matches_grounded_entities():
@@ -469,8 +523,52 @@ def test_grounding_normalizer_rejects_an_entity_id_cross_wired_to_a_different_al
 
     assert not result.ok
     assert result.stage == "grounding"
-    assert "person_B" in result.message
-    assert "person_A" in result.message
+
+
+def test_grounding_normalizer_rejects_an_entity_id_cross_wired_from_an_unresolved_alias():
+    # 2026-09-03 (GPT review, Gate-1): found live -- once UNRESOLVED aliases
+    # stopped being dropped from grounded_entities entirely, the ORIGINAL
+    # cross-wire check above stopped applying to them (an UNRESOLVED alias
+    # was simply absent from the map, so its target fell through to the
+    # weaker flat-membership fallback, which happily accepted a DIFFERENT,
+    # RESOLVED alias's real entity_id). "33" is a known alias, currently
+    # UNRESOLVED (no live entity -- see mc_world_state/entity_identity.py);
+    # "22" is RESOLVED to person_B. target="33" + entity_id=person_B (22's
+    # real id) must be rejected just as hard as the RESOLVED-vs-RESOLVED
+    # cross-wire above -- an unresolved alias can never legitimately carry
+    # ANY entity_id, cross-wired or otherwise.
+    mission, missions = _mission(
+        "go check on 33",
+        context_json=_grounded_context(
+            {"alias": "33", "entity_id": "", "grounding_state": "UNRESOLVED"},
+            {"alias": "22", "entity_id": "person_B"},
+        ),
+    )
+    plan_json = _implicit_plan_with_single_action(
+        "approach_entity", {"target": "33", "entity_id": "person_B"})
+
+    result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
+
+    assert not result.ok
+    assert result.stage == "grounding"
+    assert "unresolved" in result.message.lower()
+
+
+def test_grounding_normalizer_passes_through_an_unresolved_alias_with_no_entity_id():
+    # The legitimate UNRESOLVED case: the planner correctly did not invent
+    # an entity_id for a known-but-currently-unresolved alias -- nothing to
+    # inject (there is no live entity to inject), and nothing to reject.
+    mission, missions = _mission(
+        "go check on 33",
+        context_json=_grounded_context({"alias": "33", "entity_id": "", "grounding_state": "UNRESOLVED"}),
+    )
+    plan_json = _implicit_plan_with_single_action("approach_entity", {"target": "33"})
+
+    result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
+
+    assert result.ok, result.message
+    goal_spec = json.loads(result.goal_spec_json)
+    assert "entity_id" not in goal_spec["args"]
 
 
 def test_grounding_normalizer_accepts_the_correct_id_when_multiple_aliases_are_grounded():

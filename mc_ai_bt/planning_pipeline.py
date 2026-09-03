@@ -67,12 +67,25 @@ def _all_actions_in(node: Any) -> list[dict[str, Any]]:
     return found
 
 
-def _grounded_entity_ids(context_json: str) -> dict[str, str]:
-    """normalized alias -> entity_id, from context_json.caller_context.
-    grounded_entities (E.1, mc_voice_pipeline_legacy's RobotGatewayBridge --
-    a real, Bridge-constructed, never-Omega-authored identity source, see
-    that repo's own _grounded_entities_for_intent). Empty dict if absent or
-    malformed -- never raises."""
+def _grounded_entity_ids(context_json: str) -> dict[str, dict[str, str]]:
+    """normalized alias -> {"entity_id", "grounding_state", "semantic_entity_id"},
+    from context_json.caller_context.grounded_entities (E.1,
+    mc_voice_pipeline_legacy's RobotGatewayBridge -- a real, Bridge-
+    constructed, never-Omega-authored identity source, see that repo's own
+    _grounded_entities_for_intent). Empty dict if absent or malformed --
+    never raises.
+
+    FOUND LIVE 2026-09-03 (GPT review, Gate-1): this used to require a
+    non-empty entity_id just to include an alias at all -- which silently
+    dropped every UNRESOLVED alias (known, but its underlying live track
+    has gone STALE -- see mc_world_state/entity_identity.py's grounding_state)
+    from the map entirely. That made _apply_grounding_normalizer below fall
+    through to its flat-membership fallback for an UNRESOLVED alias's
+    target, which could then accept a cross-wired entity_id that happens to
+    belong to some OTHER, unrelated grounded alias -- the exact mistake
+    this stage exists to catch, reopened in a new form. Every bound alias
+    is included now regardless of grounding_state; entity_id is legitimately
+    "" for an UNRESOLVED one."""
     try:
         context = json.loads(context_json) if context_json else {}
     except (TypeError, ValueError, json.JSONDecodeError):
@@ -83,14 +96,18 @@ def _grounded_entity_ids(context_json: str) -> dict[str, str]:
     grounded = caller_context.get("grounded_entities")
     if not isinstance(grounded, list):
         return {}
-    result: dict[str, str] = {}
+    result: dict[str, dict[str, str]] = {}
     for entry in grounded:
         if not isinstance(entry, dict):
             continue
         alias = str(entry.get("alias") or "")
-        entity_id = str(entry.get("entity_id") or "")
-        if alias and entity_id:
-            result[_normalize_alias(alias)] = entity_id
+        if not alias:
+            continue
+        result[_normalize_alias(alias)] = {
+            "entity_id": str(entry.get("entity_id") or ""),
+            "grounding_state": str(entry.get("grounding_state") or "UNRESOLVED"),
+            "semantic_entity_id": str(entry.get("semantic_entity_id") or ""),
+        }
     return result
 
 
@@ -122,49 +139,63 @@ def _apply_grounding_normalizer(plan: dict[str, Any], context_json: str) -> str 
       alias is left alone entirely -- normal class-based behavior,
       unchanged from before this fix.
 
-    FOUND LIVE 2026-09-03 (GPT review): the check below used to be flat
-    set-membership against ALL of this mission's grounded entity_ids
+    FOUND LIVE 2026-09-03 (GPT review, round 1): the check below used to be
+    flat set-membership against ALL of this mission's grounded entity_ids
     (`entity_id not in grounded.values()`) -- correct with only one alias
     grounded, wrong the moment two or more are: with both "33"->A and
     "22"->B grounded, target="33"+entity_id=B used to PASS, because B is a
     real grounded id, just for the WRONG alias -- exactly the cross-wired
-    mistake this stage exists to catch. Now: when `target` itself exactly
+    mistake this stage exists to catch. Fixed: when `target` itself exactly
     matches a grounded alias, entity_id (if present) must equal THAT
-    alias's own entity_id, not merely be somewhere in the grounded set. The
-    flat membership check remains as the fallback for a target that is not
-    itself a recognizable alias.
+    alias's own entity_id, not merely be somewhere in the grounded set.
+
+    FOUND LIVE 2026-09-03 (GPT review, Gate-1): that first fix was itself
+    reopened by _grounded_entity_ids no longer dropping UNRESOLVED aliases
+    -- a target matching an UNRESOLVED alias must reject ANY entity_id
+    outright (there is no live entity to reference, so entity_id cannot be
+    legitimately anything), not silently fall through to the flat
+    membership fallback, which would again accept a cross-wired id
+    belonging to some OTHER, RESOLVED alias.
 
     Mutates `plan` in place for the injection case. Returns None when the
     plan needs no rejection (whether or not anything was injected).
     """
     grounded = _grounded_entity_ids(context_json)
+    resolved_ids = {info["entity_id"] for info in grounded.values() if info["entity_id"]}
     for action in _all_actions_in(plan.get("root")):
         args = action.get("args") if isinstance(action.get("args"), dict) else None
         if args is None:
             continue
         entity_id = str(args.get("entity_id") or "").strip()
         target = str(args.get("target") or "").strip()
-        expected_entity_id = grounded.get(_normalize_alias(target)) if target else None
+        matched = grounded.get(_normalize_alias(target)) if target else None
 
         if entity_id:
             skill = str(action.get("skill") or "")
-            if expected_entity_id is not None:
-                if entity_id != expected_entity_id:
+            if matched is not None:
+                if matched["grounding_state"] != "RESOLVED":
                     return (
                         f"plan uses entity_id {entity_id!r} on skill {skill!r} whose target "
-                        f"{target!r} is grounded to a DIFFERENT entity_id ({expected_entity_id!r}) "
+                        f"{target!r} is a known alias but currently UNRESOLVED (no live entity "
+                        "to reference right now) -- entity_id must never be supplied for an "
+                        "unresolved alias"
+                    )
+                if entity_id != matched["entity_id"]:
+                    return (
+                        f"plan uses entity_id {entity_id!r} on skill {skill!r} whose target "
+                        f"{target!r} is grounded to a DIFFERENT entity_id ({matched['entity_id']!r}) "
                         "-- entity_id must match the specific alias actually mentioned, never a "
                         "different one from this mission's grounded_entities"
                     )
-            elif entity_id not in grounded.values():
+            elif entity_id not in resolved_ids:
                 return (
                     f"plan uses entity_id {entity_id!r} on skill {skill!r} that does not match "
                     "any of this mission's grounded_entities -- entity_id must come from "
                     "context_json.caller_context.grounded_entities, never invented"
                 )
             continue  # already has a validated entity_id -- nothing to inject
-        if expected_entity_id:
-            args["entity_id"] = expected_entity_id
+        if matched is not None and matched["grounding_state"] == "RESOLVED" and matched["entity_id"]:
+            args["entity_id"] = matched["entity_id"]
     return None
 
 
@@ -252,11 +283,21 @@ def _redundant_locate_matches_terminal(action: dict[str, Any], terminal_target: 
 # gets ABSORBED: its direction is copied into the terminal action's own
 # `relation` arg, and only THEN is it safe to remove -- no information is
 # lost, unlike the original (reverted) unconditional-drop behavior. A
-# direction with no relation mapping (front_up/front_down/etc -- vertical,
-# meaningless to ResolveEntityReference's ground-plane geometry), or a
 # terminal action that already specifies its own relation/entity_id (do not
-# override an already-more-specific disambiguation), is left completely
-# untouched -- same conservative fallback as before this fix.
+# override an already-more-specific disambiguation), or a direction with no
+# relation mapping at all, is left completely untouched -- same
+# conservative fallback as before this fix.
+#
+# FOUND LIVE 2026-09-03 (GPT review, Gate-1): this comment used to say
+# front_up/front_down are "left untouched" as vertical/unmappable -- but the
+# table below has always mapped them to "front", a direct contradiction
+# between the comment and the actual code. The code's behavior is the
+# intended one: ResolveEntityReference's geometry is ground-plane only (see
+# entity_identity.py), and a person cannot meaningfully be "vertically in
+# front" in any way distinct from "front" for entity disambiguation purposes
+# -- ONLY a bearing with no horizontal-plane meaning at all (e.g. a bare
+# "up"/"down", if that were ever a valid look_at direction) has no relation
+# mapping and is correctly left untouched via the plain dict .get() default.
 _DIRECTION_TO_RELATION = {
     "front": "front", "front_up": "front", "front_down": "front",
     "left": "left", "left_up": "left", "left_down": "left",
@@ -264,29 +305,93 @@ _DIRECTION_TO_RELATION = {
 }
 
 
+# FOUND LIVE 2026-09-03 (GPT review, Gate-1): _terminal_self_locating_action
+# used to operate on a flat, position-blind list of every physical Action
+# anywhere in the tree (_physical_actions_in's own contract, by design, for
+# its OTHER callers like PolicyGuard-style counting). For a plan-REWRITE
+# decision that is not safe -- a flat list cannot tell a genuine
+# `Sequence: [look_at(...), remember_entity(...)]` from
+# `Fallback: [branch A: look_at(...), branch B: remember_entity(...)]`
+# (mutually exclusive alternatives, not a prefix at all) or from
+# `Sequence: [remember_entity(...), look_at(...)]` (look_at comes AFTER,
+# order was never actually checked). _physical_actions_with_sequence_position
+# below pairs each action with the id() of the Sequence node that DIRECTLY
+# contains it (None if it is not a direct Sequence child at all -- inside a
+# Fallback/Parallel/Retry/Timeout instead) and its index in that Sequence's
+# own children list, so _terminal_self_locating_action can require every
+# "redundant prefix" candidate to be a genuine sibling of the terminal
+# action, in the SAME Sequence, at a strictly smaller index -- never across
+# a branch, never out of order.
+
+def _physical_actions_with_sequence_position(
+    node: Any, *, parent_sequence_id: int | None = None, index_in_parent: int | None = None,
+) -> list[tuple[dict[str, Any], int | None, int | None]]:
+    """Every physical Action node, each paired with (parent_sequence_id,
+    index_in_parent) -- both None when the action is not a direct child of
+    a Sequence node (inside a Fallback/Parallel, or the child of a Retry/
+    Timeout, all of which reset the "same Sequence prefix" relationship
+    entirely, on purpose)."""
+    found: list[tuple[dict[str, Any], int | None, int | None]] = []
+    if not isinstance(node, dict):
+        return found
+    node_type = node.get("type")
+    if node_type == "Sequence":
+        seq_id = id(node)
+        for i, child in enumerate(node.get("children", []) or []):
+            found.extend(_physical_actions_with_sequence_position(
+                child, parent_sequence_id=seq_id, index_in_parent=i))
+        return found
+    if node_type in {"Fallback", "Parallel"}:
+        for child in node.get("children", []) or []:
+            found.extend(_physical_actions_with_sequence_position(child))
+        return found
+    if node_type in {"Retry", "Timeout"}:
+        return _physical_actions_with_sequence_position(node.get("child"))
+    if node_type == "Action":
+        skill = str(node.get("skill") or "")
+        if skill in PHYSICAL_SKILLS:
+            found.append((node, parent_sequence_id, index_in_parent))
+    return found
+
+
 def _terminal_self_locating_action(
-    actions: list[dict[str, Any]],
+    positioned_actions: list[tuple[dict[str, Any], int | None, int | None]],
 ) -> tuple[dict[str, Any], list[dict[str, Any]]] | None:
     """(terminal, redundant_prefix_actions) for a plan whose only
     non-redundant physical action is remember_person/remember_entity, where
-    every other physical action is either a locate-type skill that ALSO
-    targets the same entity as the terminal action (see
-    _redundant_locate_matches_terminal), or a single look_at whose
-    direction gets absorbed into the terminal action's own `relation` arg
-    (mutating `actions` in place -- see the module comment above). None if
-    the pattern does not hold (zero or 2+ remember-type actions, a
-    non-locate action alongside one, a locate action that targets something
-    else, or a look_at that cannot be safely absorbed)."""
-    terminal = [a for a in actions if str(a.get("skill") or "") in _SELF_LOCATING_TERMINAL_SKILLS]
-    if len(terminal) != 1:
+    every OTHER physical action anywhere in the tree is a genuine sibling of
+    it -- same Sequence, strictly earlier position -- and is either a
+    locate-type skill that ALSO targets the same entity as the terminal
+    action (see _redundant_locate_matches_terminal), or a single look_at
+    whose direction gets absorbed into the terminal action's own `relation`
+    arg (mutating the action dict in place -- see the module comment
+    above). None if the pattern does not hold (zero or 2+ remember-type
+    actions, the terminal itself not a direct Sequence child, a physical
+    action anywhere else in the tree that is not a genuine same-Sequence
+    prefix of the terminal, a locate action that targets something else, or
+    a look_at that cannot be safely absorbed)."""
+    terminal_entries = [
+        entry for entry in positioned_actions
+        if str(entry[0].get("skill") or "") in _SELF_LOCATING_TERMINAL_SKILLS
+    ]
+    if len(terminal_entries) != 1:
         return None
-    term = terminal[0]
+    term, term_seq_id, term_index = terminal_entries[0]
+    if term_seq_id is None or term_index is None:
+        return None  # terminal itself is not a direct Sequence child -- too structurally unclear to rewrite
     term_args = term.get("args") if isinstance(term.get("args"), dict) else {}
     term_target = _normalize_alias(str(term_args.get("target") or ""))
-    others = [a for a in actions if a is not term]
 
-    look_at_actions = [a for a in others if str(a.get("skill") or "") == "look_at"]
-    other_locates = [a for a in others if str(a.get("skill") or "") != "look_at"]
+    all_others = [entry[0] for entry in positioned_actions if entry[0] is not term]
+    prefix_others = [
+        entry[0] for entry in positioned_actions
+        if entry[0] is not term and entry[1] == term_seq_id and entry[2] is not None and entry[2] < term_index
+    ]
+    if len(prefix_others) != len(all_others):
+        return None  # some other physical action exists OUTSIDE this safe same-Sequence-prefix relationship
+
+    look_at_actions = [a for a in prefix_others if str(a.get("skill") or "") == "look_at"]
+    other_locates = [a for a in prefix_others if str(a.get("skill") or "") != "look_at"]
 
     for a in other_locates:
         if str(a.get("skill") or "") not in _REDUNDANT_LOCATE_SKILLS:
@@ -308,7 +413,7 @@ def _terminal_self_locating_action(
         term_args["relation"] = relation
         term["args"] = term_args
 
-    return term, others
+    return term, prefix_others
 
 
 def _without_redundant_locate_actions(node: Any, redundant_ids: set[int]) -> Any | None:
@@ -350,7 +455,7 @@ def _canonicalize_redundant_locate_prefix(plan: dict[str, Any]) -> None:
     Mutates plan["root"] in place. A no-op when the pattern does not match
     (including a locate action that targets something else -- never
     touched)."""
-    match = _terminal_self_locating_action(_physical_actions_in(plan.get("root")))
+    match = _terminal_self_locating_action(_physical_actions_with_sequence_position(plan.get("root")))
     if match is None:
         return
     _terminal, redundant = match

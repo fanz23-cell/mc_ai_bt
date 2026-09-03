@@ -296,8 +296,7 @@ class RosSkillExecutor:
             str(getattr(response, "message", "") or f"remembered place {name}"),
             {"place_remembered": name},
         )
-        self._publish_success_facts(execution.facts)
-        return execution
+        return self._finalize(execution)
 
     def _request_human_confirmation(
         self,
@@ -357,8 +356,7 @@ class RosSkillExecutor:
             }
             if decision == RequestHumanConfirmation.Goal.DECISION_APPROVED:
                 execution = ExecutionResult(True, "human confirmation approved", facts)
-                self._publish_success_facts(execution.facts)
-                return execution
+                return self._finalize(execution)
             return ExecutionResult(
                 False,
                 f"human confirmation {_confirmation_decision_name(decision)}",
@@ -447,8 +445,7 @@ class RosSkillExecutor:
                 )
             facts = _loads_evidence_json(str(getattr(result, "evidence_json", "") or ""))
             execution = ExecutionResult(True, message or f"{skill_name} succeeded", facts)
-            self._publish_success_facts(execution.facts)
-            return execution
+            return self._finalize(execution)
         finally:
             with self._current_lock:
                 if self._current_goal_handle is goal_handle:
@@ -563,8 +560,7 @@ class RosSkillExecutor:
             msg.confidence = 1.0
             self._speak_pub.publish(msg)
             result = ExecutionResult(True, "say submitted", {"say_submitted": text})
-            self._publish_success_facts(result.facts)
-            return result
+            return self._finalize(result)
         finally:
             self._leases.release(lease.lease_id, reason="say submitted", identity=identity)
 
@@ -706,8 +702,7 @@ class RosSkillExecutor:
             else:
                 facts = dict(binding.success_facts)
             execution = ExecutionResult(True, message or f"{skill_name} succeeded", facts)
-            self._publish_success_facts(execution.facts)
-            return execution
+            return self._finalize(execution)
         finally:
             with self._current_lock:
                 if self._current_goal_handle is goal_handle:
@@ -727,9 +722,29 @@ class RosSkillExecutor:
             )
             return None
 
-    def _publish_success_facts(self, facts: dict[str, Any]) -> None:
+    def _publish_success_facts(self, facts: dict[str, Any]) -> str:
+        """Returns "" when every world-state write either succeeded or is
+        legitimately best-effort (the ordinary facts below always are --
+        losing a robot.last_animation write is not worth failing a mission
+        over). Returns a non-empty error message ONLY when entity_alias_bound
+        itself was rejected by the identity registry -- callers MUST
+        downgrade their own ExecutionResult from success to failure in that
+        case.
+
+        FOUND LIVE 2026-09-03 (GPT review, Gate-1): this used to return None
+        unconditionally, called AFTER the caller had already built an
+        ExecutionResult(success=True, ...) -- a rejected bind_entity_alias
+        call (identity collision, alias conflict, live track expired between
+        the skill's own locate and this call, service down) was only ever
+        logged at debug level, with the skill's own SUCCESS untouched. That
+        is a direct violation of this whole system's core principle (a
+        skill claiming success must never disagree with the real world) --
+        entity_alias_bound is not a best-effort fact, it is the skill's own
+        actual claimed outcome (`remember_entity: bound {alias!r} to
+        {entity_id}`), so if the identity registry refuses it, the mission
+        genuinely did not succeed."""
         if self._world_state is None:
-            return
+            return ""
         for update in world_fact_updates_for_execution(facts):
             ok, message = self._world_state.update(update)
             if not ok:
@@ -753,7 +768,23 @@ class RosSkillExecutor:
                 created_by=str(entity_alias_bound.get("created_by") or ""),
             )
             if not ok:
-                self._node.get_logger().debug(f"bind_entity_alias skipped: {message}")
+                self._node.get_logger().warning(f"bind_entity_alias rejected: {message}")
+                return f"entity_alias_bound was not accepted by the identity registry: {message}"
+        return ""
+
+    def _finalize(self, execution: ExecutionResult) -> ExecutionResult:
+        """The one call site every _*_skill/action handler below must route
+        its final success-shaped ExecutionResult through: publishes world-
+        state facts, and downgrades success to failure if entity_alias_bound
+        (when present) was rejected by the identity registry -- see
+        _publish_success_facts's own docstring for why this cannot be a
+        fire-and-forget side effect."""
+        if not execution.success:
+            return execution
+        bind_error = self._publish_success_facts(execution.facts)
+        if bind_error:
+            return ExecutionResult(False, bind_error, execution.facts, blocked=True)
+        return execution
 
 
 def _wait_future(
