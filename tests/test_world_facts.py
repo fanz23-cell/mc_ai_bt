@@ -92,26 +92,19 @@ def test_world_fact_updates_ignore_person_named_without_person_id_or_name():
     assert updates == ()
 
 
-def test_world_fact_updates_map_entity_alias_bound_to_the_entity_aliases_scope():
-    # C.2: remember_entity's own, real write path -- a separate scope from
-    # entity_tracks on purpose, same reasoning person_named/people_names had:
-    # a name binding must not be clobbered by the next unrelated detection.
-    updates = world_fact_updates_for_execution(
+def test_world_fact_updates_never_produce_a_generic_update_for_entity_alias_bound():
+    # 2026-09-03 architecture consolidation: entity_alias_bound moved to a
+    # dedicated domain command (WorldStateWriter.bind_entity_alias, called
+    # directly by skill_adapters.py's _publish_success_facts -- see
+    # test_skill_adapters.py for that path) precisely so it stops being a
+    # generic WorldFactUpdate indistinguishable from any other fact write.
+    # world_fact_updates_for_execution must never emit one for this fact,
+    # regardless of shape.
+    assert world_fact_updates_for_execution(
         {"entity_alias_bound": {
             "alias": "33", "entity_id": "person_aaaa1111", "entity_class": "person",
             "created_by": "mc_embodied_skills.skill.remember_entity",
         }}
-    )
-
-    assert len(updates) == 1
-    assert updates[0].scope == "entity_aliases"
-    assert updates[0].key == "33"
-    assert updates[0].value == {
-        "alias": "33", "entity_id": "person_aaaa1111", "entity_class": "person",
-        "created_by": "mc_embodied_skills.skill.remember_entity",
-    }
-
-
-def test_world_fact_updates_ignore_entity_alias_bound_without_alias_or_entity_id():
+    ) == ()
     assert world_fact_updates_for_execution({"entity_alias_bound": {"entity_class": "person"}}) == ()
     assert world_fact_updates_for_execution({"entity_alias_bound": {"alias": "33"}}) == ()

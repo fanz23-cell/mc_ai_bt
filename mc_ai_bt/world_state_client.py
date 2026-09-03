@@ -53,14 +53,21 @@ class WorldStateWriter:
         node: Node,
         *,
         service_name: str = "/mc_world_state/update_facts",
+        bind_entity_alias_service_name: str = "/mc_world_state/bind_entity_alias",
         callback_group=None,
     ) -> None:
-        from mc_one.srv import UpdateWorldFacts
+        from mc_one.srv import BindEntityAlias, UpdateWorldFacts
 
         self._service_type = UpdateWorldFacts
         self._client = node.create_client(
             UpdateWorldFacts,
             service_name,
+            callback_group=callback_group,
+        )
+        self._bind_entity_alias_type = BindEntityAlias
+        self._bind_entity_alias_client = node.create_client(
+            BindEntityAlias,
+            bind_entity_alias_service_name,
             callback_group=callback_group,
         )
 
@@ -103,6 +110,40 @@ class WorldStateWriter:
         response = response_or_message
         if not bool(getattr(response, "success", False)):
             return False, str(getattr(response, "message", "") or "world_state update rejected")
+        return True, str(getattr(response, "message", "") or "ok")
+
+    def bind_entity_alias(
+        self,
+        *,
+        alias: str,
+        entity_class: str,
+        live_entity_id: str,
+        created_by: str,
+        evidence_ref: str = "",
+        timeout_sec: float = 0.5,
+    ) -> tuple[bool, str]:
+        """2026-09-03 architecture consolidation: the domain-command
+        counterpart to update_fact/update -- see world_facts.py's own
+        comment on why entity_alias_bound is no longer a generic
+        WorldFactUpdate. Calls /mc_world_state/bind_entity_alias directly."""
+        if not self._bind_entity_alias_client.service_is_ready():
+            return False, "bind_entity_alias service is not ready"
+
+        request = self._bind_entity_alias_type.Request()
+        request.alias = alias
+        request.entity_class = entity_class
+        request.live_entity_id = live_entity_id
+        request.created_by = created_by
+        request.evidence_ref = evidence_ref
+        ok, response_or_message = _wait_future(
+            self._bind_entity_alias_client.call_async(request),
+            timeout_sec=timeout_sec,
+        )
+        if not ok:
+            return False, str(response_or_message)
+        response = response_or_message
+        if not bool(getattr(response, "success", False)):
+            return False, str(getattr(response, "message", "") or "bind_entity_alias rejected")
         return True, str(getattr(response, "message", "") or "ok")
 
 

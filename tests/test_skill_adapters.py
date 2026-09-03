@@ -44,10 +44,23 @@ class FakePublisher:
 class FakeWorldState:
     def __init__(self):
         self.updates = []
+        self.bound_aliases = []
 
     def update(self, update):
         self.updates.append(update)
         return True, "ok"
+
+    def bind_entity_alias(self, *, alias, entity_class, live_entity_id, created_by, evidence_ref=""):
+        self.bound_aliases.append(
+            {
+                "alias": alias,
+                "entity_class": entity_class,
+                "live_entity_id": live_entity_id,
+                "created_by": created_by,
+                "evidence_ref": evidence_ref,
+            }
+        )
+        return True, "bound"
 
 
 class _FakeFuture:
@@ -136,6 +149,41 @@ def test_say_acquires_voice_and_face_lease_before_publish():
     ]
     assert executor._speak_pub.messages[0].utterance == "hello"
     assert executor._world_state.updates[0].key == "last_utterance"
+
+
+def test_publish_success_facts_binds_entity_alias_via_the_dedicated_domain_command():
+    # 2026-09-03 architecture consolidation: entity_alias_bound must call
+    # WorldStateWriter.bind_entity_alias directly, never route through the
+    # generic world_fact_updates_for_execution/update path (see
+    # test_world_facts.py's sibling test asserting the latter never fires
+    # for this fact).
+    executor = _executor(lease_result=LeaseResult(True, "ok", "lease-1"))
+
+    executor._publish_success_facts({
+        "entity_alias_bound": {
+            "alias": "33", "entity_id": "person_aaaa1111", "entity_class": "person",
+            "created_by": "mc_embodied_skills.skill.remember_entity",
+        }
+    })
+
+    assert executor._world_state.updates == []
+    assert executor._world_state.bound_aliases == [
+        {
+            "alias": "33",
+            "entity_class": "person",
+            "live_entity_id": "person_aaaa1111",
+            "created_by": "mc_embodied_skills.skill.remember_entity",
+            "evidence_ref": "",
+        }
+    ]
+
+
+def test_publish_success_facts_ignores_entity_alias_bound_without_alias_or_entity_id():
+    executor = _executor(lease_result=LeaseResult(True, "ok", "lease-1"))
+
+    executor._publish_success_facts({"entity_alias_bound": {"entity_class": "person"}})
+
+    assert executor._world_state.bound_aliases == []
 
 
 def test_say_does_not_publish_when_lease_is_denied():

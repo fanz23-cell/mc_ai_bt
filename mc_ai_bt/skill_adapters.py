@@ -735,6 +735,26 @@ class RosSkillExecutor:
             if not ok:
                 self._node.get_logger().debug(f"world state update skipped: {message}")
 
+        # 2026-09-03 architecture consolidation: entity_alias_bound is a
+        # domain command (bind_entity_alias), not a generic fact write --
+        # see world_facts.py's own comment on why this is handled here
+        # directly rather than folded into world_fact_updates_for_execution.
+        entity_alias_bound = facts.get("entity_alias_bound")
+        if (
+            isinstance(entity_alias_bound, dict)
+            and entity_alias_bound.get("alias")
+            and entity_alias_bound.get("entity_id")
+            and hasattr(self._world_state, "bind_entity_alias")
+        ):
+            ok, message = self._world_state.bind_entity_alias(
+                alias=str(entity_alias_bound["alias"]),
+                entity_class=str(entity_alias_bound.get("entity_class") or ""),
+                live_entity_id=str(entity_alias_bound["entity_id"]),
+                created_by=str(entity_alias_bound.get("created_by") or ""),
+            )
+            if not ok:
+                self._node.get_logger().debug(f"bind_entity_alias skipped: {message}")
+
 
 def _wait_future(
     future,
