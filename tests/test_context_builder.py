@@ -76,6 +76,10 @@ def test_context_builder_includes_deterministically_extracted_reference_constrai
     assert context["reference_constraints"] == [{
         "constraint_id": "ref_1", "entity_class": "person", "relation": "left",
         "reference_frame": "robot", "source_span": "The person on your left",
+        # No "as <name>"/"叫<name>" immediately adjacent -- legal, and
+        # still fully usable since it is the ONLY constraint here (see
+        # reference_extraction.py's own module docstring).
+        "bind_alias": "",
     }]
 
 

@@ -794,6 +794,71 @@ def test_reference_constraint_guard_accepts_a_valid_constraint_and_fills_in_rela
     assert json.loads(result.goal_spec_json)["args"]["relation"] == "left"
 
 
+# --- constraint <-> alias/binding ownership (2026-09-03, GPT re-review v2) --
+# A constraint's own relation/frame/class being real is not enough on its
+# own -- when 2+ constraints exist in the same mission, a confused (not
+# malicious) planner could still borrow a genuinely real constraint that
+# belongs to a DIFFERENT mention for THIS action's alias/name. GPT's own
+# worked example, reproduced exactly below.
+
+def test_reference_constraint_guard_rejects_a_real_constraint_that_belongs_to_a_different_alias():
+    # "The person on your left is waving. Remember the person on your
+    # right as 44." extracts TWO real constraints (left, right, via the
+    # real extractor). Referencing the LEFT one for alias "44" -- which
+    # actually belongs to "right" -- must be rejected, even though the
+    # LEFT constraint itself is completely real and independently valid.
+    mission, missions = _mission(
+        "The person on your left is waving. Remember the person on your right as 44.")
+    plan_json = _implicit_plan_with_single_action(
+        "remember_entity",
+        # ref_1 = left (extracted first); deliberately using it for "44",
+        # which the sentence actually assigns to ref_2 = right.
+        {"target": "the person", "alias": "44", "reference_constraint_id": "ref_1"},
+    )
+
+    result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
+
+    assert not result.ok
+    assert result.stage == "reference_constraint"
+    assert "not deterministically associated" in result.message
+
+
+def test_reference_constraint_guard_accepts_the_correctly_matched_constraint_among_several():
+    # Same sentence, same two constraints -- but this time referencing the
+    # RIGHT constraint (ref_2) for alias "44", which is what the sentence
+    # actually says. Must succeed.
+    mission, missions = _mission(
+        "The person on your left is waving. Remember the person on your right as 44.")
+    plan_json = _implicit_plan_with_single_action(
+        "remember_entity",
+        {"target": "the person", "alias": "44", "reference_constraint_id": "ref_2"},
+    )
+
+    result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
+
+    assert result.ok, result.message
+    assert json.loads(result.goal_spec_json)["args"]["relation"] == "right"
+
+
+def test_reference_constraint_guard_rejects_any_constraint_without_a_captured_alias_when_multiple_exist():
+    # Neither constraint has a captured bind_alias here (both use "is",
+    # never a trusted marker) -- with 2+ constraints in play, NEITHER is
+    # usable for identity binding at all, even for its own genuinely
+    # correct alias.
+    mission, missions = _mission(
+        "The person on your left is 33. The person on your right is 44.")
+    plan_json = _implicit_plan_with_single_action(
+        "remember_entity",
+        {"target": "the person", "alias": "44", "reference_constraint_id": "ref_2"},
+    )
+
+    result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
+
+    assert not result.ok
+    assert result.stage == "reference_constraint"
+    assert "not deterministically associated" in result.message
+
+
 def test_reference_constraint_guard_ignores_check_relations_own_unrelated_relation_arg():
     # check_relation's own `relation` arg is a free-text predicate string
     # ("the mug near the sink"), not a front/left/right/nearest spatial

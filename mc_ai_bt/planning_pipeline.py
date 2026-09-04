@@ -364,12 +364,19 @@ def _validate_reference_constraint(
     return relation, ""
 
 
+def _action_alias_or_name(args: dict[str, Any]) -> str:
+    """remember_entity uses `alias`, remember_person uses `name` -- the
+    same "what to call them" argument under two different key names (see
+    skill_registry.py's own args_schema for both)."""
+    return str(args.get("alias") or args.get("name") or "")
+
+
 def _apply_reference_constraint_guard(
     plan: dict[str, Any], *, context_json: str, intent_text: str,
 ) -> str | None:
     """Identity/Grounding foundation finalization (2026-09-03, GPT
     re-review): the deterministic enforcement layer for the
-    reference_constraints contract. Two rules, mirroring
+    reference_constraints contract. Three rules, mirroring
     _apply_grounding_normalizer's own shape for entity_id:
 
     - `relation` must NEVER be set directly on a remember_person/
@@ -379,14 +386,31 @@ def _apply_reference_constraint_guard(
       own say-so about `relation` is ever trusted, under any circumstance.
     - A referenced constraint must exist in the TRUSTED extractor output
       (context_json.reference_constraints, never plan.reference_constraints)
-      and pass every check in _validate_reference_constraint -- on success,
-      `relation` is filled into the action's own args (so seattle_lab's
-      skill execution code, which already just reads args.get("relation"),
-      needs no changes at all).
+      and pass every check in _validate_reference_constraint.
+    - Identity/Grounding foundation finalization v2 (2026-09-03, GPT
+      re-review): a constraint's own relation/frame/class being real and
+      verified is NOT enough on its own -- when 2+ constraints exist in the
+      same mission, a confused (not malicious) planner could still borrow
+      a genuinely real constraint that belongs to a DIFFERENT mention for
+      THIS action's alias/name (GPT's own worked example: "The person on
+      your left is waving. Remember the person on your right as 44." --
+      referencing the LEFT constraint for alias "44" would pass every
+      per-constraint check while binding the wrong person). Whenever 2+
+      constraints exist, the referenced one's own `bind_alias` (set by the
+      extractor ONLY when a sentence immediately, unambiguously names who
+      it is about -- see reference_extraction.py's own comment) must
+      exactly match this action's alias/name; a constraint with no
+      bind_alias captured is not usable for identity binding at all under
+      that condition. A SINGLE constraint is never ambiguous about which
+      action it belongs to, so no match is required there -- this is what
+      keeps intentionally cross-sentence phrasings ("There is a person
+      right in front of you. Remember them as 44.") working unchanged.
 
-    Mutates `plan` in place for the fill-in case, exactly like
-    _apply_grounding_normalizer. Returns None when the plan needs no
-    rejection.
+    On success, `relation` is filled into the action's own args (so
+    seattle_lab's skill execution code, which already just reads
+    args.get("relation"), needs no changes at all). Mutates `plan` in
+    place for the fill-in case, exactly like _apply_grounding_normalizer.
+    Returns None when the plan needs no rejection.
     """
     constraints = _trusted_reference_constraints(context_json)
     for action in _all_actions_in(plan.get("root")):
@@ -414,6 +438,17 @@ def _apply_reference_constraint_guard(
         relation, error = _validate_reference_constraint(constraint, intent_text=intent_text)
         if error:
             return f"plan's reference_constraint {constraint_id!r} on skill {skill!r} is invalid: {error}"
+        if len(constraints) > 1:
+            bind_alias = str(constraint.get("bind_alias") or "").strip()
+            action_alias = _action_alias_or_name(args)
+            if not bind_alias or _normalize_alias(bind_alias) != _normalize_alias(action_alias):
+                return (
+                    f"plan's reference_constraint {constraint_id!r} on skill {skill!r} is not "
+                    f"deterministically associated with alias/name {action_alias!r} -- multiple "
+                    "reference_constraints exist in this mission (context_json.reference_"
+                    "constraints) and this one cannot be confirmed to belong to this specific "
+                    "binding"
+                )
         args["relation"] = relation
     return None
 

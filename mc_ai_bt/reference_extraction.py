@@ -78,13 +78,59 @@ _PERSON_RELATION_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
 }
 
 
+# Identity/Grounding foundation finalization v2 (2026-09-03, GPT
+# re-review): a constraint's OWN relation/frame/class can all be real and
+# correctly verified, and it can STILL be borrowed by the wrong
+# remember_person/remember_entity action when 2+ constraints exist in the
+# same mission -- e.g. "The person on your left is waving. Remember the
+# person on your right as 44." extracts two real constraints (left, right);
+# nothing before this fix stopped a confused planner from referencing the
+# LEFT one for alias "44". _bind_alias_immediately_after captures which
+# alias/name a constraint's own sentence assigns, WHEN it does so
+# immediately and unambiguously (a tight "as <token>"/"叫<token>" marker
+# right after the relation phrase, no clause break) -- planning_pipeline.py's
+# guard then requires an EXACT match between this and the alias/name the
+# referencing action actually uses, whenever more than one constraint
+# exists (a single constraint is never ambiguous about which action it
+# belongs to, so no match is required there -- this is what keeps the
+# original E.1 phrasing, "There is a person right in front of you. Remember
+# them as 44." -- a cross-sentence PRONOUN reference no deterministic regex
+# should ever try to resolve -- working exactly as before).
+#
+# "is <token>" is deliberately NOT a marker, in either language ("is
+# waving" would otherwise be captured as alias="waving") -- only "as"
+# (English) and "叫" (Chinese) are specific, low-ambiguity naming
+# constructions in this command-style context. Missing a real alias
+# assignment this way only means that ONE constraint stays unusable for
+# identity binding when 2+ exist -- the safe direction, per the same
+# "smaller supported range over any false accept" principle the relation
+# patterns themselves already follow.
+_ALIAS_AFTER_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\s*,?\s*as\s+(?P<alias>[A-Za-z0-9_]+)", re.IGNORECASE),
+    re.compile(r"\s*叫\s*(?P<alias>[\w一-鿿]+)"),
+)
+_ALIAS_LOOKAHEAD_WINDOW = 20
+
+
+def _bind_alias_immediately_after(text: str, end: int) -> str:
+    window = text[end:end + _ALIAS_LOOKAHEAD_WINDOW]
+    for pattern in _ALIAS_AFTER_PATTERNS:
+        match = pattern.match(window)  # anchored at position 0 -- must be IMMEDIATELY adjacent
+        if match:
+            return match.group("alias")
+    return ""
+
+
 def extract_reference_constraints(intent_text: str) -> list[dict[str, Any]]:
     """Deterministic, trusted reference_constraints for `intent_text` -- see
     the module docstring for why this exists and how narrow it is by
     design. Never raises; returns [] for text with no recognized pattern.
     Each constraint's source_span is copied VERBATIM from the original (not
     lowercased) intent_text, exactly as matched -- a real quote, not a
-    reconstruction."""
+    reconstruction. `bind_alias` (see _bind_alias_immediately_after above)
+    is "" when no immediately-adjacent naming marker was found -- legal,
+    and still fully usable when it is the ONLY constraint this call
+    produces."""
     text = intent_text or ""
     constraints: list[dict[str, Any]] = []
     seen_spans: list[tuple[int, int]] = []
@@ -101,6 +147,7 @@ def extract_reference_constraints(intent_text: str) -> list[dict[str, Any]]:
                     "relation": relation,
                     "reference_frame": "robot",
                     "source_span": text[span[0]:span[1]],
+                    "bind_alias": _bind_alias_immediately_after(text, span[1]),
                 })
     return constraints
 

@@ -116,6 +116,56 @@ def test_extract_reference_constraints_never_raises_on_empty_or_none():
     assert extract_reference_constraints(None) == []
 
 
+# --- bind_alias capture (2026-09-03, GPT re-review v2) -----------------------
+# A constraint's relation/frame/class being real is not enough on its own --
+# it can still be borrowed by the wrong remember_person/remember_entity
+# action when 2+ constraints exist in the same mission. bind_alias captures
+# which alias/name a constraint's OWN sentence assigns, when it does so
+# immediately and unambiguously; planning_pipeline.py's guard then requires
+# an exact match whenever more than one constraint exists.
+
+def test_bind_alias_captured_from_an_immediately_adjacent_as_clause():
+    result = extract_reference_constraints("Remember the person on your left as 44.")
+    assert result[0]["bind_alias"] == "44"
+
+
+def test_bind_alias_captured_from_the_chinese_jiao_marker():
+    result = extract_reference_constraints("记住你左边的人叫44")
+    assert result[0]["bind_alias"] == "44"
+
+
+def test_bind_alias_is_empty_without_an_immediately_adjacent_marker():
+    # The original E.1 phrasing -- a cross-sentence PRONOUN reference no
+    # deterministic regex should ever try to resolve. Legal: this
+    # constraint is still fully usable, because it is the ONLY one
+    # extracted here (see reference_extraction.py's own module docstring).
+    result = extract_reference_constraints("There is a person right in front of you. Remember them as 44.")
+    assert result[0]["bind_alias"] == ""
+
+
+def test_bind_alias_is_never_captured_from_the_word_is():
+    # GPT's own worked counter-example: "is <word>" is deliberately NOT a
+    # naming marker in either language -- "is waving" must never be
+    # captured as if "waving" were an alias. Only "as" (English) and "叫"
+    # (Chinese) are specific enough naming constructions to trust.
+    result = extract_reference_constraints(
+        "The person on your left is waving. Remember the person on your right as 44.")
+
+    assert _relation_of(result) == ["left", "right"]
+    left, right = result
+    assert left["bind_alias"] == ""  # "is waving" -- never mistaken for a name
+    assert right["bind_alias"] == "44"  # "as 44" -- a real, adjacent naming marker
+
+
+def test_bind_alias_is_never_captured_across_a_clause_break():
+    # A comma alone does not grant enough adjacency for "is"-style
+    # markers; only "as"/"叫" are trusted at all, and only immediately
+    # after the relation phrase, per the module's own tight-adjacency
+    # design (mirroring the relation patterns themselves).
+    result = extract_reference_constraints("The person on your left, who is waving, is 33.")
+    assert result[0]["bind_alias"] == ""
+
+
 # --- has_explicit_look_instruction -------------------------------------
 
 def test_look_instruction_recognizes_look_to_your_left():
