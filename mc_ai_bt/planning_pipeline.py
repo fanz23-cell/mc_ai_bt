@@ -398,25 +398,26 @@ def _apply_reference_constraint_guard(
       person). Whenever the referenced constraint's own `bind_alias` (set
       by the extractor ONLY when a sentence unambiguously names who it is
       about -- see reference_extraction.py's own comment) is non-empty, it
-      must exactly match this action's alias/name -- this check does NOT
-      depend on how many other constraints exist in the mission. A v2
-      round of this fix conditioned the check on "2+ constraints exist",
-      reasoning that a single constraint could never be ambiguous about
-      which action it belongs to -- GPT's re-review found that reasoning
-      incomplete: a single constraint can still carry a bind_alias that
-      simply does not match the action referencing it (e.g. "Remember the
-      person on your left as 33" extracts one constraint with
-      bind_alias="33"; a planner mistakenly writing name="44" while still
-      referencing it must be rejected, exactly like the 2+-constraint
-      case, not silently let through because there happened to be nothing
-      else it could have been confused with). Only when bind_alias is
-      EMPTY (the extractor found no unambiguous naming marker at all) does
-      this check step aside -- and reference_extraction.py's own
-      cross-sentence pattern now covers the specific phrasing that used to
-      rely on this ("There is a person right in front of you. Remember
-      them as 44." now captures bind_alias="44" directly, via an explicit,
-      narrow "next sentence names the pronoun" pattern -- not a blanket
-      exemption for being the only constraint in the mission).
+      must exactly match this action's alias/name.
+    - Identity/Grounding foundation finalization v4 (2026-09-04, GPT
+      re-review): v3's own fix still had one exception left -- an EMPTY
+      bind_alias was accepted without a match whenever only ONE constraint
+      existed in the mission (`elif len(constraints) > 1`), reasoning a
+      lone constraint could never be ambiguous about which action it
+      belongs to. GPT's re-review found this exception itself still lets
+      an unowned real spatial constraint -- relation/frame/class all
+      genuinely verified, but the sentence never actually names WHO it is
+      for -- be used for identity binding under ANY alias the planner
+      happens to write, as long as it is the only constraint present in
+      that mission. Fixed: an empty bind_alias is now rejected
+      unconditionally, with no exception for constraint count. A
+      reference_constraint is usable for identity binding only when its
+      own sentence unambiguously names the specific alias/name being
+      bound -- full stop, regardless of how many other constraints exist.
+      The original E.1 phrasing ("There is a person right in front of you.
+      Remember them as 44.") was never relying on this exception to begin
+      with -- v3's own cross-sentence pattern already captures
+      bind_alias="44" for it directly -- so it keeps working unchanged.
 
     On success, `relation` is filled into the action's own args (so
     seattle_lab's skill execution code, which already just reads
@@ -460,13 +461,14 @@ def _apply_reference_constraint_guard(
                     f"uses {action_alias!r} -- a reference_constraint can only be used for the "
                     "specific binding its own sentence actually names"
                 )
-        elif len(constraints) > 1:
+        else:
             return (
                 f"plan's reference_constraint {constraint_id!r} on skill {skill!r} is not "
-                f"deterministically associated with alias/name {action_alias!r} -- multiple "
-                "reference_constraints exist in this mission (context_json.reference_"
-                "constraints) and this one cannot be confirmed to belong to this specific "
-                "binding"
+                f"deterministically associated with alias/name {action_alias!r} -- this "
+                "constraint's own sentence never unambiguously names who it is for "
+                "(context_json.reference_constraints[...].bind_alias is empty), so it cannot "
+                "be confirmed to belong to this specific binding, regardless of how many other "
+                "reference_constraints exist in this mission"
             )
         args["relation"] = relation
     return None

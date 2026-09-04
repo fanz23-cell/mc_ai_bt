@@ -209,7 +209,19 @@ def test_planning_pipeline_still_drops_a_redundant_look_at_when_a_constraint_sup
     # never from look_at's own direction (which here points a DIFFERENT
     # way -- "left" -- than the resolved "front", proving the constraint,
     # not the look_at, is the real source).
-    mission, missions = _mission("There is a person right in front of you. Remember this as 33")
+    #
+    # FOUND while applying the v4 fix (2026-09-04): the original sentence
+    # here used "Remember THIS as 33" -- _CROSS_SENTENCE_ALIAS_PATTERNS
+    # only recognizes "them/him/her/it", not "this", so it captured
+    # bind_alias="" under the real, UNCHANGED extractor grammar. That was
+    # fine before v4 (a lone constraint with an empty bind_alias was still
+    # accepted), but v4 rejects an empty bind_alias unconditionally -- so
+    # this test, whose actual purpose is entirely the look_at/relation
+    # decoupling above and has nothing to do with bind_alias ownership,
+    # needs a sentence whose bind_alias is actually captured. Swapped the
+    # pronoun to "them" (an already-supported form) -- nothing else about
+    # the test changed.
+    mission, missions = _mission("There is a person right in front of you. Remember them as 33")
     plan_json = json.dumps({
         "schema": "mc_ai_bt.plan.v1",
         "root": {
@@ -782,7 +794,20 @@ def test_reference_constraint_guard_rejects_a_constraint_describing_a_different_
 
 
 def test_reference_constraint_guard_accepts_a_valid_constraint_and_fills_in_relation():
-    mission, missions = _mission("The person on your left, remember them as 44")
+    # FOUND while applying the v4 fix below (2026-09-04): this test's
+    # original sentence -- "The person on your left, remember them as
+    # 44" -- is comma-joined, not the tight same-clause "as" marker
+    # (_ALIAS_AFTER_PATTERNS requires immediate adjacency after the
+    # relation phrase) and not the period-separated cross-sentence
+    # pattern either -- so it captures bind_alias="" under the real,
+    # UNCHANGED extractor grammar. Once the v4 fix below removes the
+    # empty-bind_alias singleton exception, that sentence would now be
+    # correctly REJECTED, not accepted -- this basic accept-path smoke
+    # test needs a sentence whose bind_alias is actually captured to keep
+    # testing what it always intended to (plain accept + relation
+    # fill-in), so the phrasing changed to the tight same-clause "as"
+    # form. Nothing about relation/alias expectations changed.
+    mission, missions = _mission("Remember the person on your left as 44.")
     plan_json = _implicit_plan_with_single_action(
         "remember_entity",
         {"target": "the person", "alias": "44", "reference_constraint_id": "ref_1"},
@@ -892,6 +917,44 @@ def test_reference_constraint_guard_still_accepts_the_cross_sentence_e1_phrasing
 
     assert result.ok, result.message
     assert json.loads(result.goal_spec_json)["args"]["relation"] == "front"
+
+
+def test_reference_constraint_guard_rejects_a_single_constraint_with_no_captured_bind_alias():
+    # THE v4 fix (2026-09-04, GPT re-review): v3 only required a
+    # non-empty bind_alias to match the action's alias/name -- an EMPTY
+    # bind_alias was still silently accepted whenever it was the ONLY
+    # constraint in the mission (elif len(constraints) > 1), reasoning a
+    # lone constraint could never be ambiguous about which action it
+    # belongs to. GPT's re-review found that exception itself lets an
+    # unowned real spatial constraint (relation/frame/class all genuinely
+    # verified, but the sentence never actually names WHO it is for) be
+    # used for identity binding under ANY alias the planner happens to
+    # write, as long as nothing else is around to be confused with. Fixed:
+    # empty bind_alias is now rejected unconditionally, no matter how many
+    # constraints exist. "There is a person right in front of you. They
+    # seem friendly." extracts exactly ONE constraint (front), with no
+    # naming marker anywhere -- bind_alias="" -- so referencing it for
+    # ANY alias must now be rejected.
+    mission, missions = _mission("There is a person right in front of you. They seem friendly.")
+    plan_json = _implicit_plan_with_single_action(
+        "remember_entity",
+        {"target": "the person", "alias": "44", "reference_constraint_id": "ref_1"},
+    )
+
+    result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
+
+    assert not result.ok
+    assert result.stage == "reference_constraint"
+    assert "not deterministically associated" in result.message
+
+
+# NOTE: the "single constraint, real bind_alias, accept" regression asked
+# for alongside the v4 fix above -- the original E.1 cross-sentence
+# phrasing ("There is a person right in front of you. Remember them as
+# 44."), bind_alias="44", referenced for alias "44" -- is already covered
+# verbatim by test_reference_constraint_guard_still_accepts_the_cross_
+# sentence_e1_phrasing above (added in v3, when the cross-sentence
+# pattern was introduced); not duplicated here.
 
 
 def test_reference_constraint_guard_rejects_any_constraint_without_a_captured_alias_when_multiple_exist():
