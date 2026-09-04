@@ -31,6 +31,33 @@ def test_context_builder_includes_world_missions_and_skills():
     assert skills["point_at"]["policy_enabled"] is True
 
 
+def test_context_builder_bounds_mission_history_to_the_most_recent():
+    # FOUND LIVE 2026-09-03: this used to serialize EVERY mission the node
+    # has EVER handled since its last cold start (replayed from the
+    # persisted mission journal on every restart, so it never actually
+    # shrinks) -- 204 accumulated missions from this session alone were
+    # enough to push a real planner call over gpt-4o-mini's 128000-token
+    # limit, live, blocking every subsequent mission on the deployed
+    # system. Nothing downstream ever reads context.missions at all
+    # (grep-confirmed: not planner.py's prompt, not goal_check.py,
+    # anywhere) -- pure unbounded dead weight for zero benefit.
+    manager = MissionManager()
+    missions = []
+    for i in range(15):
+        _accepted, _message, mission, _event = manager.submit(
+            intent_text=f"mission {i}", source="voice", operator_id="user",
+            parent_mission_id="", priority=10, allow_queue=True, context_json="{}",
+        )
+        missions.append(mission)
+    builder = ContextBuilder()
+
+    context = json.loads(builder.build_json(missions[-1], manager.all()))
+
+    assert len(context["missions"]) == 10
+    assert context["missions"][-1]["mission_id"] == missions[-1].identity.mission_id
+    assert context["missions"][0]["mission_id"] == missions[5].identity.mission_id
+
+
 def test_context_builder_ignores_invalid_caller_context():
     manager = MissionManager()
     _accepted, _message, mission, _event = manager.submit(

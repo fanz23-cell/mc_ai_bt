@@ -13,6 +13,23 @@ SnapshotProvider = Callable[[tuple[str, ...], float], str]
 
 DEFAULT_SCOPES = ("navigation", "people", "objects", "robot", "tasks")
 
+# FOUND LIVE 2026-09-03 (identity/grounding foundation live verification):
+# build_json below used to serialize EVERY mission this node has ever
+# handled since its last cold start into context.missions, unbounded --
+# MissionManager.all() is replayed from the persisted mission journal on
+# startup, so this genuinely never shrinks, even across a redeploy. 204
+# accumulated missions this session alone were enough to push a real
+# gpt-4o-mini planner call over its 128000-token limit (confirmed live:
+# OpenAIContextOverflowError, blocking every subsequent mission on the
+# live system, not just a test). Grep-confirmed nothing downstream --
+# planner.py's prompt, goal_check.py, anywhere else -- ever reads
+# context.missions at all (task_projection.py has its own, separate,
+# differently-purposed missions field for the monitor/status API); this
+# was pure dead weight, growing forever, for zero benefit. Bounded to the
+# most recent few rather than dropped outright, in case a future planner
+# backend does want short recent-history context.
+_MAX_MISSION_HISTORY = 10
+
 
 class ContextBuilder:
     """Build the bounded planner context passed to the BT planner."""
@@ -44,7 +61,7 @@ class ContextBuilder:
             },
             "caller_context": caller_context,
             "world": self._snapshot(),
-            "missions": [_mission_summary(item) for item in missions],
+            "missions": [_mission_summary(item) for item in missions[-_MAX_MISSION_HISTORY:]],
             "skills": [
                 {
                     "name": spec.name,
