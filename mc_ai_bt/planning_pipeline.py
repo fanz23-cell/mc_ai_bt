@@ -305,6 +305,108 @@ _DIRECTION_TO_RELATION = {
 }
 
 
+# Gate-1.1 (2026-09-03, GPT review): a curated, deliberately small lexicon of
+# spatial-reference phrasings (English + Chinese -- intent_text can arrive
+# from either the HTTP bridge or the voice pipeline's ASR) used to check
+# whether a `relation` value the plan ends up with actually has textual
+# support in what the user said. Bare "left"/"right" are intentionally
+# EXCLUDED: an unrelated use of the word ("he left the room") would falsely
+# justify a relation the user never actually expressed -- a real spatial
+# phrasing this list misses only causes a safe rejection (see
+# _apply_reference_constraint_guard below), matching
+# _apply_deterministic_goal_spec's own "replanning/rejecting beats guessing
+# wrong" principle. Curated, not exhaustive -- extend as real missions
+# surface a phrasing this misses.
+_RELATION_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "front": (
+        "in front of you", "in front of me", "right in front", "in front",
+        "ahead of you", "ahead of me",
+        "正前方", "正前面", "你面前", "我面前", "前面那个",
+    ),
+    "left": (
+        "on your left", "on my left", "to your left", "to my left", "on the left",
+        "左边", "左侧", "左手边",
+    ),
+    "right": (
+        "on your right", "on my right", "to your right", "to my right", "on the right",
+        "右边", "右侧", "右手边",
+    ),
+    "nearest": (
+        "nearest", "closest",
+        "最近的", "离你最近", "离我最近",
+    ),
+}
+
+
+def _reference_constraints_in(intent_text: str) -> set[str]:
+    """Which of front/left/right/nearest the mission's own intent_text
+    actually contains textual support for -- see _RELATION_KEYWORDS above
+    for why this is deliberately conservative (biased toward missing a
+    legitimate phrasing over falsely accepting an invented one)."""
+    text = (intent_text or "").casefold()
+    return {
+        relation
+        for relation, phrases in _RELATION_KEYWORDS.items()
+        if any(phrase in text for phrase in phrases)
+    }
+
+
+def _apply_reference_constraint_guard(plan: dict[str, Any], intent_text: str) -> str | None:
+    """Gate-1.1 (2026-09-03, GPT review): Gate-1's P0-2 fix made `relation`
+    on remember_person/remember_entity authoritative against real geometry
+    once supplied -- but nothing ever checked WHERE `relation` itself came
+    from. Two distinct real exposures, both closed by the same check:
+
+    1. The LLM planner can simply invent relation="left" with no basis in
+       what the user actually said. Every fact downstream of that point is
+       real (ResolveEntityReference genuinely finds who is on the left) --
+       but the foundational claim, "the user meant the one on the left",
+       was never real, and the alias would be durably bound to the wrong
+       physical entity.
+    2. _terminal_self_locating_action's own look_at-absorption (Gate-1
+       P1-1) has the identical exposure from a second direction:
+       look_at(direction="left") can be a literal physical instruction
+       ("turn left and look"), unrelated to which entity is meant, but
+       gets absorbed into `relation` with no check that "left" was ever
+       really a reference rather than a movement command.
+
+    Deterministic enforcement: any relation present in the FINAL plan (LLM-
+    authored directly on the Action, or absorbed from look_at) on a
+    remember_person/remember_entity Action must be one of the constraints
+    _reference_constraints_in finds real textual support for in the
+    mission's own intent_text. A relation the user's own words do not
+    support is rejected outright, exactly like an invented entity_id
+    (_apply_grounding_normalizer above) or an AMBIGUOUS/NOT_FOUND
+    ResolveEntityReference answer -- refuse rather than guess.
+
+    KNOWN LIMIT, not papered over: this cannot yet distinguish "turn left,
+    then remember whoever you see" (look_at as a genuine, unambiguous
+    physical instruction) from an invented reference -- intent_text
+    containing no front/left/right/nearest phrasing at all rejects BOTH,
+    since text alone cannot tell them apart. That is the conservative,
+    correct choice for now (a safe replan/rejection, never a silently
+    wrong bind); a real fix needs look_at to carry its own
+    reference-vs-movement provenance, out of scope for this bounded round.
+    """
+    allowed = _reference_constraints_in(intent_text)
+    for action in _all_actions_in(plan.get("root")):
+        skill = str(action.get("skill") or "")
+        if skill not in _SELF_LOCATING_TERMINAL_SKILLS:
+            continue
+        args = action.get("args") if isinstance(action.get("args"), dict) else None
+        if not args:
+            continue
+        relation = str(args.get("relation") or "").strip().lower()
+        if relation and relation not in allowed:
+            return (
+                f"plan uses relation {relation!r} on skill {skill!r} that the mission's own "
+                "intent_text does not actually support -- relation must trace to the user's "
+                "real words, never invented by the planner or assumed from an unrelated "
+                "look_at direction"
+            )
+    return None
+
+
 # FOUND LIVE 2026-09-03 (GPT review, Gate-1): _terminal_self_locating_action
 # used to operate on a flat, position-blind list of every physical Action
 # anywhere in the tree (_physical_actions_in's own contract, by design, for
@@ -571,6 +673,16 @@ class PlanningPipeline:
             )
 
         _canonicalize_redundant_locate_prefix(plan)
+
+        reference_error = _apply_reference_constraint_guard(plan, mission.intent_text)
+        if reference_error:
+            return PlanningResult(
+                False,
+                "reference_constraint",
+                reference_error,
+                context_json=context_json,
+                plan_json=plan_json,
+            )
 
         grounding_error = _apply_grounding_normalizer(plan, context_json)
         if grounding_error:

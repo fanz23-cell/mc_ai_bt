@@ -7,6 +7,7 @@ pytest.importorskip("mc_one")
 
 from action_msgs.msg import GoalStatus
 
+from mc_ai_bt.executor import ExecutionResult
 from mc_ai_bt.identity import Identity
 from mc_ai_bt.resource_client import LeaseResult
 from mc_ai_bt.skill_adapters import ActionBinding, RosSkillExecutor, _binding_with_node_timeout
@@ -61,6 +62,21 @@ class FakeWorldState:
             }
         )
         return True, "bound"
+
+
+class FakeWorldStateWithoutBind:
+    """A WorldState-shaped double with no bind_entity_alias method at all --
+    Gate-1.1's fail-closed test for a world-state connection that genuinely
+    lacks the identity-registry capability, as opposed to FakeWorldState
+    (has it, and it succeeds) or _world_state being None entirely (no
+    connection at all)."""
+
+    def __init__(self):
+        self.updates = []
+
+    def update(self, update):
+        self.updates.append(update)
+        return True, "ok"
 
 
 class _FakeFuture:
@@ -178,12 +194,94 @@ def test_publish_success_facts_binds_entity_alias_via_the_dedicated_domain_comma
     ]
 
 
-def test_publish_success_facts_ignores_entity_alias_bound_without_alias_or_entity_id():
+def test_publish_success_facts_forwards_evidence_ref_to_bind_entity_alias():
+    # Gate-1.1 (2026-09-03, GPT review): EntityIdentityRegistry has stored
+    # evidence_ref/reason since Gate-1's P1-4 fix, but nothing on this real
+    # call path ever actually supplied one -- "why did this semantic entity
+    # get bound to this live entity" could never be answered. Confirms the
+    # real production value (see seattle_lab's _remember_entity_skill) now
+    # reaches the registry, not just a synthetic unit-test string.
     executor = _executor(lease_result=LeaseResult(True, "ok", "lease-1"))
 
-    executor._publish_success_facts({"entity_alias_bound": {"entity_class": "person"}})
+    executor._publish_success_facts({
+        "entity_alias_bound": {
+            "alias": "33", "entity_id": "person_aaaa1111", "entity_class": "person",
+            "created_by": "mc_embodied_skills.skill.remember_entity",
+            "evidence_ref": "resolve_entity_reference:person:front",
+        }
+    })
 
+    assert executor._world_state.bound_aliases[0]["evidence_ref"] == "resolve_entity_reference:person:front"
+
+
+# --- entity_alias_bound fail-closed (2026-09-03, GPT review, Gate-1.1) ----
+# Gate-1's P0-3 fix made a REJECTED bind_entity_alias call block the
+# mission -- but the rejection check only ever ran inside the
+# "world_state is not None and hasattr(..., bind_entity_alias)" guard.
+# Anything that kept execution from ever REACHING that guard (no writer at
+# all, a writer that lacks the method, a malformed payload) fell through to
+# a bare `return ""` -- SUCCESS, despite the identity claim never reaching
+# any registry. These are the regression tests for each of those corners.
+
+def test_publish_success_facts_rejects_entity_alias_bound_missing_alias_or_entity_id():
+    executor = _executor(lease_result=LeaseResult(True, "ok", "lease-1"))
+
+    error = executor._publish_success_facts({"entity_alias_bound": {"entity_class": "person"}})
+
+    assert error != ""
     assert executor._world_state.bound_aliases == []
+
+
+def test_publish_success_facts_blocks_when_there_is_no_world_state_writer_at_all():
+    executor = _executor(lease_result=LeaseResult(True, "ok", "lease-1"))
+    executor._world_state = None
+
+    error = executor._publish_success_facts({
+        "entity_alias_bound": {
+            "alias": "33", "entity_id": "person_aaaa1111", "entity_class": "person",
+            "created_by": "mc_embodied_skills.skill.remember_entity",
+        }
+    })
+
+    assert error != ""
+
+
+def test_publish_success_facts_blocks_when_the_world_state_writer_lacks_bind_entity_alias():
+    executor = _executor(lease_result=LeaseResult(True, "ok", "lease-1"))
+    executor._world_state = FakeWorldStateWithoutBind()
+
+    error = executor._publish_success_facts({
+        "entity_alias_bound": {
+            "alias": "33", "entity_id": "person_aaaa1111", "entity_class": "person",
+            "created_by": "mc_embodied_skills.skill.remember_entity",
+        }
+    })
+
+    assert error != ""
+
+
+def test_finalize_downgrades_success_when_there_is_no_identity_registry_connection():
+    # The end-to-end contract every _*_skill call site depends on: a skill
+    # that constructs ExecutionResult(success=True, ...facts with
+    # entity_alias_bound...) must never have that success stand if the
+    # identity write never actually happened.
+    executor = _executor(lease_result=LeaseResult(True, "ok", "lease-1"))
+    executor._world_state = None
+    execution = ExecutionResult(
+        True,
+        "remember_entity: bound '33' to person_aaaa1111",
+        {
+            "entity_alias_bound": {
+                "alias": "33", "entity_id": "person_aaaa1111", "entity_class": "person",
+                "created_by": "mc_embodied_skills.skill.remember_entity",
+            },
+        },
+    )
+
+    result = executor._finalize(execution)
+
+    assert not result.success
+    assert result.blocked
 
 
 def test_say_does_not_publish_when_lease_is_denied():

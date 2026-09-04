@@ -723,13 +723,14 @@ class RosSkillExecutor:
             return None
 
     def _publish_success_facts(self, facts: dict[str, Any]) -> str:
-        """Returns "" when every world-state write either succeeded or is
-        legitimately best-effort (the ordinary facts below always are --
-        losing a robot.last_animation write is not worth failing a mission
-        over). Returns a non-empty error message ONLY when entity_alias_bound
-        itself was rejected by the identity registry -- callers MUST
-        downgrade their own ExecutionResult from success to failure in that
-        case.
+        """Returns "" when there is no entity_alias_bound claim to honor, or
+        it was actually committed to the identity registry. Every ordinary
+        world_fact_updates_for_execution write (robot.last_animation and
+        friends) stays best-effort regardless -- losing one of those is
+        still not worth failing a mission over. Returns a non-empty error
+        message whenever facts claims entity_alias_bound but committing it
+        authoritatively did not actually happen -- callers MUST downgrade
+        their own ExecutionResult from success to failure in that case.
 
         FOUND LIVE 2026-09-03 (GPT review, Gate-1): this used to return None
         unconditionally, called AFTER the caller had already built an
@@ -742,34 +743,55 @@ class RosSkillExecutor:
         entity_alias_bound is not a best-effort fact, it is the skill's own
         actual claimed outcome (`remember_entity: bound {alias!r} to
         {entity_id}`), so if the identity registry refuses it, the mission
-        genuinely did not succeed."""
-        if self._world_state is None:
-            return ""
-        for update in world_fact_updates_for_execution(facts):
-            ok, message = self._world_state.update(update)
-            if not ok:
-                self._node.get_logger().debug(f"world state update skipped: {message}")
+        genuinely did not succeed.
+
+        FOUND LIVE 2026-09-03 (GPT review, Gate-1.1): that fix still had a
+        fail-OPEN corner -- the rejection check above only ever ran INSIDE
+        the `self._world_state is not None and hasattr(..., "bind_entity_alias")`
+        guard. A WorldStateWriter that failed to construct at all
+        (_build_world_state_writer's own try/except, logged as a warning
+        and left None) or one that genuinely lacked the method meant
+        entity_alias_bound was silently SKIPPED entirely -- SUCCESS,
+        despite the skill's own claimed identity binding never reaching the
+        registry at all. Fixed: once facts carries entity_alias_bound at
+        all, committing it is mandatory, not best-effort -- "no world state
+        writer", "writer lacks bind_entity_alias", a malformed payload
+        (missing alias/entity_id), and a real registry rejection now all
+        return a non-empty error and block the mission the same way."""
+        if self._world_state is not None:
+            for update in world_fact_updates_for_execution(facts):
+                ok, message = self._world_state.update(update)
+                if not ok:
+                    self._node.get_logger().debug(f"world state update skipped: {message}")
 
         # 2026-09-03 architecture consolidation: entity_alias_bound is a
         # domain command (bind_entity_alias), not a generic fact write --
         # see world_facts.py's own comment on why this is handled here
         # directly rather than folded into world_fact_updates_for_execution.
         entity_alias_bound = facts.get("entity_alias_bound")
-        if (
-            isinstance(entity_alias_bound, dict)
-            and entity_alias_bound.get("alias")
-            and entity_alias_bound.get("entity_id")
-            and hasattr(self._world_state, "bind_entity_alias")
-        ):
-            ok, message = self._world_state.bind_entity_alias(
-                alias=str(entity_alias_bound["alias"]),
-                entity_class=str(entity_alias_bound.get("entity_class") or ""),
-                live_entity_id=str(entity_alias_bound["entity_id"]),
-                created_by=str(entity_alias_bound.get("created_by") or ""),
+        if not isinstance(entity_alias_bound, dict):
+            return ""
+
+        alias = str(entity_alias_bound.get("alias") or "")
+        entity_id = str(entity_alias_bound.get("entity_id") or "")
+        if not alias or not entity_id:
+            return (
+                "entity_alias_bound facts are malformed (missing alias/entity_id) -- "
+                "a skill must never claim entity_alias_bound without both"
             )
-            if not ok:
-                self._node.get_logger().warning(f"bind_entity_alias rejected: {message}")
-                return f"entity_alias_bound was not accepted by the identity registry: {message}"
+        if self._world_state is None or not hasattr(self._world_state, "bind_entity_alias"):
+            return "entity_alias_bound cannot be committed: no identity registry connection is available"
+
+        ok, message = self._world_state.bind_entity_alias(
+            alias=alias,
+            entity_class=str(entity_alias_bound.get("entity_class") or ""),
+            live_entity_id=entity_id,
+            created_by=str(entity_alias_bound.get("created_by") or ""),
+            evidence_ref=str(entity_alias_bound.get("evidence_ref") or ""),
+        )
+        if not ok:
+            self._node.get_logger().warning(f"bind_entity_alias rejected: {message}")
+            return f"entity_alias_bound was not accepted by the identity registry: {message}"
         return ""
 
     def _finalize(self, execution: ExecutionResult) -> ExecutionResult:

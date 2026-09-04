@@ -162,7 +162,11 @@ def test_planning_pipeline_absorbs_a_redundant_look_at_into_relation():
     # consume to disambiguate 2+ candidates), and ONLY THEN is look_at
     # removed -- no information lost, unlike the original bug, and no
     # longer needlessly blocked either.
-    mission, missions = _mission("remember this as 33")
+    # Gate-1.1 (2026-09-03, GPT review): intent_text must actually contain
+    # textual support for "front" -- _apply_reference_constraint_guard now
+    # rejects a relation the mission's own words do not support, regardless
+    # of whether it was LLM-authored directly or absorbed from look_at.
+    mission, missions = _mission("There is a person right in front of you. Remember this as 33")
     plan_json = _implicit_plan_with_actions([
         {"type": "Action", "skill": "look_at", "args": {"direction": "front"}},
         {"type": "Action", "skill": "remember_entity", "args": {"target": "the person", "alias": "33"}},
@@ -205,7 +209,11 @@ def test_planning_pipeline_does_not_override_an_already_specific_terminal_action
     # remember_entity already specifies its own relation -- a preceding
     # look_at's bearing must never override or duplicate that; left
     # completely untouched (still 2 physical actions, still policy-rejected).
-    mission, missions = _mission("remember this as 33")
+    # Gate-1.1 (2026-09-03, GPT review): intent_text must support "nearest"
+    # too, or _apply_reference_constraint_guard would reject this plan for
+    # that reason before it ever reaches the override check this test means
+    # to exercise.
+    mission, missions = _mission("remember the nearest person as 33")
     plan_json = _implicit_plan_with_actions([
         {"type": "Action", "skill": "look_at", "args": {"direction": "left"}},
         {"type": "Action", "skill": "remember_entity",
@@ -581,6 +589,76 @@ def test_grounding_normalizer_accepts_the_correct_id_when_multiple_aliases_are_g
     )
     plan_json = _implicit_plan_with_single_action(
         "approach_entity", {"target": "33", "entity_id": "person_A"})
+
+    result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
+
+    assert result.ok, result.message
+
+
+# --- reference constraint guard (2026-09-03, GPT review, Gate-1.1) --------
+# Gate-1's P0-2 fix made `relation` authoritative against real geometry once
+# supplied -- but nothing checked WHERE `relation` itself came from. These
+# tests are the deterministic backstop for GPT's own worked example: a
+# planner can invent relation="left" with no basis in what the user
+# actually said, and ResolveEntityReference would then very reliably (and
+# wrongly) bind the alias to whoever is genuinely on the left.
+
+def test_reference_constraint_guard_rejects_a_relation_invented_with_no_textual_support():
+    # The user's own words never mention a side at all -- a planner-authored
+    # relation="left" here would have no basis in reality, exactly the
+    # cross-wire GPT's example describes.
+    mission, missions = _mission("Remember this person as 44")
+    plan_json = _implicit_plan_with_single_action(
+        "remember_entity", {"target": "the person", "alias": "44", "relation": "left"})
+
+    result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
+
+    assert not result.ok
+    assert result.stage == "reference_constraint"
+    assert "left" in result.message
+
+
+def test_reference_constraint_guard_accepts_a_relation_the_intent_text_actually_supports():
+    mission, missions = _mission("The person on your left, remember them as 44")
+    plan_json = _implicit_plan_with_single_action(
+        "remember_entity", {"target": "the person", "alias": "44", "relation": "left"})
+
+    result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
+
+    assert result.ok, result.message
+
+
+def test_reference_constraint_guard_accepts_a_chinese_bearing_phrase():
+    # intent_text may arrive from the voice pipeline's ASR, not just the
+    # HTTP bridge's English text -- the lexicon must cover both.
+    mission, missions = _mission("记住正前方的人叫44")
+    plan_json = _implicit_plan_with_single_action(
+        "remember_entity", {"target": "the person", "alias": "44", "relation": "front"})
+
+    result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
+
+    assert result.ok, result.message
+
+
+def test_reference_constraint_guard_accepts_a_closest_synonym_for_nearest():
+    mission, missions = _mission("remember the closest person as 44")
+    plan_json = _implicit_plan_with_single_action(
+        "remember_entity", {"target": "the person", "alias": "44", "relation": "nearest"})
+
+    result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
+
+    assert result.ok, result.message
+
+
+def test_reference_constraint_guard_ignores_check_relations_own_unrelated_relation_arg():
+    # check_relation's own `relation` arg is a free-text predicate string
+    # ("the mug near the sink"), not a front/left/right/nearest spatial
+    # disambiguator -- the guard only inspects remember_person/
+    # remember_entity (_SELF_LOCATING_TERMINAL_SKILLS) and must never
+    # false-trigger on this unrelated, same-named arg.
+    mission, missions = _mission("is the mug near the sink")
+    plan_json = _implicit_plan_with_single_action(
+        "check_relation", {"relation": "the mug near the sink"})
 
     result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
 
