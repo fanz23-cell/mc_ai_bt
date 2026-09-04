@@ -134,12 +134,30 @@ def test_bind_alias_captured_from_the_chinese_jiao_marker():
     assert result[0]["bind_alias"] == "44"
 
 
-def test_bind_alias_is_empty_without_an_immediately_adjacent_marker():
-    # The original E.1 phrasing -- a cross-sentence PRONOUN reference no
-    # deterministic regex should ever try to resolve. Legal: this
-    # constraint is still fully usable, because it is the ONLY one
-    # extracted here (see reference_extraction.py's own module docstring).
+def test_bind_alias_captures_the_original_e1_cross_sentence_phrasing():
+    # (2026-09-03, GPT re-review v3): the original E.1 phrasing used to be
+    # documented as an "acceptable bind_alias='' case, safe because it is
+    # the only constraint" -- GPT's re-review found relying on that
+    # singleton exemption was itself incomplete (a single constraint CAN
+    # still be used for the wrong alias if the planner names one that
+    # doesn't match). Fixed properly: reference_extraction.py now has an
+    # explicit, narrow cross-sentence pattern ("<clause>. Remember them/
+    # him/her/it as <token>.") that captures this bind_alias directly,
+    # rather than depending on there being nothing else to confuse it
+    # with. See test_bind_alias_is_empty_with_no_naming_continuation_at_all
+    # below for a genuinely still-unresolvable case.
     result = extract_reference_constraints("There is a person right in front of you. Remember them as 44.")
+    assert result[0]["bind_alias"] == "44"
+
+
+def test_bind_alias_is_empty_with_no_naming_continuation_at_all():
+    # No "as"/"叫" marker anywhere nearby, same-clause or next-sentence --
+    # genuinely no deterministic way to know who this is for. Still legal
+    # and still usable AS THE SOLE constraint (planning_pipeline.py's
+    # guard only requires a match when bind_alias is non-empty, or when
+    # 2+ constraints exist) -- just not verifiable against a SPECIFIC
+    # alias/name the way the "as"/cross-sentence cases now are.
+    result = extract_reference_constraints("There is a person right in front of you. They seem friendly.")
     assert result[0]["bind_alias"] == ""
 
 

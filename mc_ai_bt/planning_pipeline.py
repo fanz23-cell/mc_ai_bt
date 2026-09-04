@@ -387,24 +387,36 @@ def _apply_reference_constraint_guard(
     - A referenced constraint must exist in the TRUSTED extractor output
       (context_json.reference_constraints, never plan.reference_constraints)
       and pass every check in _validate_reference_constraint.
-    - Identity/Grounding foundation finalization v2 (2026-09-03, GPT
+    - Identity/Grounding foundation finalization v3 (2026-09-03, GPT
       re-review): a constraint's own relation/frame/class being real and
-      verified is NOT enough on its own -- when 2+ constraints exist in the
-      same mission, a confused (not malicious) planner could still borrow
-      a genuinely real constraint that belongs to a DIFFERENT mention for
-      THIS action's alias/name (GPT's own worked example: "The person on
-      your left is waving. Remember the person on your right as 44." --
-      referencing the LEFT constraint for alias "44" would pass every
-      per-constraint check while binding the wrong person). Whenever 2+
-      constraints exist, the referenced one's own `bind_alias` (set by the
-      extractor ONLY when a sentence immediately, unambiguously names who
-      it is about -- see reference_extraction.py's own comment) must
-      exactly match this action's alias/name; a constraint with no
-      bind_alias captured is not usable for identity binding at all under
-      that condition. A SINGLE constraint is never ambiguous about which
-      action it belongs to, so no match is required there -- this is what
-      keeps intentionally cross-sentence phrasings ("There is a person
-      right in front of you. Remember them as 44.") working unchanged.
+      verified is NOT enough on its own -- a confused (not malicious)
+      planner could still borrow a genuinely real constraint that belongs
+      to a DIFFERENT mention for THIS action's alias/name (GPT's own worked
+      example: "The person on your left is waving. Remember the person on
+      your right as 44." -- referencing the LEFT constraint for alias "44"
+      would pass every per-constraint check while binding the wrong
+      person). Whenever the referenced constraint's own `bind_alias` (set
+      by the extractor ONLY when a sentence unambiguously names who it is
+      about -- see reference_extraction.py's own comment) is non-empty, it
+      must exactly match this action's alias/name -- this check does NOT
+      depend on how many other constraints exist in the mission. A v2
+      round of this fix conditioned the check on "2+ constraints exist",
+      reasoning that a single constraint could never be ambiguous about
+      which action it belongs to -- GPT's re-review found that reasoning
+      incomplete: a single constraint can still carry a bind_alias that
+      simply does not match the action referencing it (e.g. "Remember the
+      person on your left as 33" extracts one constraint with
+      bind_alias="33"; a planner mistakenly writing name="44" while still
+      referencing it must be rejected, exactly like the 2+-constraint
+      case, not silently let through because there happened to be nothing
+      else it could have been confused with). Only when bind_alias is
+      EMPTY (the extractor found no unambiguous naming marker at all) does
+      this check step aside -- and reference_extraction.py's own
+      cross-sentence pattern now covers the specific phrasing that used to
+      rely on this ("There is a person right in front of you. Remember
+      them as 44." now captures bind_alias="44" directly, via an explicit,
+      narrow "next sentence names the pronoun" pattern -- not a blanket
+      exemption for being the only constraint in the mission).
 
     On success, `relation` is filled into the action's own args (so
     seattle_lab's skill execution code, which already just reads
@@ -438,17 +450,24 @@ def _apply_reference_constraint_guard(
         relation, error = _validate_reference_constraint(constraint, intent_text=intent_text)
         if error:
             return f"plan's reference_constraint {constraint_id!r} on skill {skill!r} is invalid: {error}"
-        if len(constraints) > 1:
-            bind_alias = str(constraint.get("bind_alias") or "").strip()
-            action_alias = _action_alias_or_name(args)
-            if not bind_alias or _normalize_alias(bind_alias) != _normalize_alias(action_alias):
+        bind_alias = str(constraint.get("bind_alias") or "").strip()
+        action_alias = _action_alias_or_name(args)
+        if bind_alias:
+            if _normalize_alias(bind_alias) != _normalize_alias(action_alias):
                 return (
-                    f"plan's reference_constraint {constraint_id!r} on skill {skill!r} is not "
-                    f"deterministically associated with alias/name {action_alias!r} -- multiple "
-                    "reference_constraints exist in this mission (context_json.reference_"
-                    "constraints) and this one cannot be confirmed to belong to this specific "
-                    "binding"
+                    f"plan's reference_constraint {constraint_id!r} on skill {skill!r} is bound "
+                    f"to alias/name {bind_alias!r} in this mission's own words, but this action "
+                    f"uses {action_alias!r} -- a reference_constraint can only be used for the "
+                    "specific binding its own sentence actually names"
                 )
+        elif len(constraints) > 1:
+            return (
+                f"plan's reference_constraint {constraint_id!r} on skill {skill!r} is not "
+                f"deterministically associated with alias/name {action_alias!r} -- multiple "
+                "reference_constraints exist in this mission (context_json.reference_"
+                "constraints) and this one cannot be confirmed to belong to this specific "
+                "binding"
+            )
         args["relation"] = relation
     return None
 

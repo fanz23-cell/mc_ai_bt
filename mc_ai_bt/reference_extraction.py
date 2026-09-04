@@ -81,41 +81,66 @@ _PERSON_RELATION_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
 # Identity/Grounding foundation finalization v2 (2026-09-03, GPT
 # re-review): a constraint's OWN relation/frame/class can all be real and
 # correctly verified, and it can STILL be borrowed by the wrong
-# remember_person/remember_entity action when 2+ constraints exist in the
-# same mission -- e.g. "The person on your left is waving. Remember the
-# person on your right as 44." extracts two real constraints (left, right);
-# nothing before this fix stopped a confused planner from referencing the
-# LEFT one for alias "44". _bind_alias_immediately_after captures which
-# alias/name a constraint's own sentence assigns, WHEN it does so
-# immediately and unambiguously (a tight "as <token>"/"叫<token>" marker
-# right after the relation phrase, no clause break) -- planning_pipeline.py's
-# guard then requires an EXACT match between this and the alias/name the
-# referencing action actually uses, whenever more than one constraint
-# exists (a single constraint is never ambiguous about which action it
-# belongs to, so no match is required there -- this is what keeps the
-# original E.1 phrasing, "There is a person right in front of you. Remember
-# them as 44." -- a cross-sentence PRONOUN reference no deterministic regex
-# should ever try to resolve -- working exactly as before).
+# remember_person/remember_entity action -- e.g. "The person on your left
+# is waving. Remember the person on your right as 44." extracts two real
+# constraints (left, right); nothing before this fix stopped a confused
+# planner from referencing the LEFT one for alias "44". _bind_alias_
+# immediately_after captures which alias/name a constraint's own sentence
+# assigns, WHEN it does so unambiguously -- planning_pipeline.py's guard
+# then requires an EXACT match between this and the alias/name the
+# referencing action actually uses, WHENEVER a bind_alias was captured at
+# all (see that guard's own comment on why this no longer depends on how
+# many constraints exist in the mission -- a v2 round's own singleton
+# bypass turned out to still let "Remember the person on your left as 33"
+# be answered with alias "44" through, since it was the ONLY constraint
+# extracted).
 #
-# "is <token>" is deliberately NOT a marker, in either language ("is
-# waving" would otherwise be captured as alias="waving") -- only "as"
-# (English) and "叫" (Chinese) are specific, low-ambiguity naming
-# constructions in this command-style context. Missing a real alias
-# assignment this way only means that ONE constraint stays unusable for
-# identity binding when 2+ exist -- the safe direction, per the same
-# "smaller supported range over any false accept" principle the relation
-# patterns themselves already follow.
+# Two tiers of capture, both narrow and explicit:
+#
+# 1. _ALIAS_AFTER_PATTERNS: a tight "as <token>"/"叫<token>" marker
+#    IMMEDIATELY after the relation phrase (only a bare comma allowed in
+#    between, no clause break) -- "Remember the person on your left as
+#    44." "is <token>" is deliberately NOT a marker, in either language
+#    ("is waving" would otherwise be captured as alias="waving") -- only
+#    "as"/"叫" are specific, low-ambiguity naming constructions in this
+#    command-style context.
+# 2. _CROSS_SENTENCE_ALIAS_PATTERNS: the original E.1 live-tested
+#    phrasing -- "There is a person right in front of you. Remember them
+#    as 44." -- names its subject via a PRONOUN in the immediately
+#    FOLLOWING sentence, not the same clause. Recognized as its own
+#    explicit, narrow pattern (a sentence break, then "Remember them/him/
+#    her/it as <token>" verbatim, or the Chinese equivalent) -- not a
+#    general "search anywhere after this point" rule.
+#
+# Missing a real alias assignment either way only means that constraint
+# stays unusable for identity binding (see the guard) -- the safe
+# direction, per the same "smaller supported range over any false accept"
+# principle the relation patterns themselves already follow.
 _ALIAS_AFTER_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\s*,?\s*as\s+(?P<alias>[A-Za-z0-9_]+)", re.IGNORECASE),
     re.compile(r"\s*叫\s*(?P<alias>[\w一-鿿]+)"),
 )
 _ALIAS_LOOKAHEAD_WINDOW = 20
 
+_CROSS_SENTENCE_ALIAS_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"\s*[.!?]\s*Remember\s+(?:them|him|her|it)\s+as\s+(?P<alias>[A-Za-z0-9_]+)",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\s*[。！？.]\s*(?:记住|把)(?:他们|他|她|它|TA)(?:叫|记成|记为|记作)\s*(?P<alias>[\w一-鿿]+)"),
+)
+_CROSS_SENTENCE_ALIAS_LOOKAHEAD_WINDOW = 40
+
 
 def _bind_alias_immediately_after(text: str, end: int) -> str:
     window = text[end:end + _ALIAS_LOOKAHEAD_WINDOW]
     for pattern in _ALIAS_AFTER_PATTERNS:
         match = pattern.match(window)  # anchored at position 0 -- must be IMMEDIATELY adjacent
+        if match:
+            return match.group("alias")
+    window = text[end:end + _CROSS_SENTENCE_ALIAS_LOOKAHEAD_WINDOW]
+    for pattern in _CROSS_SENTENCE_ALIAS_PATTERNS:
+        match = pattern.match(window)  # anchored -- must be the IMMEDIATELY next sentence
         if match:
             return match.group("alias")
     return ""

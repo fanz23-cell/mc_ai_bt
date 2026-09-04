@@ -840,6 +840,60 @@ def test_reference_constraint_guard_accepts_the_correctly_matched_constraint_amo
     assert json.loads(result.goal_spec_json)["args"]["relation"] == "right"
 
 
+def test_reference_constraint_guard_rejects_a_single_constraint_used_for_the_wrong_alias():
+    # THE core fix (2026-09-03, GPT re-review v3): a v2 round's own
+    # ownership check only ran when 2+ constraints existed, reasoning a
+    # single constraint could never be ambiguous about which action it
+    # belongs to -- GPT's re-review found that incomplete. "Remember the
+    # person on your left as 33" extracts exactly ONE constraint, with
+    # bind_alias="33" captured directly -- a planner mistakenly writing
+    # name="44" while still referencing that SAME constraint must be
+    # rejected too, exactly like the 2+-constraint case, not silently
+    # let through just because nothing else was around to confuse it with.
+    mission, missions = _mission("Remember the person on your left as 33.")
+    plan_json = _implicit_plan_with_single_action(
+        "remember_entity",
+        {"target": "the person", "alias": "44", "reference_constraint_id": "ref_1"},
+    )
+
+    result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
+
+    assert not result.ok
+    assert result.stage == "reference_constraint"
+    assert "bound to alias/name '33'" in result.message
+
+
+def test_reference_constraint_guard_accepts_a_single_constraint_used_for_its_own_correct_alias():
+    # The positive counterpart -- the SAME captured bind_alias, referenced
+    # for the alias it actually names, must still succeed.
+    mission, missions = _mission("Remember the person on your left as 33.")
+    plan_json = _implicit_plan_with_single_action(
+        "remember_entity",
+        {"target": "the person", "alias": "33", "reference_constraint_id": "ref_1"},
+    )
+
+    result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
+
+    assert result.ok, result.message
+    assert json.loads(result.goal_spec_json)["args"]["relation"] == "left"
+
+
+def test_reference_constraint_guard_still_accepts_the_cross_sentence_e1_phrasing():
+    # Confirms the original E.1 live-tested phrasing keeps working -- now
+    # via reference_extraction.py's own explicit cross-sentence pattern
+    # (bind_alias="44" captured directly), not a singleton bypass.
+    mission, missions = _mission("There is a person right in front of you. Remember them as 44.")
+    plan_json = _implicit_plan_with_single_action(
+        "remember_entity",
+        {"target": "the person", "alias": "44", "reference_constraint_id": "ref_1"},
+    )
+
+    result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
+
+    assert result.ok, result.message
+    assert json.loads(result.goal_spec_json)["args"]["relation"] == "front"
+
+
 def test_reference_constraint_guard_rejects_any_constraint_without_a_captured_alias_when_multiple_exist():
     # Neither constraint has a captured bind_alias here (both use "is",
     # never a trusted marker) -- with 2+ constraints in play, NEITHER is
