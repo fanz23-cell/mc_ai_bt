@@ -451,7 +451,8 @@ def build_planner_messages(
             "You are the mc_ai_bt planner.",
             "Return only one JSON object. Do not include markdown.",
             "The JSON object must use schema mc_ai_bt.plan.v1.",
-            "Top-level keys: schema, root, goal_spec, context_json.",
+            "Top-level keys: schema, root, goal_spec, context_json, and optionally "
+            "reference_constraints (see its own section below).",
             "root must be a Behavior Tree made only from executable node types.",
             (
                 "Executable node types: Sequence, Fallback, Parallel, Timeout, Action, Wait, Retry, "
@@ -533,6 +534,42 @@ def build_planner_messages(
                 "fail at execution time -- entity_id, once supplied, is never dropped or substituted; a "
                 "genuinely unresolvable one correctly pauses the mission rather than silently approaching "
                 "the nearest same-class instance instead."
+            ),
+            (
+                # Gate-1.1 architecture round (2026-09-03, GPT review): the prior version of this
+                # prompt let remember_person/remember_entity's own `relation` arg be set directly,
+                # with no check on WHERE that value came from -- a planner could invent
+                # relation="left" with no basis in what the user actually said, and
+                # ResolveEntityReference would then reliably (and wrongly) bind the alias to
+                # whoever really is on the left. reference_constraints is the structural fix:
+                # the planner must name WHICH WORDS justify a spatial claim, in a place a
+                # deterministic check (planning_pipeline.py's _apply_reference_constraint_guard)
+                # can verify those words are real, not merely present somewhere in the sentence.
+                "OPTIONAL top-level key reference_constraints: a list of objects, each "
+                '{"constraint_id": "<short id you choose, e.g. ref_1>", "entity_class": '
+                '"<the class this identifies, e.g. person>", "relation": '
+                '"front|left|right|nearest", "reference_frame": "robot", "source_span": '
+                '"<the EXACT words copied from intent_text that establish this>"}. Use this '
+                "ONLY when the user's own words identify WHICH SPECIFIC person/entity is "
+                "meant via a spatial relation TO YOU (the robot) -- e.g. \"the person on "
+                "your left\", \"whoever is right in front of you\", \"whichever is "
+                "nearest\". source_span must be copied verbatim from intent_text, describing "
+                "the SAME entity the constraint's entity_class/relation claim -- citing words "
+                "that actually describe a DIFFERENT entity (e.g. \"the chair is on your "
+                "left\" does not establish a constraint about a PERSON) or a relation to "
+                "something other than yourself (e.g. \"in front of the sofa\" is not "
+                'reference_frame "robot") is never valid and will be rejected outright.'
+            ),
+            (
+                "remember_person/remember_entity's own `relation` must NEVER be set directly "
+                "as a plain string on the Action itself -- reference an entry from "
+                "reference_constraints instead, via `reference_constraint_id` (e.g. args: "
+                '{"target": "the person", "name": "44", "reference_constraint_id": "ref_1"}). '
+                "A look_at Action's own `direction` is a physical bearing the robot turns to "
+                "look at -- it is NEVER evidence of which entity the user meant, even when it "
+                "appears immediately before remember_person/remember_entity in the plan; if "
+                "disambiguation is genuinely needed, express it as a reference_constraints "
+                "entry, never by relying on a look_at's direction to carry that meaning."
             ),
             (
                 # Found live 2026-08-30: "find/look for a woman in the room" planned

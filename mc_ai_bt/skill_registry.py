@@ -308,12 +308,16 @@ DEFAULT_SKILLS: dict[str, SkillSpec] = {
         "to bind a name to someone it cannot actually find. `target` describes who "
         "(a bearing, description, or an id from a prior locate_entity/search_for_entity "
         "result), `name` is what to call them. If 2+ people are simultaneously visible "
-        "(ambiguous which one is meant) AND the user's own words describe which one by a "
-        "spatial bearing (in front of you/nearest/on your left/on your right), pass that "
-        "as `relation` (one of: front, left, right, nearest) -- resolved deterministically "
-        "against real robot position/orientation, never guessed.",
+        "(ambiguous which one is meant) AND the user's own words identify which one by a "
+        "spatial relation TO YOU, pass `reference_constraint_id` (never a bare `relation` "
+        "string -- see the system prompt's reference_constraints section for the full "
+        "contract) referencing an entry this plan's own top-level reference_constraints "
+        "array -- resolved deterministically against real robot position/orientation, "
+        "never guessed.",
         {"target": "entity|entity_id|person", "name": "name to bind",
-         "relation": "optional: front|left|right|nearest -- only when 2+ same-class candidates could otherwise be meant"},
+         "reference_constraint_id": "optional: id of a reference_constraints entry -- only "
+         "when 2+ same-class candidates could otherwise be meant and the user's own words "
+         "identify which one via a spatial relation to you; never set relation directly"},
         ("person_named",),
         subsumes_locate_skills=("search_for_entity", "locate_entity"),
     ),
@@ -339,14 +343,18 @@ DEFAULT_SKILLS: dict[str, SkillSpec] = {
         "currently-tracked entity of that kind (2+ simultaneously visible -> ambiguous, "
         "use entity_id instead), or if the alias is already bound to a different entity. "
         "A THIRD way to disambiguate 2+ simultaneously visible same-class entities, "
-        "alongside a prior locate's entity_id: if the user's own words describe which one "
-        "by a spatial bearing (in front of you/nearest/on your left/on your right), pass "
-        "that as `relation` (one of: front, left, right, nearest) instead -- resolved "
-        "deterministically against real robot position/orientation, never guessed.",
+        "alongside a prior locate's entity_id: if the user's own words identify which one "
+        "by a spatial relation TO YOU, pass `reference_constraint_id` (never a bare "
+        "`relation` string -- see the system prompt's reference_constraints section for "
+        "the full contract) referencing an entry in this plan's own top-level "
+        "reference_constraints array instead -- resolved deterministically against real "
+        "robot position/orientation, never guessed.",
         {"target": "entity|object|person (class/description; omit if entity_id given)",
          "entity_id": "optional, exact entity_tracks id from a prior locate/search/approach result",
          "alias": "alias to bind",
-         "relation": "optional: front|left|right|nearest -- only when 2+ same-class candidates could otherwise be meant"},
+         "reference_constraint_id": "optional: id of a reference_constraints entry -- only "
+         "when 2+ same-class candidates could otherwise be meant and the user's own words "
+         "identify which one via a spatial relation to you; never set relation directly"},
         ("entity_alias_bound",),
         subsumes_locate_skills=("search_for_entity", "locate_entity"),
     ),

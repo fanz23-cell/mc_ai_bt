@@ -91,6 +91,23 @@ def test_planner_prompt_explains_grounded_entities():
     assert "never invent" in system.lower()
 
 
+def test_planner_prompt_teaches_the_reference_constraints_contract():
+    # Gate-1.1 architecture round (2026-09-03, GPT re-review): the planner
+    # must be taught the structured reference_constraints schema AND told
+    # never to set relation directly / never to treat look_at as evidence
+    # -- planning_pipeline.py's _apply_reference_constraint_guard is the
+    # deterministic backstop, but the model needs to know the contract
+    # exists at all to comply with it in the first place.
+    messages = build_planner_messages("remember this person as 44", "{}")
+    system = messages[0][1]
+
+    assert "reference_constraints" in system
+    assert "constraint_id" in system
+    assert "source_span" in system
+    assert "must NEVER be set directly" in system
+    assert "look_at" in system and "NEVER evidence" in system
+
+
 def test_planner_prompt_lists_wait_for_event_node_type():
     messages = build_planner_messages("wait until a customer raises a hand", "{}")
     system = messages[0][1]

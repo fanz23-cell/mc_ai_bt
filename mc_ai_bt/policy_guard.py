@@ -6,7 +6,7 @@ from typing import Any
 from .skill_registry import DEFAULT_SKILLS, SkillRegistry
 
 
-ALLOWED_TOP_LEVEL_KEYS = {"schema", "root", "goal_spec", "context_json"}
+ALLOWED_TOP_LEVEL_KEYS = {"schema", "root", "goal_spec", "context_json", "reference_constraints"}
 
 # These five sets used to be independent, hand-written literals -- three separate
 # production bugs in one afternoon (adding a single new skill, approach_entity) traced back
