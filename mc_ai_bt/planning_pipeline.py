@@ -9,6 +9,7 @@ from .goal_check import _normalize_alias
 from .mission import Mission
 from .planner import Planner
 from .policy_guard import PHYSICAL_SKILLS, PolicyGuard
+from .reference_extraction import has_explicit_look_instruction
 from .skill_registry import DEFAULT_SKILLS
 from .validator import PlanValidator
 
@@ -268,42 +269,46 @@ def _redundant_locate_matches_terminal(action: dict[str, Any], terminal_target: 
     return bool(terminal_target) and action_target == terminal_target
 
 
-# Gate-1.1 architecture round (2026-09-03, GPT re-review): the Gate-1.1
-# fix round above (a keyword lexicon checking whether SOME phrase
-# supporting a relation appeared ANYWHERE in intent_text) was itself found
-# to be a heuristic patch, not a real trust-boundary closure -- confirmed
-# by direct counter-example: "Look to your left, then remember this person
-# as 44" contains "to your left" (so the keyword check passed it), but
-# that phrase describes a look_at MOVEMENT, not which person is meant;
-# "The chair is on your left. Remember this person as 44" contains the
-# same phrase describing an entirely DIFFERENT entity (the chair, not the
-# person being bound); "Remember the person in front of the sofa as 44"
-# contains "in front" but describes a relation to the SOFA, not to the
-# robot -- ResolveEntityReference only ever understands robot-relative
-# bearings. A bag-of-words search over the whole utterance has no notion
-# of WHICH entity a phrase modifies or WHAT it is relative to, so it can
-# false-ACCEPT (not just safely reject) exactly the kind of cross-wired
-# claim GroundingNormalizer exists to catch for entity_id. Replaced below
-# with a structured reference_constraints contract: the planner must name
-# which words justify a spatial claim, in a shape a deterministic check
-# can actually verify (that those words are real, that the class matches,
-# that the frame is robot-relative) -- not just search for them.
+# Identity/Grounding foundation finalization (2026-09-03, GPT re-review):
+# Gate-1.1's structured contract (a plan-level reference_constraints array
+# the PLANNER itself authored, deterministically checked) was itself found
+# to still be trust-boundary-open, by direct counter-example: a planner
+# that mis-attributes "on your left" to a person when it actually describes
+# a chair would write internally-consistent fields (entity_class="person",
+# reference_frame="robot", source_span="on your left" -- each individually
+# a TRUE statement about the words) that pass every check this stage could
+# run, because the checks were verifying the model's OWN claims against
+# each other and against the raw utterance, never against an INDEPENDENT
+# judgment of what those words actually modify. Same failure mode as
+# GroundingNormalizer would have if the LLM were allowed to both invent AND
+# self-certify an entity_id.
+#
+# The fix: extraction moves entirely out of the planner and into
+# reference_extraction.py's deterministic recognizer, run BEFORE the
+# planner (see context_builder.py). The planner may only REFERENCE a
+# constraint that module already produced (by constraint_id, via
+# context_json.reference_constraints) -- it is never handed the pen to
+# author fields itself. This stage's job shrinks accordingly: reject a
+# directly-set `relation` outright (the planner must never write one), and
+# look up + apply a referenced constraint FROM CONTEXT -- plan.
+# reference_constraints (if a confused planner still emits one) is simply
+# never consulted at all.
 _VALID_RELATIONS = frozenset({"front", "left", "right", "nearest"})
 
 
-def _reference_constraints_by_id(plan: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    """plan.reference_constraints, keyed by constraint_id -- a new, OPTIONAL
-    top-level plan field: a structured, source-attributed claim ("this
-    exact span of the user's own words identifies which entity_class is
-    meant, via this relation, relative to this reference_frame"), extracted
-    by the SAME planner call that produces the rest of the plan (it already
-    has to understand the sentence to plan at all) -- see planner.py's own
-    prompt section for the schema/rules taught to the model. Never a raw
-    relation string an Action can set directly (see
-    _apply_reference_constraint_guard below for why). Malformed entries
-    (not a dict, missing constraint_id) are silently dropped, same
-    defensive style as _grounded_entity_ids -- never raises."""
-    constraints = plan.get("reference_constraints")
+def _trusted_reference_constraints(context_json: str) -> dict[str, dict[str, Any]]:
+    """context_json.reference_constraints, keyed by constraint_id --
+    reference_extraction.py's own deterministic output, computed from
+    intent_text BEFORE the planner ever ran (see context_builder.py). This
+    is the ONLY source _apply_reference_constraint_guard trusts; a
+    same-shaped array the planner might put in its OWN plan.
+    reference_constraints output is never read. Malformed entries (not a
+    dict, missing constraint_id) are silently dropped -- never raises."""
+    try:
+        context = json.loads(context_json) if context_json else {}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    constraints = context.get("reference_constraints") if isinstance(context, dict) else None
     if not isinstance(constraints, list):
         return {}
     out: dict[str, dict[str, Any]] = {}
@@ -318,40 +323,25 @@ def _reference_constraints_by_id(plan: dict[str, Any]) -> dict[str, dict[str, An
 
 
 def _validate_reference_constraint(
-    constraint: dict[str, Any], *, expected_entity_class: str, intent_text: str,
+    constraint: dict[str, Any], *, intent_text: str,
 ) -> tuple[str, str]:
     """(relation, error) -- relation is "" and error is non-empty when the
     constraint fails any check; otherwise relation is one of
     front/left/right/nearest and error is "".
 
-    Three DETERMINISTIC checks, each closing one of the counter-examples
-    above against the prior (keyword-search) design:
-
-    - reference_frame must be "robot" -- ResolveEntityReference's geometry
-      (entity_identity.py) has only ever understood robot-relative
-      bearings; a constraint describing position relative to some OTHER
-      entity ("in front of the sofa") is rejected rather than silently
-      reinterpreted as robot-relative.
-    - entity_class must match what the consuming skill actually needs
-      (e.g. remember_person requires "person") -- catches a constraint
-      genuinely extracted for a DIFFERENT entity ("the chair is on your
-      left") ever being borrowed for this action.
-    - source_span must be a real, near-verbatim substring of this
-      mission's own intent_text -- the anti-hallucination check. A
-      constraint whose source_span cannot be found in what the user
-      actually said is rejected outright, the same principle
-      _apply_grounding_normalizer already applies to entity_id.
-
-    HONEST LIMIT, not papered over: none of this verifies the extraction
-    correctly attributed source_span to the right entity in the first
-    place (that a phrase describing a look_at MOVEMENT was not mistakenly
-    packaged as a person-reference claim) -- that is a genuine language-
-    understanding judgment call, the SAME trust every other LLM-extracted
-    field in this pipeline already carries (target, alias, args) and not a
-    new gap this design introduces. What it closes is the bag-of-words
-    false-accept: a claim can no longer borrow support from words that
-    describe a different entity or a non-robot frame, and can no longer
-    cite text that was never there at all.
+    These constraints come from a TRUSTED, deterministic extractor now
+    (reference_extraction.py), not the planner -- so this is defense in
+    depth, not the primary trust boundary (that moved to the extractor's
+    own narrow-grammar design). Still checked, in case context_json ever
+    carries a stale or hand-crafted entry: reference_frame must be "robot"
+    (ResolveEntityReference's geometry has only ever understood
+    robot-relative bearings), entity_class must be "person" (the only
+    class the extractor produces today -- remember_person AND
+    remember_entity both require it, since there is currently no
+    legitimate reason for either to reference a non-person constraint; a
+    prior round left remember_entity with NO class check at all here,
+    flagged as a real gap by GPT's review), and source_span must be a
+    real, near-verbatim substring of this mission's own intent_text.
     """
     relation = str(constraint.get("relation") or "").strip().lower()
     if relation not in _VALID_RELATIONS:
@@ -363,11 +353,8 @@ def _validate_reference_constraint(
             "only understands robot-relative bearings, never a relation to some other entity"
         )
     entity_class = str(constraint.get("entity_class") or "").strip().lower()
-    if expected_entity_class and entity_class != expected_entity_class:
-        return "", (
-            f"entity_class {entity_class!r} does not match what this skill needs "
-            f"({expected_entity_class!r})"
-        )
+    if entity_class != "person":
+        return "", f"entity_class {entity_class!r} is not \"person\" -- the only class reference_extraction.py produces"
     source_span = str(constraint.get("source_span") or "").strip()
     if not source_span or _normalize_alias(source_span) not in _normalize_alias(intent_text):
         return "", (
@@ -377,29 +364,31 @@ def _validate_reference_constraint(
     return relation, ""
 
 
-def _apply_reference_constraint_guard(plan: dict[str, Any], intent_text: str) -> str | None:
-    """Gate-1.1 architecture round (2026-09-03, GPT re-review): the
-    deterministic enforcement layer for the reference_constraints contract
-    above. Two rules, mirroring _apply_grounding_normalizer's own shape for
-    entity_id:
+def _apply_reference_constraint_guard(
+    plan: dict[str, Any], *, context_json: str, intent_text: str,
+) -> str | None:
+    """Identity/Grounding foundation finalization (2026-09-03, GPT
+    re-review): the deterministic enforcement layer for the
+    reference_constraints contract. Two rules, mirroring
+    _apply_grounding_normalizer's own shape for entity_id:
 
     - `relation` must NEVER be set directly on a remember_person/
       remember_entity Action's own args -- the planner may only reference
-      an existing constraint via `reference_constraint_id`. This is the
-      literal fix for "the planner can invent relation=left with no basis
-      in what the user said": there is no longer anywhere for it to put
-      that invention that this guard will accept.
-    - A referenced constraint must exist and pass every check in
-      _validate_reference_constraint (frame is robot, class matches,
-      source_span is real) -- on success, `relation` is filled into the
-      action's own args (so seattle_lab's skill execution code, which
-      already just reads args.get("relation"), needs no changes at all).
+      an existing, EXTRACTOR-produced constraint via
+      `reference_constraint_id`. There is no path by which the planner's
+      own say-so about `relation` is ever trusted, under any circumstance.
+    - A referenced constraint must exist in the TRUSTED extractor output
+      (context_json.reference_constraints, never plan.reference_constraints)
+      and pass every check in _validate_reference_constraint -- on success,
+      `relation` is filled into the action's own args (so seattle_lab's
+      skill execution code, which already just reads args.get("relation"),
+      needs no changes at all).
 
     Mutates `plan` in place for the fill-in case, exactly like
     _apply_grounding_normalizer. Returns None when the plan needs no
     rejection.
     """
-    constraints = _reference_constraints_by_id(plan)
+    constraints = _trusted_reference_constraints(context_json)
     for action in _all_actions_in(plan.get("root")):
         skill = str(action.get("skill") or "")
         if skill not in _SELF_LOCATING_TERMINAL_SKILLS:
@@ -410,7 +399,7 @@ def _apply_reference_constraint_guard(plan: dict[str, Any], intent_text: str) ->
         if str(args.get("relation") or "").strip():
             return (
                 f"plan sets relation directly on skill {skill!r} -- relation must never be set "
-                "directly by the planner; reference an entry in this plan's own "
+                "directly by the planner; reference an entry in context_json."
                 "reference_constraints via reference_constraint_id instead"
             )
         constraint_id = str(args.get("reference_constraint_id") or "").strip()
@@ -420,11 +409,9 @@ def _apply_reference_constraint_guard(plan: dict[str, Any], intent_text: str) ->
         if constraint is None:
             return (
                 f"plan uses reference_constraint_id {constraint_id!r} on skill {skill!r} that "
-                "does not match any entry in this plan's own reference_constraints"
+                "does not match any entry in context_json.reference_constraints"
             )
-        expected_class = "person" if skill == "remember_person" else ""
-        relation, error = _validate_reference_constraint(
-            constraint, expected_entity_class=expected_class, intent_text=intent_text)
+        relation, error = _validate_reference_constraint(constraint, intent_text=intent_text)
         if error:
             return f"plan's reference_constraint {constraint_id!r} on skill {skill!r} is invalid: {error}"
         args["relation"] = relation
@@ -482,33 +469,52 @@ def _physical_actions_with_sequence_position(
 
 def _terminal_self_locating_action(
     positioned_actions: list[tuple[dict[str, Any], int | None, int | None]],
+    *,
+    intent_text: str,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]] | None:
     """(terminal, redundant_prefix_actions) for a plan whose only
     non-redundant physical action is remember_person/remember_entity, where
     every OTHER physical action anywhere in the tree is a genuine sibling of
     it -- same Sequence, strictly earlier position -- and is either a
     locate-type skill that ALSO targets the same entity as the terminal
-    action (see _redundant_locate_matches_terminal), or a single look_at,
-    dropped as pure redundant motion (remember_person/remember_entity
-    locate internally regardless of what a preceding look_at already did).
-    None if the pattern does not hold (zero or 2+ remember-type actions,
-    the terminal itself not a direct Sequence child, a physical action
-    anywhere else in the tree that is not a genuine same-Sequence prefix of
-    the terminal, or a locate action that targets something else).
+    action (see _redundant_locate_matches_terminal), or a look_at with no
+    genuine textual support of its own (see below), dropped as pure
+    redundant motion (remember_person/remember_entity locate internally
+    regardless). None if the pattern does not hold (zero or 2+
+    remember-type actions, the terminal itself not a direct Sequence
+    child, a physical action anywhere else in the tree that is not a
+    genuine same-Sequence prefix of the terminal, or a locate action that
+    targets something else). redundant_prefix_actions can be empty even
+    when the pattern otherwise matches (see the look_at case below) -- the
+    caller already treats an empty list as "nothing to rewrite".
 
     Gate-1.1 architecture round (2026-09-03, GPT re-review): this used to
     ALSO copy a mappable look_at direction into the terminal's own
     `relation` arg before dropping it -- GPT's re-review found this treated
     a look_at's direction as reference evidence unconditionally, with no
     check that the user's words ever described a PERSON's position rather
-    than a literal turn instruction ("look to your left, then remember
-    this person" silently became "the person on your left"). look_at's
-    direction is no longer inspected here at all -- a preceding look_at is
-    dropped purely because it is redundant motion, never harvested for
-    meaning. The terminal's own `relation` (if any) comes ONLY from a
-    validated reference_constraint (_apply_reference_constraint_guard,
-    run later in plan()); a terminal with a raw relation already set
-    directly is rejected there, not silently accepted here.
+    than a literal turn instruction. look_at's direction is never harvested
+    into `relation` here under any circumstance; the terminal's own
+    `relation` (if any) comes ONLY from a validated reference_constraint
+    (_apply_reference_constraint_guard, run later in plan()).
+
+    Identity/Grounding foundation finalization (2026-09-03, GPT re-review):
+    a SEPARATE, later finding on the same mechanism -- dropping a
+    preceding look_at as "redundant" is only safe when it genuinely IS
+    redundant. "Look to your left, then remember this person as 44" is two
+    real, distinct user intentions (turn left; then remember whoever you
+    then see) -- the look_at is an EXPLICIT physical action the user asked
+    for, not planner filler, and silently deleting it means the robot
+    never performs the turn the user explicitly requested (worse: with
+    only one person currently in view, it could bind that person's
+    identity without ever having looked where the user pointed). A look_at
+    is now excluded from the redundant set whenever intent_text contains a
+    genuine look/turn instruction toward its own direction
+    (has_explicit_look_instruction) -- it remains in the tree and actually
+    executes. This does not create a NEW relation-provenance risk: the
+    preserved look_at's direction still never feeds `relation` (that path
+    stays closed, per the paragraph above) -- it only changes whether the
+    physical action itself is real or discarded.
     """
     terminal_entries = [
         entry for entry in positioned_actions
@@ -544,7 +550,17 @@ def _terminal_self_locating_action(
     if look_at_actions and term_args.get("entity_id"):
         return None  # terminal already has its own, fully-specified identity
 
-    return term, prefix_others
+    redundant = list(other_locates)
+    if look_at_actions:
+        look_at = look_at_actions[0]
+        look_at_args = look_at.get("args") if isinstance(look_at.get("args"), dict) else {}
+        direction = str(look_at_args.get("direction") or "")
+        if not has_explicit_look_instruction(intent_text, direction):
+            redundant.append(look_at)
+        # else: a genuine, user-requested physical action -- preserved,
+        # left in the tree, never dropped.
+
+    return term, redundant
 
 
 def _without_redundant_locate_actions(node: Any, redundant_ids: set[int]) -> Any | None:
@@ -576,7 +592,7 @@ def _without_redundant_locate_actions(node: Any, redundant_ids: set[int]) -> Any
     return node
 
 
-def _canonicalize_redundant_locate_prefix(plan: dict[str, Any]) -> None:
+def _canonicalize_redundant_locate_prefix(plan: dict[str, Any], *, intent_text: str) -> None:
     """Actually remove a redundant look_at/search_for_entity/locate_entity
     Action from the executable BT tree when it immediately duplicates work
     remember_person/remember_entity already does internally for the SAME
@@ -584,9 +600,10 @@ def _canonicalize_redundant_locate_prefix(plan: dict[str, Any]) -> None:
     deriving goal_spec (that alone left it in the tree to actually run,
     which is what a real live E.1 attempt showed blocking the mission).
     Mutates plan["root"] in place. A no-op when the pattern does not match
-    (including a locate action that targets something else -- never
-    touched)."""
-    match = _terminal_self_locating_action(_physical_actions_with_sequence_position(plan.get("root")))
+    (including a locate action that targets something else, or a look_at
+    with genuine textual support of its own -- never touched)."""
+    match = _terminal_self_locating_action(
+        _physical_actions_with_sequence_position(plan.get("root")), intent_text=intent_text)
     if match is None:
         return
     _terminal, redundant = match
@@ -701,9 +718,10 @@ class PlanningPipeline:
                 plan_json=plan_json,
             )
 
-        _canonicalize_redundant_locate_prefix(plan)
+        _canonicalize_redundant_locate_prefix(plan, intent_text=mission.intent_text)
 
-        reference_error = _apply_reference_constraint_guard(plan, mission.intent_text)
+        reference_error = _apply_reference_constraint_guard(
+            plan, context_json=context_json, intent_text=mission.intent_text)
         if reference_error:
             return PlanningResult(
                 False,

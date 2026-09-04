@@ -3,9 +3,21 @@ import json
 from mc_ai_bt.context_builder import ContextBuilder
 from mc_ai_bt.mission import MissionManager
 from mc_ai_bt.planner import BootstrapPlanner
-from mc_ai_bt.planning_pipeline import PlanningPipeline
+from mc_ai_bt.planning_pipeline import PlanningPipeline, _apply_reference_constraint_guard
 from mc_ai_bt.policy_guard import PolicyGuard
 from mc_ai_bt.validator import PlanValidator
+
+
+def _context_json_with_reference_constraints(*constraints: dict) -> str:
+    """A hand-built context_json carrying an arbitrary (possibly invalid)
+    reference_constraints list -- for unit-testing
+    _apply_reference_constraint_guard's OWN defensive checks directly.
+    The real extractor (reference_extraction.py) never actually produces
+    an invalid entry -- these tests exist because the guard must not
+    silently trust context_json's shape either, exactly the same
+    "verify, don't just trust the source" principle applied one layer
+    further out."""
+    return json.dumps({"reference_constraints": list(constraints)})
 
 
 class StaticPlanner:
@@ -189,10 +201,14 @@ def test_planning_pipeline_drops_a_redundant_look_at_without_absorbing_its_direc
 
 def test_planning_pipeline_still_drops_a_redundant_look_at_when_a_constraint_supplies_relation():
     # The two mechanisms are properly decoupled: look_at is dropped purely
-    # because it is redundant motion; relation comes ONLY from the
-    # validated reference_constraint, never from look_at's own direction
-    # (which here points a DIFFERENT way -- "left" -- than the constraint's
-    # "front", proving the constraint, not the look_at, is the real source).
+    # because it is redundant motion (intent_text has no "look/turn left"
+    # instruction, so has_explicit_look_instruction is False for it);
+    # relation comes ONLY from the real, deterministically-extracted
+    # reference_constraint (context_json.reference_constraints, computed
+    # by reference_extraction.py from intent_text's "in front of you"),
+    # never from look_at's own direction (which here points a DIFFERENT
+    # way -- "left" -- than the resolved "front", proving the constraint,
+    # not the look_at, is the real source).
     mission, missions = _mission("There is a person right in front of you. Remember this as 33")
     plan_json = json.dumps({
         "schema": "mc_ai_bt.plan.v1",
@@ -210,12 +226,6 @@ def test_planning_pipeline_still_drops_a_redundant_look_at_when_a_constraint_sup
             ],
         },
         "goal_spec": {"type": "human", "verification": {"mode": "implicit_conversation"}},
-        "reference_constraints": [
-            {
-                "constraint_id": "ref_1", "entity_class": "person", "relation": "front",
-                "reference_frame": "robot", "source_span": "right in front of you",
-            },
-        ],
     })
 
     result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
@@ -244,6 +254,49 @@ def test_planning_pipeline_does_not_drop_a_look_at_before_a_terminal_with_an_alr
 
     assert not result.ok
     assert result.stage == "policy"
+
+
+def test_planning_pipeline_preserves_an_explicit_look_instruction_as_a_real_action():
+    # Identity/Grounding foundation finalization (2026-09-03, GPT
+    # re-review): "Look to your left, then remember this person as 44" is
+    # two real, distinct user intentions -- turn left, THEN remember
+    # whoever you then see. The look_at here is an EXPLICIT physical
+    # action the user asked for, not planner filler -- has_explicit_look_
+    # instruction recognizes "Look to your left" and keeps it in the tree.
+    # With 2 real physical actions and only an implicit goal_spec, this
+    # correctly reaches PolicyGuard's rejection rather than a bare
+    # look_at(left) x1 -- proving look_at survived canonicalization intact
+    # (a silently-dropped look_at would instead leave exactly 1 physical
+    # action, and this plan would succeed).
+    mission, missions = _mission("Look to your left, then remember this person as 44.")
+    plan_json = _implicit_plan_with_actions([
+        {"type": "Action", "skill": "look_at", "args": {"direction": "left"}},
+        {"type": "Action", "skill": "remember_entity", "args": {"target": "the person", "alias": "44"}},
+    ])
+
+    result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
+
+    assert not result.ok
+    assert result.stage == "policy"
+    assert "physical skill" in result.message
+
+
+def test_planning_pipeline_still_drops_a_look_at_with_no_explicit_instruction_of_its_own():
+    # Contrast case for the test above: a bare look_at with no textual
+    # support in intent_text at all (the planner added it speculatively,
+    # with no basis in the user's words) is still dropped as redundant --
+    # this is the ORIGINAL, still-working E.1 behavior, not a regression.
+    mission, missions = _mission("Remember this person as 44.")
+    plan_json = _implicit_plan_with_actions([
+        {"type": "Action", "skill": "look_at", "args": {"direction": "left"}},
+        {"type": "Action", "skill": "remember_entity", "args": {"target": "the person", "alias": "44"}},
+    ])
+
+    result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
+
+    assert result.ok, result.message
+    bt = json.loads(result.bt_json)
+    assert len(bt["children"]) == 1
 
 
 def test_planning_pipeline_does_not_absorb_a_look_at_that_comes_after_the_terminal_action():
@@ -660,70 +713,72 @@ def test_reference_constraint_guard_rejects_an_unknown_constraint_id():
 
 
 def test_reference_constraint_guard_rejects_a_hallucinated_source_span():
-    # GPT's original worked example, now via the structured path: the
-    # user's own words never mention a side at all -- a constraint CLAIMING
-    # "on your left" as its source_span is citing text that was never there.
-    mission, missions = _mission("Remember this person as 44")
-    plan_json = _implicit_plan_with_single_action(
-        "remember_entity",
-        {"target": "the person", "alias": "44", "reference_constraint_id": "ref_1"},
-        reference_constraints=[{
-            "constraint_id": "ref_1", "entity_class": "person", "relation": "left",
-            "reference_frame": "robot", "source_span": "on your left",
-        }],
-    )
+    # Direct unit test of the guard's own defensive check -- the real
+    # extractor (reference_extraction.py) never produces an entry whose
+    # source_span is not really in intent_text, but the guard must not
+    # blindly trust context_json's shape either (the same "verify, don't
+    # just trust the source" principle applied one layer further out).
+    # GPT's original worked example: the user's own words never mention a
+    # side at all -- a constraint CLAIMING "on your left" as its
+    # source_span is citing text that was never there.
+    plan = {"root": {"type": "Action", "skill": "remember_entity", "args": {
+        "target": "the person", "alias": "44", "reference_constraint_id": "ref_1",
+    }}}
+    context_json = _context_json_with_reference_constraints({
+        "constraint_id": "ref_1", "entity_class": "person", "relation": "left",
+        "reference_frame": "robot", "source_span": "on your left",
+    })
 
-    result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
+    error = _apply_reference_constraint_guard(
+        plan, context_json=context_json, intent_text="Remember this person as 44")
 
-    assert not result.ok
-    assert result.stage == "reference_constraint"
-    assert "was not found" in result.message
+    assert error is not None
+    assert "was not found" in error
 
 
 def test_reference_constraint_guard_rejects_a_constraint_relative_to_a_different_entity():
-    # GPT's sofa counter-example: source_span is genuinely, verbatim
-    # present in intent_text -- but it describes a relation to the SOFA,
-    # not to the robot. ResolveEntityReference only ever understands
-    # robot-relative bearings; reinterpreting this as reference_frame=
-    # "robot" would silently answer a different question than the one the
-    # user actually asked.
-    mission, missions = _mission("Remember the person in front of the sofa as 44")
-    plan_json = _implicit_plan_with_single_action(
-        "remember_entity",
-        {"target": "the person", "alias": "44", "reference_constraint_id": "ref_1"},
-        reference_constraints=[{
-            "constraint_id": "ref_1", "entity_class": "person", "relation": "front",
-            "reference_frame": "sofa", "source_span": "in front of the sofa",
-        }],
-    )
+    # Direct unit test, same reasoning as above. GPT's sofa counter-example:
+    # source_span is genuinely, verbatim present in intent_text -- but it
+    # describes a relation to the SOFA, not to the robot. ResolveEntity
+    # Reference only ever understands robot-relative bearings;
+    # reinterpreting this as reference_frame="robot" would silently answer
+    # a different question than the one the user actually asked.
+    plan = {"root": {"type": "Action", "skill": "remember_entity", "args": {
+        "target": "the person", "alias": "44", "reference_constraint_id": "ref_1",
+    }}}
+    context_json = _context_json_with_reference_constraints({
+        "constraint_id": "ref_1", "entity_class": "person", "relation": "front",
+        "reference_frame": "sofa", "source_span": "in front of the sofa",
+    })
 
-    result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
+    error = _apply_reference_constraint_guard(
+        plan, context_json=context_json, intent_text="Remember the person in front of the sofa as 44")
 
-    assert not result.ok
-    assert result.stage == "reference_constraint"
-    assert "robot" in result.message
+    assert error is not None
+    assert "robot" in error
 
 
 def test_reference_constraint_guard_rejects_a_constraint_describing_a_different_entity_class():
-    # GPT's chair counter-example: source_span is genuinely present -- but
-    # it describes the CHAIR's position, not the person being bound.
-    # remember_person requires entity_class="person"; a constraint
-    # extracted for "chair" must never be borrowed for it.
-    mission, missions = _mission("The chair is on your left. Remember this person as 44.")
-    plan_json = _implicit_plan_with_single_action(
-        "remember_person",
-        {"target": "the person", "name": "44", "reference_constraint_id": "ref_1"},
-        reference_constraints=[{
-            "constraint_id": "ref_1", "entity_class": "chair", "relation": "left",
-            "reference_frame": "robot", "source_span": "on your left",
-        }],
-    )
+    # Direct unit test. GPT's chair counter-example: source_span is
+    # genuinely present -- but it describes the CHAIR's position, not the
+    # person being bound. FOUND (2026-09-03, GPT re-review): a prior round
+    # left remember_entity with NO entity_class check at all here -- any
+    # constraint, regardless of declared class, would be accepted for it.
+    # reference_extraction.py only ever produces "person" constraints
+    # today; entity_class must equal "person" for EITHER skill now.
+    plan = {"root": {"type": "Action", "skill": "remember_entity", "args": {
+        "target": "the person", "alias": "44", "reference_constraint_id": "ref_1",
+    }}}
+    context_json = _context_json_with_reference_constraints({
+        "constraint_id": "ref_1", "entity_class": "chair", "relation": "left",
+        "reference_frame": "robot", "source_span": "on your left",
+    })
 
-    result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
+    error = _apply_reference_constraint_guard(
+        plan, context_json=context_json, intent_text="The chair is on your left. Remember this person as 44.")
 
-    assert not result.ok
-    assert result.stage == "reference_constraint"
-    assert "does not match" in result.message
+    assert error is not None
+    assert "person" in error
 
 
 def test_reference_constraint_guard_accepts_a_valid_constraint_and_fills_in_relation():
@@ -731,10 +786,6 @@ def test_reference_constraint_guard_accepts_a_valid_constraint_and_fills_in_rela
     plan_json = _implicit_plan_with_single_action(
         "remember_entity",
         {"target": "the person", "alias": "44", "reference_constraint_id": "ref_1"},
-        reference_constraints=[{
-            "constraint_id": "ref_1", "entity_class": "person", "relation": "left",
-            "reference_frame": "robot", "source_span": "on your left",
-        }],
     )
 
     result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)

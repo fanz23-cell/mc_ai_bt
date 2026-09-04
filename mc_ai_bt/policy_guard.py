@@ -6,7 +6,13 @@ from typing import Any
 from .skill_registry import DEFAULT_SKILLS, SkillRegistry
 
 
-ALLOWED_TOP_LEVEL_KEYS = {"schema", "root", "goal_spec", "context_json", "reference_constraints"}
+# Identity/Grounding foundation finalization (2026-09-03, GPT re-review):
+# reference_constraints was briefly a legal PLAN-output key (Gate-1.1's own
+# round) -- removed now that authoring one is no longer the planner's job
+# at all (see reference_extraction.py/context_builder.py): a plan that
+# still tries to emit one is a clean, obvious policy rejection, not a
+# silently-ignored field.
+ALLOWED_TOP_LEVEL_KEYS = {"schema", "root", "goal_spec", "context_json"}
 
 # These five sets used to be independent, hand-written literals -- three separate
 # production bugs in one afternoon (adding a single new skill, approach_entity) traced back

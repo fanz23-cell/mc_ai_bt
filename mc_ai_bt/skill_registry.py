@@ -311,13 +311,15 @@ DEFAULT_SKILLS: dict[str, SkillSpec] = {
         "(ambiguous which one is meant) AND the user's own words identify which one by a "
         "spatial relation TO YOU, pass `reference_constraint_id` (never a bare `relation` "
         "string -- see the system prompt's reference_constraints section for the full "
-        "contract) referencing an entry this plan's own top-level reference_constraints "
-        "array -- resolved deterministically against real robot position/orientation, "
+        "contract) referencing an entry in context_json.reference_constraints -- a "
+        "pre-extracted, trusted list computed before planning, never something you author "
+        "yourself -- resolved deterministically against real robot position/orientation, "
         "never guessed.",
         {"target": "entity|entity_id|person", "name": "name to bind",
-         "reference_constraint_id": "optional: id of a reference_constraints entry -- only "
-         "when 2+ same-class candidates could otherwise be meant and the user's own words "
-         "identify which one via a spatial relation to you; never set relation directly"},
+         "reference_constraint_id": "optional: id of an entry in context_json."
+         "reference_constraints -- only when 2+ same-class candidates could otherwise be "
+         "meant and the user's own words identify which one via a spatial relation to you; "
+         "never set relation directly"},
         ("person_named",),
         subsumes_locate_skills=("search_for_entity", "locate_entity"),
     ),
@@ -346,14 +348,16 @@ DEFAULT_SKILLS: dict[str, SkillSpec] = {
         "alongside a prior locate's entity_id: if the user's own words identify which one "
         "by a spatial relation TO YOU, pass `reference_constraint_id` (never a bare "
         "`relation` string -- see the system prompt's reference_constraints section for "
-        "the full contract) referencing an entry in this plan's own top-level "
-        "reference_constraints array instead -- resolved deterministically against real "
-        "robot position/orientation, never guessed.",
+        "the full contract) referencing an entry in context_json.reference_constraints "
+        "instead -- a pre-extracted, trusted list computed before planning, never something "
+        "you author yourself -- resolved deterministically against real robot "
+        "position/orientation, never guessed.",
         {"target": "entity|object|person (class/description; omit if entity_id given)",
          "entity_id": "optional, exact entity_tracks id from a prior locate/search/approach result",
          "alias": "alias to bind",
-         "reference_constraint_id": "optional: id of a reference_constraints entry -- only "
-         "when 2+ same-class candidates could otherwise be meant and the user's own words "
+         "reference_constraint_id": "optional: id of an entry in context_json."
+         "reference_constraints -- only when 2+ same-class candidates could otherwise be "
+         "meant and the user's own words "
          "identify which one via a spatial relation to you; never set relation directly"},
         ("entity_alias_bound",),
         subsumes_locate_skills=("search_for_entity", "locate_entity"),

@@ -399,7 +399,18 @@ class LlmJsonPlanner:
         raw = self._invoke(messages)
         plan = _extract_json_object(raw)
         plan.setdefault("schema", "mc_ai_bt.plan.v1")
-        plan.setdefault("context_json", context_json or "{}")
+        # Identity/Grounding foundation finalization (2026-09-03, GPT
+        # re-review): unconditional overwrite, not setdefault -- the model
+        # is now explicitly told never to write context_json itself (see
+        # build_planner_messages' own "Top-level keys" instruction; this
+        # also used to be embedded a SECOND time, in full, inside
+        # required_output_example, actively teaching the model that
+        # echoing it back was expected -- removed there too). setdefault
+        # would leave a stray/hallucinated value in place if the model
+        # wrote one anyway despite the instruction; this line guarantees
+        # the real, caller-supplied context_json always wins regardless of
+        # what the model does.
+        plan["context_json"] = context_json or "{}"
         return json.dumps(plan, sort_keys=True, separators=(",", ":"))
 
     def _invoke(self, messages: list[tuple[str, str]]) -> str:
@@ -451,8 +462,13 @@ def build_planner_messages(
             "You are the mc_ai_bt planner.",
             "Return only one JSON object. Do not include markdown.",
             "The JSON object must use schema mc_ai_bt.plan.v1.",
-            "Top-level keys: schema, root, goal_spec, context_json, and optionally "
-            "reference_constraints (see its own section below).",
+            (
+                "Top-level keys: schema, root, goal_spec. Do not include a context_json key in "
+                "your own output -- the caller attaches the real one automatically after parsing; "
+                "writing your own would just be discarded, and copying the input context_json back "
+                "out wastes output tokens for no purpose. Do not include a reference_constraints key "
+                "either -- see its own section below for why that is never your data to write."
+            ),
             "root must be a Behavior Tree made only from executable node types.",
             (
                 "Executable node types: Sequence, Fallback, Parallel, Timeout, Action, Wait, Retry, "
@@ -536,40 +552,42 @@ def build_planner_messages(
                 "the nearest same-class instance instead."
             ),
             (
-                # Gate-1.1 architecture round (2026-09-03, GPT review): the prior version of this
-                # prompt let remember_person/remember_entity's own `relation` arg be set directly,
-                # with no check on WHERE that value came from -- a planner could invent
-                # relation="left" with no basis in what the user actually said, and
-                # ResolveEntityReference would then reliably (and wrongly) bind the alias to
-                # whoever really is on the left. reference_constraints is the structural fix:
-                # the planner must name WHICH WORDS justify a spatial claim, in a place a
-                # deterministic check (planning_pipeline.py's _apply_reference_constraint_guard)
-                # can verify those words are real, not merely present somewhere in the sentence.
-                "OPTIONAL top-level key reference_constraints: a list of objects, each "
-                '{"constraint_id": "<short id you choose, e.g. ref_1>", "entity_class": '
-                '"<the class this identifies, e.g. person>", "relation": '
-                '"front|left|right|nearest", "reference_frame": "robot", "source_span": '
-                '"<the EXACT words copied from intent_text that establish this>"}. Use this '
-                "ONLY when the user's own words identify WHICH SPECIFIC person/entity is "
-                "meant via a spatial relation TO YOU (the robot) -- e.g. \"the person on "
-                "your left\", \"whoever is right in front of you\", \"whichever is "
-                "nearest\". source_span must be copied verbatim from intent_text, describing "
-                "the SAME entity the constraint's entity_class/relation claim -- citing words "
-                "that actually describe a DIFFERENT entity (e.g. \"the chair is on your "
-                "left\" does not establish a constraint about a PERSON) or a relation to "
-                "something other than yourself (e.g. \"in front of the sofa\" is not "
-                'reference_frame "robot") is never valid and will be rejected outright.'
+                # Identity/Grounding foundation finalization (2026-09-03, GPT re-review):
+                # Gate-1.1's own prompt let the planner AUTHOR reference_constraints itself,
+                # self-certifying which words justify a spatial claim -- GPT's re-review found
+                # this closes nothing structural: a planner that mis-attributes "on your left"
+                # to a person when it actually described a chair would write internally-
+                # consistent fields that pass every deterministic check, because the checks
+                # verified the model's OWN claims against each other, never an INDEPENDENT
+                # judgment of what those words actually modify. Extraction moved entirely out
+                # of the planner: reference_extraction.py (a small, deterministic, narrow-
+                # grammar recognizer) now runs on intent_text BEFORE you are ever called, and
+                # its output -- already-verified, already-trustworthy -- arrives as
+                # context_json.reference_constraints. You do not create, edit, or extend that
+                # list under any circumstance; you may only pick an existing entry by its
+                # constraint_id when it genuinely fits.
+                "If context_json.reference_constraints is present and non-empty, each entry "
+                "is {\"constraint_id\", \"entity_class\", \"relation\", \"reference_frame\", "
+                "\"source_span\"} -- a pre-verified, TRUSTED spatial claim, computed "
+                "deterministically before you were called. If one of its entries genuinely "
+                "fits what this intent needs for remember_person/remember_entity's "
+                "`reference_constraint_id` arg (e.g. args: {\"target\": \"the person\", "
+                "\"name\": \"44\", \"reference_constraint_id\": \"ref_1\"}), use that exact "
+                "constraint_id. If context_json.reference_constraints is empty, or none of its "
+                "entries fit, do not set reference_constraint_id at all -- never invent a "
+                "constraint_id that is not in that list, and never write your own "
+                "reference_constraints array in your output (it will simply be ignored; the "
+                "one that matters was already computed before this prompt was built)."
             ),
             (
                 "remember_person/remember_entity's own `relation` must NEVER be set directly "
-                "as a plain string on the Action itself -- reference an entry from "
-                "reference_constraints instead, via `reference_constraint_id` (e.g. args: "
-                '{"target": "the person", "name": "44", "reference_constraint_id": "ref_1"}). '
-                "A look_at Action's own `direction` is a physical bearing the robot turns to "
-                "look at -- it is NEVER evidence of which entity the user meant, even when it "
-                "appears immediately before remember_person/remember_entity in the plan; if "
-                "disambiguation is genuinely needed, express it as a reference_constraints "
-                "entry, never by relying on a look_at's direction to carry that meaning."
+                "as a plain string on the Action itself, under any circumstance -- always via "
+                "reference_constraint_id as described above, or not at all. A look_at Action's "
+                "own `direction` is a physical bearing the robot turns to look at -- it is "
+                "NEVER evidence of which entity the user meant, even when it appears "
+                "immediately before remember_person/remember_entity in the plan; disambiguation "
+                "can only ever come from context_json.reference_constraints, never from a "
+                "look_at's direction."
             ),
             (
                 # Found live 2026-08-30: "find/look for a woman in the room" planned
@@ -690,6 +708,17 @@ def build_planner_messages(
             "\n".join(skill_lines),
         ]
     )
+    # Identity/Grounding foundation finalization (2026-09-03, GPT
+    # re-review): required_output_example used to ALSO carry a second,
+    # full copy of context_json -- doubling how much of it counted against
+    # the model's input token budget for zero benefit (LlmJsonPlanner.plan
+    # never trusted the model's own context_json anyway, and now
+    # unconditionally overwrites it regardless), and actively teaching the
+    # model that echoing the whole thing back in its OWN output was
+    # expected, wasting real output tokens on a real mission (context_json
+    # can run to tens of thousands of characters). context_json is dropped
+    # from this example entirely -- see the "Top-level keys" system-prompt
+    # line above for the explicit instruction not to write one.
     user = json.dumps(
         {
             "intent_text": intent_text,
@@ -707,7 +736,6 @@ def build_planner_messages(
                     "verification": {"mode": "implicit_conversation"},
                     "summary": intent_text,
                 },
-                "context_json": context_json or "{}",
             },
         },
         sort_keys=True,
