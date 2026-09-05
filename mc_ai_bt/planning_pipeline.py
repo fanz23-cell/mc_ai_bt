@@ -648,6 +648,93 @@ def _without_redundant_locate_actions(node: Any, redundant_ids: set[int]) -> Any
     return node
 
 
+_SELF_SUFFICIENT_TERMINAL_SKILLS = frozenset(
+    name for name, spec in DEFAULT_SKILLS.items() if spec.self_sufficient_physical_terminal
+)
+
+
+def _predicate_producers() -> dict[str, set[str]]:
+    producers: dict[str, set[str]] = {}
+    for name, spec in DEFAULT_SKILLS.items():
+        for predicate in spec.result_predicates:
+            producers.setdefault(predicate, set()).add(name)
+    return producers
+
+
+def _canonicalize_unsatisfiable_gate_before_terminal(plan: dict[str, Any]) -> None:
+    """FOUND LIVE 2026-09-05 (E1 TURN1, fourth and fifth real attempts): the
+    planner put a gate in front of a self-sufficient terminal --
+
+        Sequence[ Condition(entity_located), remember_person(name=33) ]
+
+    -- and the mission stalled on "condition UNKNOWN: no verification evidence
+    for entity_located", every time. Nothing in that plan produces
+    entity_located (remember_person produces person_named), so the gate could
+    only ever be UNKNOWN: it asks whether the target has been located before
+    the step whose whole job is to locate it.
+
+    The prompt was told not to do this, twice, and kept doing it. That is the
+    line where a rule stops being advice and has to be enforced: the same
+    lesson this pipeline already learned when reference-constraint extraction
+    was moved out of the planner. So the gate is removed here, deterministically.
+
+    Deliberately narrow, and NOT a licence to delete safety checks:
+      * only a Condition/GoalCheck sitting in the same Sequence as, and before,
+        an Action whose skill declares self_sufficient_physical_terminal;
+      * only when no earlier Action in that Sequence produces the gate's
+        predicate (checked against the registry's own result_predicates, so a
+        genuine "locate, then confirm it worked" pair is never touched);
+      * a gate on a predicate that IS produced earlier, or that guards anything
+        other than a self-sufficient terminal, is left exactly as written.
+
+    Removing such a gate removes no information and no protection -- the
+    terminal establishes the very thing being asked about, and it refuses on
+    its own (fail-closed, with real evidence) when it cannot. What it removes
+    is a guaranteed deadlock. Mutates plan["root"] in place; a no-op when the
+    pattern does not match."""
+    producers = _predicate_producers()
+
+    def rewrite(node: Any) -> Any:
+        if not isinstance(node, dict):
+            return node
+        node_type = node.get("type")
+        if node_type in {"Sequence", "Fallback", "Parallel"}:
+            children = [c for c in (node.get("children") or []) if isinstance(c, dict)]
+            terminal_at = [
+                i for i, c in enumerate(children)
+                if c.get("type") == "Action"
+                and str(c.get("skill") or "") in _SELF_SUFFICIENT_TERMINAL_SKILLS
+            ]
+            drop: set[int] = set()
+            if node_type == "Sequence" and terminal_at:
+                last_terminal = max(terminal_at)
+                for i, child in enumerate(children[:last_terminal]):
+                    if child.get("type") not in {"Condition", "GoalCheck"}:
+                        continue
+                    predicate = str(child.get("predicate") or "")
+                    if not predicate:
+                        continue
+                    produced_earlier = any(
+                        earlier.get("type") == "Action"
+                        and str(earlier.get("skill") or "") in producers.get(predicate, set())
+                        for earlier in children[:i]
+                    )
+                    if not produced_earlier:
+                        drop.add(i)
+            new_node = dict(node)
+            new_node["children"] = [
+                rewrite(c) for i, c in enumerate(children) if i not in drop
+            ]
+            return new_node
+        if node_type in {"Retry", "Timeout"}:
+            new_node = dict(node)
+            new_node["child"] = rewrite(node.get("child"))
+            return new_node
+        return node
+
+    plan["root"] = rewrite(plan.get("root"))
+
+
 def _canonicalize_redundant_locate_prefix(plan: dict[str, Any], *, intent_text: str) -> None:
     """Actually remove a redundant look_at/search_for_entity/locate_entity
     Action from the executable BT tree when it immediately duplicates work
@@ -775,6 +862,7 @@ class PlanningPipeline:
             )
 
         _canonicalize_redundant_locate_prefix(plan, intent_text=mission.intent_text)
+        _canonicalize_unsatisfiable_gate_before_terminal(plan)
 
         reference_error = _apply_reference_constraint_guard(
             plan, context_json=context_json, intent_text=mission.intent_text)

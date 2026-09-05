@@ -110,3 +110,42 @@ def test_the_rule_also_forbids_a_precondition_gate_in_front_of_the_terminal():
     assert "Condition or GoalCheck gate" in rule
     assert "entity_located" in rule
     assert "produced BY it, not required before it" in rule
+
+
+def test_an_unsatisfiable_gate_before_a_terminal_is_removed_deterministically():
+    # The live plan, verbatim, from the fourth and fifth E1 TURN1 attempts.
+    from mc_ai_bt.planning_pipeline import _canonicalize_unsatisfiable_gate_before_terminal
+    plan = {"root": {"type": "Sequence", "children": [
+        {"type": "Condition", "predicate": "entity_located"},
+        {"type": "Action", "skill": "remember_person", "args": {"name": "33", "target": "person"}},
+    ]}}
+    _canonicalize_unsatisfiable_gate_before_terminal(plan)
+    kinds = [c["type"] for c in plan["root"]["children"]]
+    assert kinds == ["Action"], "the unsatisfiable gate must be gone"
+    assert plan["root"]["children"][0]["skill"] == "remember_person"
+
+
+def test_a_gate_whose_predicate_an_earlier_action_really_produces_is_kept():
+    # "locate, then confirm that locate worked" is a legitimate pair and must
+    # survive untouched -- this is the whole reason the check is producer-aware
+    # instead of just deleting Conditions in front of remember_*.
+    from mc_ai_bt.planning_pipeline import _canonicalize_unsatisfiable_gate_before_terminal
+    plan = {"root": {"type": "Sequence", "children": [
+        {"type": "Action", "skill": "locate_entity", "args": {"target": "person"}},
+        {"type": "Condition", "predicate": "entity_located"},
+        {"type": "Action", "skill": "remember_person", "args": {"name": "33", "target": "person"}},
+    ]}}
+    _canonicalize_unsatisfiable_gate_before_terminal(plan)
+    kinds = [c["type"] for c in plan["root"]["children"]]
+    assert kinds == ["Action", "Condition", "Action"]
+
+
+def test_a_gate_in_front_of_an_ordinary_skill_is_never_touched():
+    from mc_ai_bt.planning_pipeline import _canonicalize_unsatisfiable_gate_before_terminal
+    plan = {"root": {"type": "Sequence", "children": [
+        {"type": "Condition", "predicate": "entity_located"},
+        {"type": "Action", "skill": "approach_entity", "args": {"target": "person"}},
+    ]}}
+    before = json_like = str(plan)
+    _canonicalize_unsatisfiable_gate_before_terminal(plan)
+    assert str(plan) == before
