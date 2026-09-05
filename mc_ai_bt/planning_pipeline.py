@@ -10,7 +10,7 @@ from .mission import Mission
 from .planner import Planner
 from .policy_guard import PHYSICAL_SKILLS, PolicyGuard
 from .reference_extraction import has_explicit_look_instruction
-from .skill_registry import DEFAULT_SKILLS
+from .skill_registry import DEFAULT_SKILLS, internally_resolved_predicates
 from .validator import PlanValidator
 
 
@@ -708,8 +708,8 @@ def _without_redundant_locate_actions(node: Any, redundant_ids: set[int]) -> Any
     return node
 
 
-_SELF_SUFFICIENT_TERMINAL_SKILLS = frozenset(
-    name for name, spec in DEFAULT_SKILLS.items() if spec.self_sufficient_physical_terminal
+_TARGET_ACQUIRING_TERMINALS = frozenset(
+    name for name, spec in DEFAULT_SKILLS.items() if spec.resolves_own_target_acquisition
 )
 
 
@@ -721,37 +721,38 @@ def _predicate_producers() -> dict[str, set[str]]:
     return producers
 
 
-def _canonicalize_unsatisfiable_gate_before_terminal(plan: dict[str, Any]) -> None:
-    """FOUND LIVE 2026-09-05 (E1 TURN1, fourth and fifth real attempts): the
-    planner put a gate in front of a self-sufficient terminal --
+def _canonicalize_gate_the_terminal_resolves_itself(plan: dict[str, Any]) -> None:
+    """FOUND LIVE 2026-09-05 (E1 TURN1, fourth and fifth attempts): the planner
+    gated a target-acquiring terminal on the very thing that terminal does --
 
         Sequence[ Condition(entity_located), remember_person(name=33) ]
 
     -- and the mission stalled on "condition UNKNOWN: no verification evidence
-    for entity_located", every time. Nothing in that plan produces
-    entity_located (remember_person produces person_named), so the gate could
-    only ever be UNKNOWN: it asks whether the target has been located before
-    the step whose whole job is to locate it.
+    for entity_located" every time, because nothing had run to establish it.
+    Two prompt revisions did not stop it, so it is removed here instead.
 
-    The prompt was told not to do this, twice, and kept doing it. That is the
-    line where a rule stops being advice and has to be enforced: the same
-    lesson this pipeline already learned when reference-constraint extraction
-    was moved out of the planner. So the gate is removed here, deterministically.
+    NARROWED 2026-09-05 after review, and this is the important part. The first
+    version of this function decided a gate was unsatisfiable whenever no
+    EARLIER ACTION in the plan produced its predicate. That inference is simply
+    false: a Condition may perfectly well check a fact that already holds in
+    WorldState -- person_visible has no producing skill at all, and gating on it
+    is entirely legitimate. Written that way this function would have silently
+    deleted real pre-execution checks, weakening exactly the execution-time
+    verification the D/WorldState layers exist to provide -- a much worse defect
+    than the stall it was fixing.
 
-    Deliberately narrow, and NOT a licence to delete safety checks:
-      * only a Condition/GoalCheck sitting in the same Sequence as, and before,
-        an Action whose skill declares self_sufficient_physical_terminal;
-      * only when no earlier Action in that Sequence produces the gate's
-        predicate (checked against the registry's own result_predicates, so a
-        genuine "locate, then confirm it worked" pair is never touched);
-      * a gate on a predicate that IS produced earlier, or that guards anything
-        other than a self-sufficient terminal, is left exactly as written.
+    So the test is now contract-driven, not inference-driven: a gate is removed
+    only when its predicate is one the terminal itself declares it resolves
+    internally, derived from subsumes_locate_skills via
+    internally_resolved_predicates(). For remember_person/remember_entity that
+    is exactly {entity_located, search_for_entity_completed}. Every other
+    predicate -- person_visible, robot_at_place, person_named, anything a policy
+    or the world already answers -- is left alone, whether or not any Action
+    produces it.
 
-    Removing such a gate removes no information and no protection -- the
-    terminal establishes the very thing being asked about, and it refuses on
-    its own (fail-closed, with real evidence) when it cannot. What it removes
-    is a guaranteed deadlock. Mutates plan["root"] in place; a no-op when the
-    pattern does not match."""
+    Still additionally producer-aware: if an earlier Action really did produce
+    the predicate, the pair is a genuine "locate, then confirm that locate
+    worked" and is kept untouched. Mutates plan["root"] in place."""
     producers = _predicate_producers()
 
     def rewrite(node: Any) -> Any:
@@ -760,19 +761,21 @@ def _canonicalize_unsatisfiable_gate_before_terminal(plan: dict[str, Any]) -> No
         node_type = node.get("type")
         if node_type in {"Sequence", "Fallback", "Parallel"}:
             children = [c for c in (node.get("children") or []) if isinstance(c, dict)]
-            terminal_at = [
-                i for i, c in enumerate(children)
-                if c.get("type") == "Action"
-                and str(c.get("skill") or "") in _SELF_SUFFICIENT_TERMINAL_SKILLS
-            ]
             drop: set[int] = set()
-            if node_type == "Sequence" and terminal_at:
-                last_terminal = max(terminal_at)
-                for i, child in enumerate(children[:last_terminal]):
+            if node_type == "Sequence":
+                for i, child in enumerate(children):
                     if child.get("type") not in {"Condition", "GoalCheck"}:
                         continue
                     predicate = str(child.get("predicate") or "")
                     if not predicate:
+                        continue
+                    resolved_by_a_later_terminal = any(
+                        later.get("type") == "Action"
+                        and predicate in internally_resolved_predicates(
+                            str(later.get("skill") or ""))
+                        for later in children[i + 1:]
+                    )
+                    if not resolved_by_a_later_terminal:
                         continue
                     produced_earlier = any(
                         earlier.get("type") == "Action"
@@ -922,7 +925,7 @@ class PlanningPipeline:
             )
 
         _canonicalize_redundant_locate_prefix(plan, intent_text=mission.intent_text)
-        _canonicalize_unsatisfiable_gate_before_terminal(plan)
+        _canonicalize_gate_the_terminal_resolves_itself(plan)
 
         _inject_owned_reference_constraint(
             plan, context_json=context_json, intent_text=mission.intent_text)

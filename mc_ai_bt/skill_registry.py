@@ -51,30 +51,26 @@ class SkillSpec:
     # live information-loss bug that caused), so it is never safe to treat
     # as unconditionally redundant.
     subsumes_locate_skills: tuple[str, ...] = ()
-    # FOUND LIVE 2026-09-05 (E1 TURN1, third real attempt): this skill performs
-    # ALL the physical work its own goal needs, so a plan that uses it must
-    # contain no OTHER physical Action for the same target -- it is the plan's
-    # single physical Action, full stop.
+    # FOUND LIVE 2026-09-05 (E1 TURN1, third real attempt): to reach its OWN
+    # subgoal this skill needs no prerequisite motion planned in front of it --
+    # no separate locate/search step, and above all no walk/navigate step.
+    # Binding a name to someone requires SEEING them, not travelling to them.
     #
-    # This is deliberately NOT the same thing as subsumes_locate_skills. That
-    # field lists specific skills whose work is duplicated, and the pipeline
-    # canonicalizer uses it to DROP a redundant prefix. This field states
-    # something stronger and simpler: nothing else physical belongs in the plan
-    # at all. In particular it says the robot never needs to TRAVEL to the
-    # target -- binding a name to someone only requires SEEING them.
+    # NARROWED 2026-09-05 after review, and the narrowing matters. A first
+    # version of this field was read as "this must be the plan's ONLY physical
+    # Action, and no Condition/GoalCheck may precede it". That is too strong and
+    # was wrong twice over: a user can legitimately ask for two things at once
+    # ("wave at the nearest person, then remember them as 33"), and a Condition
+    # may legitimately check a fact that already holds in WorldState before
+    # anything in this plan runs. This field says only what its name says --
+    # the skill acquires its own target -- and nothing about what else the
+    # mission may contain.
     #
-    # It exists because the narrower field could not express that. "记住离你最近
-    # 的人叫33" (remember the nearest person as 33) was planned as
-    # approach_entity(entity_id="33") + remember_person: the planner invented an
-    # entity_id out of the alias the mission was supposed to CREATE, and walked
-    # to it first. The prompt rule meant to prevent that had been written as a
-    # hand-typed list of two skill names (look_at, search_for_entity), so a third
-    # skill simply stepped around it -- the same "hand-maintained skill-name set
-    # goes stale" failure this file's other comments already document twice.
-    # Declaring the property here instead means planner.py renders the rule from
-    # the registry and cannot drift again (tests/test_skill_registry_derived_
-    # prompt_rules.py pins that).
-    self_sufficient_physical_terminal: bool = False
+    # What the skill establishes internally is NOT declared here a second time:
+    # it is derived from subsumes_locate_skills (those skills' own
+    # result_predicates), so the two can never disagree. See
+    # internally_resolved_predicates() below.
+    resolves_own_target_acquisition: bool = False
 
 
 # Real clip names from the animation library (mc_one_codey/*/context/animations/clips/),
@@ -347,7 +343,7 @@ DEFAULT_SKILLS: dict[str, SkillSpec] = {
          "never set relation directly"},
         ("person_named",),
         subsumes_locate_skills=("search_for_entity", "locate_entity"),
-        self_sufficient_physical_terminal=True,
+        resolves_own_target_acquisition=True,
     ),
     # C.2 (2026-09-02): remember_person's generalization to any entity_tracks-
     # tracked class (person, chair, potted plant, ...), not just people --
@@ -389,7 +385,7 @@ DEFAULT_SKILLS: dict[str, SkillSpec] = {
          "identify which one via a spatial relation to you; never set relation directly"},
         ("entity_alias_bound",),
         subsumes_locate_skills=("search_for_entity", "locate_entity"),
-        self_sufficient_physical_terminal=True,
+        resolves_own_target_acquisition=True,
     ),
     # FOUND LIVE 2026-08-31: "turn around and count everyone in the room" is one
     # reasonable request, but needing several separate simple_move turns to do it
@@ -522,3 +518,26 @@ class SkillRegistry:
 
     def names(self) -> tuple[str, ...]:
         return tuple(sorted(self._skills.keys()))
+
+
+def internally_resolved_predicates(skill_name: str) -> frozenset[str]:
+    """The predicates a skill establishes on its own, derived strictly from the
+    contract already declared in subsumes_locate_skills -- the result_predicates
+    of the skills whose work it performs internally.
+
+    Nothing is hand-listed here on purpose. A gate asking for one of these in
+    front of such a skill is asking for something the skill itself produces; a
+    gate asking for anything else (person_visible, robot_at_place, a policy
+    fact, any predicate no skill produces at all) is a legitimate check of state
+    that may already hold, and must never be treated as unsatisfiable just
+    because no earlier Action in the plan produces it. That inference was the
+    P0 this function exists to make impossible to write again."""
+    spec = DEFAULT_SKILLS.get(skill_name)
+    if spec is None or not spec.resolves_own_target_acquisition:
+        return frozenset()
+    return frozenset(
+        predicate
+        for subsumed in spec.subsumes_locate_skills
+        for predicate in DEFAULT_SKILLS[subsumed].result_predicates
+        if subsumed in DEFAULT_SKILLS
+    )

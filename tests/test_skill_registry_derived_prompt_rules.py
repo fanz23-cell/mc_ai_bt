@@ -13,14 +13,14 @@ self-sufficient terminal skill without the prompt following along, this fails.
 """
 
 
-from mc_ai_bt.planner import _self_sufficient_terminal_rule, build_planner_messages
+from mc_ai_bt.planner import _target_acquisition_rule, build_planner_messages
 from mc_ai_bt.skill_registry import DEFAULT_SKILLS, SkillRegistry
 
 
 def _registry_declared_terminals() -> set[str]:
     return {
         name for name, spec in DEFAULT_SKILLS.items()
-        if spec.self_sufficient_physical_terminal
+        if spec.resolves_own_target_acquisition
     }
 
 
@@ -39,21 +39,21 @@ def test_the_registry_actually_declares_the_remember_skills_as_self_sufficient()
 
 
 def test_every_declared_terminal_appears_in_the_derived_rule():
-    rule = _self_sufficient_terminal_rule()
+    rule = _target_acquisition_rule()
     for name in _registry_declared_terminals():
-        assert name in rule, f"{name} declares self_sufficient_physical_terminal but the derived rule omits it"
+        assert name in rule, f"{name} declares resolves_own_target_acquisition but the derived rule omits it"
 
 
 def test_the_derived_rule_actually_reaches_the_planner_prompt():
     prompt = _prompt_text()
-    rule = _self_sufficient_terminal_rule()
+    rule = _target_acquisition_rule()
     assert rule, "the registry declares terminals, so the rule must be non-empty"
     assert rule in prompt
 
 
 def test_the_rule_forbids_travelling_to_a_target_just_to_name_it():
     # The specific live failure: approach_entity in front of remember_person.
-    rule = _self_sufficient_terminal_rule()
+    rule = _target_acquisition_rule()
     assert "approach_entity" in rule
     assert "go_to_place" in rule
     assert "SEEING" in rule
@@ -94,7 +94,7 @@ def test_self_sufficient_terminals_are_a_superset_of_nothing_unexpected():
     # go_to_place, come_to_me) must never be declared self-sufficient -- the
     # rule tells the planner such skills are exactly what NOT to plan alongside.
     for name in ("approach_entity", "go_to_place", "come_to_me", "simple_move"):
-        assert not DEFAULT_SKILLS[name].self_sufficient_physical_terminal
+        assert not DEFAULT_SKILLS[name].resolves_own_target_acquisition
 
 
 def test_the_rule_also_forbids_a_precondition_gate_in_front_of_the_terminal():
@@ -106,20 +106,21 @@ def test_the_rule_also_forbids_a_precondition_gate_in_front_of_the_terminal():
     # decision. Same concept as the Action half: a self-sufficient terminal
     # establishes its own preconditions, so nothing precedes it -- the rule has
     # to say that about node types, not only about skills.
-    rule = _self_sufficient_terminal_rule()
-    assert "Condition or GoalCheck gate" in rule
+    rule = _target_acquisition_rule()
     assert "entity_located" in rule
-    assert "produced BY it, not required before it" in rule
+    assert "produces rather than needs" in rule
+    # and it must NOT over-claim about the rest of the mission
+    assert "ONLY physical Action" not in rule
 
 
 def test_an_unsatisfiable_gate_before_a_terminal_is_removed_deterministically():
     # The live plan, verbatim, from the fourth and fifth E1 TURN1 attempts.
-    from mc_ai_bt.planning_pipeline import _canonicalize_unsatisfiable_gate_before_terminal
+    from mc_ai_bt.planning_pipeline import _canonicalize_gate_the_terminal_resolves_itself
     plan = {"root": {"type": "Sequence", "children": [
         {"type": "Condition", "predicate": "entity_located"},
         {"type": "Action", "skill": "remember_person", "args": {"name": "33", "target": "person"}},
     ]}}
-    _canonicalize_unsatisfiable_gate_before_terminal(plan)
+    _canonicalize_gate_the_terminal_resolves_itself(plan)
     kinds = [c["type"] for c in plan["root"]["children"]]
     assert kinds == ["Action"], "the unsatisfiable gate must be gone"
     assert plan["root"]["children"][0]["skill"] == "remember_person"
@@ -129,25 +130,25 @@ def test_a_gate_whose_predicate_an_earlier_action_really_produces_is_kept():
     # "locate, then confirm that locate worked" is a legitimate pair and must
     # survive untouched -- this is the whole reason the check is producer-aware
     # instead of just deleting Conditions in front of remember_*.
-    from mc_ai_bt.planning_pipeline import _canonicalize_unsatisfiable_gate_before_terminal
+    from mc_ai_bt.planning_pipeline import _canonicalize_gate_the_terminal_resolves_itself
     plan = {"root": {"type": "Sequence", "children": [
         {"type": "Action", "skill": "locate_entity", "args": {"target": "person"}},
         {"type": "Condition", "predicate": "entity_located"},
         {"type": "Action", "skill": "remember_person", "args": {"name": "33", "target": "person"}},
     ]}}
-    _canonicalize_unsatisfiable_gate_before_terminal(plan)
+    _canonicalize_gate_the_terminal_resolves_itself(plan)
     kinds = [c["type"] for c in plan["root"]["children"]]
     assert kinds == ["Action", "Condition", "Action"]
 
 
 def test_a_gate_in_front_of_an_ordinary_skill_is_never_touched():
-    from mc_ai_bt.planning_pipeline import _canonicalize_unsatisfiable_gate_before_terminal
+    from mc_ai_bt.planning_pipeline import _canonicalize_gate_the_terminal_resolves_itself
     plan = {"root": {"type": "Sequence", "children": [
         {"type": "Condition", "predicate": "entity_located"},
         {"type": "Action", "skill": "approach_entity", "args": {"target": "person"}},
     ]}}
     before = json_like = str(plan)
-    _canonicalize_unsatisfiable_gate_before_terminal(plan)
+    _canonicalize_gate_the_terminal_resolves_itself(plan)
     assert str(plan) == before
 
 
@@ -199,3 +200,49 @@ def test_an_action_that_already_chose_a_constraint_is_left_alone():
     ]}}
     _inject_owned_reference_constraint(plan, context_json=context, intent_text=intent)
     assert plan["root"]["children"][0]["args"]["reference_constraint_id"] == "ref_9"
+
+
+# --- the P0 this file exists to prevent recurring -------------------------
+# A first version of the canonicalizer decided a gate was unsatisfiable
+# whenever no EARLIER ACTION produced its predicate. That inference is false:
+# a Condition may check a fact that already holds in WorldState. Written that
+# way it silently deleted legitimate pre-execution checks -- a worse defect
+# than the stall it fixed. These are the cases that catch it.
+
+def test_a_legitimate_worldstate_gate_with_no_producer_is_never_removed():
+    # person_visible is produced by NO skill at all -- it is answered from
+    # WorldState. Gating a remember on it is entirely legitimate, and the old
+    # "no earlier producer means unsatisfiable" rule would have deleted it.
+    from mc_ai_bt.planning_pipeline import _canonicalize_gate_the_terminal_resolves_itself
+    from mc_ai_bt.skill_registry import DEFAULT_SKILLS
+    assert not any("person_visible" in s.result_predicates for s in DEFAULT_SKILLS.values()), (
+        "this test's premise is that person_visible has no producing skill")
+    plan = {"root": {"type": "Sequence", "children": [
+        {"type": "Condition", "predicate": "person_visible"},
+        {"type": "Action", "skill": "remember_person", "args": {"name": "33", "target": "person"}},
+    ]}}
+    _canonicalize_gate_the_terminal_resolves_itself(plan)
+    kinds = [c["type"] for c in plan["root"]["children"]]
+    assert kinds == ["Condition", "Action"], "a legitimate WorldState gate must survive"
+
+
+def test_only_predicates_the_terminal_itself_resolves_are_removable():
+    from mc_ai_bt.skill_registry import internally_resolved_predicates
+    resolved = internally_resolved_predicates("remember_person")
+    assert resolved == {"entity_located", "search_for_entity_completed"}
+    # everything else a plan might gate on stays outside that set
+    for predicate in ("person_visible", "person_named", "robot_at_place", "entity_approached"):
+        assert predicate not in resolved
+
+
+def test_a_skill_that_does_not_acquire_its_own_target_resolves_nothing():
+    from mc_ai_bt.skill_registry import internally_resolved_predicates
+    assert internally_resolved_predicates("approach_entity") == frozenset()
+
+
+def test_the_rule_no_longer_claims_the_mission_may_hold_nothing_else():
+    # "wave at the nearest person, then remember them as 33" is a legitimate
+    # two-action mission; the rule must not forbid it.
+    rule = _target_acquisition_rule()
+    assert "rest of the mission" in rule
+    assert "if the user genuinely asked for another action too, plan it" in rule

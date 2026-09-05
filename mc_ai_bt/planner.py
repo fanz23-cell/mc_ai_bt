@@ -34,37 +34,33 @@ def _predicate_names_with_producing_skill() -> str:
     return ", ".join(parts)
 
 
-def _self_sufficient_terminal_rule() -> str:
-    """FOUND LIVE 2026-09-05 (E1 TURN1, third real attempt): the rule this
-    renders used to be a hand-typed sentence naming two skills -- "never plan a
-    separate look_at or search_for_entity Action immediately before
-    remember_person/remember_entity". A real planner then put a THIRD skill
-    there instead (approach_entity, to walk to the person before naming them),
-    stepped straight around the list, and the mission died at the grounding
-    guard. Same failure shape as every other hand-maintained skill-name set this
-    codebase has already been bitten by -- so the property lives on SkillSpec
-    (self_sufficient_physical_terminal) and this sentence is derived from it.
-    Adding such a skill later cannot leave the prompt stale."""
+def _target_acquisition_rule() -> str:
+    """FOUND LIVE 2026-09-05: rendered from the registry rather than hand-typed,
+    because the sentence this replaced named exactly two skills (look_at,
+    search_for_entity) and a planner simply used a third (approach_entity).
+
+    NARROWED after review: an earlier wording of this rule claimed the terminal
+    must be the plan's ONLY physical Action and that no Condition/GoalCheck may
+    precede it. Both were too strong. A user can legitimately ask for two things
+    in one breath ("wave at the nearest person, then remember them as 33"), and
+    a Condition may legitimately check something that already holds. The rule
+    says only what is actually true: this skill acquires its own target, so
+    nothing needs to be planned in front of it to make that happen."""
     names = sorted(
         name for name, spec in DEFAULT_SKILLS.items()
-        if spec.self_sufficient_physical_terminal
+        if spec.resolves_own_target_acquisition
     )
     if not names:  # pragma: no cover -- defensive; the registry declares two today
         return ""
-    listed = "/".join(names)
     return (
-        f"{listed} each perform ALL the physical work their own goal needs, including "
-        "locating the target themselves (turning to look if needed). When the plan's goal "
-        f"is one of them, NOTHING goes in front of it for the same target -- not another "
-        "physical Action (no look_at, no search_for_entity/locate_entity, and above all no "
-        "walk/navigate step such as approach_entity or go_to_place), and equally no "
-        "Condition or GoalCheck gate. A gate asking whether the target has been located "
-        "yet (entity_located, search_for_entity_completed, pose_available ...) can only "
-        "ever be UNKNOWN here, because nothing has run to establish it: the terminal does "
-        "its own locating, so the answer is produced BY it, not required before it. "
-        "Binding a name to someone requires SEEING them, never travelling to them. Keeping "
-        "it the plan's single step for that goal is also what lets the goal_spec be filled "
-        "in unambiguously."
+        f"{'/'.join(names)} acquire their own target: they locate it themselves, turning "
+        "to look if needed. So never plan a step in front of one of them just to make its "
+        "target available -- no look_at, no search_for_entity/locate_entity, and above all "
+        "no walk/navigate step such as approach_entity or go_to_place. Binding a name to "
+        "someone requires SEEING them, never travelling to them, and a gate asking whether "
+        "the target has been located yet (entity_located, search_for_entity_completed) asks "
+        "for something this skill produces rather than needs. This says nothing about the "
+        "rest of the mission: if the user genuinely asked for another action too, plan it."
     )
 
 
@@ -673,7 +669,7 @@ def build_planner_messages(
                 # remember_entity's own descriptions already say they locate the
                 # target first internally (turning to look if needed) -- exactly the
                 # same work search_for_entity/look_at would separately do.
-                _self_sufficient_terminal_rule()
+                _target_acquisition_rule()
             ),
             (
                 "Never write a say node whose text states the outcome of a Condition/GoalCheck/"
