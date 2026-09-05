@@ -34,6 +34,36 @@ def _predicate_names_with_producing_skill() -> str:
     return ", ".join(parts)
 
 
+def _self_sufficient_terminal_rule() -> str:
+    """FOUND LIVE 2026-09-05 (E1 TURN1, third real attempt): the rule this
+    renders used to be a hand-typed sentence naming two skills -- "never plan a
+    separate look_at or search_for_entity Action immediately before
+    remember_person/remember_entity". A real planner then put a THIRD skill
+    there instead (approach_entity, to walk to the person before naming them),
+    stepped straight around the list, and the mission died at the grounding
+    guard. Same failure shape as every other hand-maintained skill-name set this
+    codebase has already been bitten by -- so the property lives on SkillSpec
+    (self_sufficient_physical_terminal) and this sentence is derived from it.
+    Adding such a skill later cannot leave the prompt stale."""
+    names = sorted(
+        name for name, spec in DEFAULT_SKILLS.items()
+        if spec.self_sufficient_physical_terminal
+    )
+    if not names:  # pragma: no cover -- defensive; the registry declares two today
+        return ""
+    listed = "/".join(names)
+    return (
+        f"{listed} each perform ALL the physical work their own goal needs, including "
+        "locating the target themselves (turning to look if needed). When the plan's goal "
+        f"is one of them, that Action is the plan's ONLY physical Action: never put any "
+        "other physical skill in front of it for the same target -- not a look_at, not a "
+        "search_for_entity/locate_entity, and above all not a walk/navigate step such as "
+        "approach_entity or go_to_place. Binding a name to someone requires SEEING them, "
+        "never travelling to them. Keeping it a single physical Action is also what lets "
+        "the goal_spec be filled in unambiguously."
+    )
+
+
 PERSON_WORDS = {"person", "people", "someone", "anyone", "人", "某人", "一个人"}
 
 
@@ -541,8 +571,14 @@ def build_planner_messages(
                 # alias -> entity_id identity ONLY -- never current visibility,
                 # position, distance, or task success, all of which still require
                 # real, execution-time WorldState evidence.
-                "If context_json.caller_context.grounded_entities is present and one of its `alias` values "
-                "matches something the user said (e.g. intent_text contains \"33\" or \"小绿\"), use that entry's exact "
+                "An `entity_id` is an opaque machine-owned identifier. It has exactly two legitimate "
+                "sources: an entry of context_json.caller_context.grounded_entities, or the result of an "
+                "earlier locate-type Action in this same plan. A name or alias the user SPOKE is never an "
+                "entity_id -- least of all one the current request is asking you to create ('remember this "
+                "person as X' makes X a NEW name: it goes in remember_person's `name` / remember_entity's "
+                "`alias`, and there is nothing yet to approach). This holds unconditionally, including when "
+                "grounded_entities is absent or empty. When grounded_entities IS present and one of its "
+                "`alias` values matches something the user said, use that entry's exact "
                 "`entity_id` value as the `entity_id` arg on approach_entity (alongside `target` as a plain "
                 "human-readable label) instead of inventing a bare class/description search. Never invent an "
                 "entity_id yourself, never copy one from a different alias than the one actually mentioned, "
@@ -633,13 +669,7 @@ def build_planner_messages(
                 # remember_entity's own descriptions already say they locate the
                 # target first internally (turning to look if needed) -- exactly the
                 # same work search_for_entity/look_at would separately do.
-                "remember_person and remember_entity already locate the target "
-                "themselves before binding (turning to look if needed, the same work "
-                "search_for_entity/look_at would do) -- never plan a separate look_at "
-                "or search_for_entity Action immediately before remember_person/"
-                "remember_entity for the same target; call remember_person/"
-                "remember_entity directly as the plan's only physical Action so the "
-                "goal_spec can be filled in unambiguously."
+                _self_sufficient_terminal_rule()
             ),
             (
                 "Never write a say node whose text states the outcome of a Condition/GoalCheck/"
@@ -679,7 +709,7 @@ def build_planner_messages(
             (
                 "go_to_place ONLY works for a place already configured by name -- if there is no "
                 "known place for what the person means (e.g. 'go to her', 'walk over to the box'), "
-                "do not invent a place name. Use approach_entity instead: one arg, target, the "
+                "do not invent a place name. Use approach_entity instead: `target`, the "
                 "plain name of the person/object to walk to; it navigates to that entity's live "
                 "perceived position. It fails if the entity has not been perceived recently -- "
                 "that is a real, reportable outcome, not something to retry with a guessed place."

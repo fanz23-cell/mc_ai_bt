@@ -51,6 +51,30 @@ class SkillSpec:
     # live information-loss bug that caused), so it is never safe to treat
     # as unconditionally redundant.
     subsumes_locate_skills: tuple[str, ...] = ()
+    # FOUND LIVE 2026-09-05 (E1 TURN1, third real attempt): this skill performs
+    # ALL the physical work its own goal needs, so a plan that uses it must
+    # contain no OTHER physical Action for the same target -- it is the plan's
+    # single physical Action, full stop.
+    #
+    # This is deliberately NOT the same thing as subsumes_locate_skills. That
+    # field lists specific skills whose work is duplicated, and the pipeline
+    # canonicalizer uses it to DROP a redundant prefix. This field states
+    # something stronger and simpler: nothing else physical belongs in the plan
+    # at all. In particular it says the robot never needs to TRAVEL to the
+    # target -- binding a name to someone only requires SEEING them.
+    #
+    # It exists because the narrower field could not express that. "记住离你最近
+    # 的人叫33" (remember the nearest person as 33) was planned as
+    # approach_entity(entity_id="33") + remember_person: the planner invented an
+    # entity_id out of the alias the mission was supposed to CREATE, and walked
+    # to it first. The prompt rule meant to prevent that had been written as a
+    # hand-typed list of two skill names (look_at, search_for_entity), so a third
+    # skill simply stepped around it -- the same "hand-maintained skill-name set
+    # goes stale" failure this file's other comments already document twice.
+    # Declaring the property here instead means planner.py renders the rule from
+    # the registry and cannot drift again (tests/test_skill_registry_derived_
+    # prompt_rules.py pins that).
+    self_sufficient_physical_terminal: bool = False
 
 
 # Real clip names from the animation library (mc_one_codey/*/context/animations/clips/),
@@ -261,7 +285,8 @@ DEFAULT_SKILLS: dict[str, SkillSpec] = {
         "approach identity-aware: it navigates to and re-verifies that SPECIFIC tracked "
         "entity, never falling back to 'nearest same-class instance' the way a bare "
         "`target` search does.",
-        {"target": "entity|entity_id|object|person", "entity_id": "optional, from remember_entity/entity_tracks"},
+        {"target": "human-readable label of the entity to walk to (never an id)",
+         "entity_id": "optional; ONLY a real id from grounded_entities or a prior locate result -- never a name/alias the user spoke"},
         ("entity_approached",),
     ),
     "face_entity": SkillSpec(
@@ -322,6 +347,7 @@ DEFAULT_SKILLS: dict[str, SkillSpec] = {
          "never set relation directly"},
         ("person_named",),
         subsumes_locate_skills=("search_for_entity", "locate_entity"),
+        self_sufficient_physical_terminal=True,
     ),
     # C.2 (2026-09-02): remember_person's generalization to any entity_tracks-
     # tracked class (person, chair, potted plant, ...), not just people --
@@ -334,11 +360,13 @@ DEFAULT_SKILLS: dict[str, SkillSpec] = {
         "remember_entity",
         ("base", "gaze"),
         "Bind an alias to a specific physical entity (person, chair, plant, ...) -- "
-        "e.g. 'that plant is 小绿'. If a prior locate_entity/search_for_entity/"
-        "approach_entity result already resolved WHICH specific entity_id is meant "
-        "(the normal case when multiple same-class entities, e.g. several people, are "
-        "simultaneously visible -- pass that entity_id here, this is the ONLY way to "
-        "bind 11/22/33-style aliases to specific different people unambiguously), pass "
+        "e.g. 'that plant is 小绿'. The alias you are creating is NEVER an entity_id: it is a "
+        "name the user just spoke, so it goes in `alias`, and `entity_id` stays empty unless "
+        "a PRIOR locate_entity/search_for_entity Action in this same plan actually returned "
+        "one. Binding needs only to SEE the target -- never plan a walk/navigate step first. "
+        "If such a prior locate DID resolve which specific entity_id is meant (the case when "
+        "multiple same-class entities are simultaneously visible and no spatial relation "
+        "distinguishes them), pass "
         "`entity_id` and it is bound directly, no fresh look required. Otherwise pass "
         "`target` (a class name or description) and the robot actually locates it first "
         "(turning to look if needed); refuses to bind if it cannot find exactly one "
@@ -361,6 +389,7 @@ DEFAULT_SKILLS: dict[str, SkillSpec] = {
          "identify which one via a spatial relation to you; never set relation directly"},
         ("entity_alias_bound",),
         subsumes_locate_skills=("search_for_entity", "locate_entity"),
+        self_sufficient_physical_terminal=True,
     ),
     # FOUND LIVE 2026-08-31: "turn around and count everyone in the room" is one
     # reasonable request, but needing several separate simple_move turns to do it
