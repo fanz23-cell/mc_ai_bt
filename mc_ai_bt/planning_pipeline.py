@@ -371,6 +371,66 @@ def _action_alias_or_name(args: dict[str, Any]) -> str:
     return str(args.get("alias") or args.get("name") or "")
 
 
+def _inject_owned_reference_constraint(
+    plan: dict[str, Any], *, context_json: str, intent_text: str,
+) -> None:
+    """FOUND LIVE 2026-09-05 (E1 TURN1, sixth real attempt): with everything
+    else fixed the plan finally reached the robot, as a single clean action --
+    and was refused by the skill itself:
+
+        remember_person blocked/failed: remember_entity: 2 person candidates
+        currently active
+
+    Correctly refused: two people really were visible, and the plan carried no
+    way to say which. But the user HAD said which -- "离你最近的人", the nearest
+    one -- and reference_extraction.py had already turned that into a real
+    constraint sitting in context_json. The planner simply never referenced it,
+    so the one piece of disambiguating information the user actually gave was
+    dropped between extraction and execution.
+
+    It was described to the model only conditionally ("If one of its entries
+    genuinely fits", "only when 2+ same-class candidates could otherwise be
+    meant"), while every wrong path was described plainly -- and no prompt text
+    ever said that "nearest" is itself a qualifying spatial relation. Rather
+    than argue with the model again, this attaches the constraint the same way
+    _apply_grounding_normalizer already attaches an entity_id the model was
+    told to copy and did not: deterministically, from data the machine already
+    owns.
+
+    Safe precisely because it reuses the ownership test the guard below already
+    enforces in the other direction. The guard says a constraint may only be
+    USED for the alias its own sentence names; this says that when exactly one
+    extracted constraint names THIS action's alias, and it validates, it is the
+    one that belongs here. Nothing is guessed: a constraint with no bind_alias,
+    an alias with two competing constraints, or an action that already carries
+    a reference_constraint_id or relation is left untouched, and the guard then
+    has the final word either way."""
+    constraints = _trusted_reference_constraints(context_json)
+    if not constraints:
+        return
+    for action in _all_actions_in(plan.get("root")):
+        if str(action.get("skill") or "") not in _SELF_LOCATING_TERMINAL_SKILLS:
+            continue
+        args = action.get("args") if isinstance(action.get("args"), dict) else None
+        if not args:
+            continue
+        if str(args.get("reference_constraint_id") or "").strip():
+            continue
+        if str(args.get("relation") or "").strip():
+            continue  # the guard rejects this outright; never paper over it here
+        action_alias = _normalize_alias(_action_alias_or_name(args))
+        if not action_alias:
+            continue
+        owned = [
+            constraint_id
+            for constraint_id, constraint in constraints.items()
+            if _normalize_alias(str(constraint.get("bind_alias") or "").strip()) == action_alias
+            and not _validate_reference_constraint(constraint, intent_text=intent_text)[1]
+        ]
+        if len(owned) == 1:
+            args["reference_constraint_id"] = owned[0]
+
+
 def _apply_reference_constraint_guard(
     plan: dict[str, Any], *, context_json: str, intent_text: str,
 ) -> str | None:
@@ -864,6 +924,8 @@ class PlanningPipeline:
         _canonicalize_redundant_locate_prefix(plan, intent_text=mission.intent_text)
         _canonicalize_unsatisfiable_gate_before_terminal(plan)
 
+        _inject_owned_reference_constraint(
+            plan, context_json=context_json, intent_text=mission.intent_text)
         reference_error = _apply_reference_constraint_guard(
             plan, context_json=context_json, intent_text=mission.intent_text)
         if reference_error:

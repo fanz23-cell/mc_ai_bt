@@ -149,3 +149,53 @@ def test_a_gate_in_front_of_an_ordinary_skill_is_never_touched():
     before = json_like = str(plan)
     _canonicalize_unsatisfiable_gate_before_terminal(plan)
     assert str(plan) == before
+
+
+def test_the_owned_reference_constraint_is_attached_when_the_planner_omits_it():
+    # The live sixth-attempt plan: correct single action, but no
+    # reference_constraint_id, so "离你最近的人" was lost and the skill refused
+    # between two visible people.
+    import json as _json
+    from mc_ai_bt.planning_pipeline import _inject_owned_reference_constraint
+    from mc_ai_bt.reference_extraction import extract_reference_constraints
+
+    intent = "记住离你最近的人叫33"
+    context = _json.dumps({"reference_constraints": extract_reference_constraints(intent)})
+    plan = {"root": {"type": "Sequence", "children": [
+        {"type": "Action", "skill": "remember_person", "args": {"name": "33", "target": "person"}},
+    ]}}
+    _inject_owned_reference_constraint(plan, context_json=context, intent_text=intent)
+    args = plan["root"]["children"][0]["args"]
+    assert args.get("reference_constraint_id") == "ref_1"
+
+
+def test_nothing_is_attached_when_the_constraint_names_a_different_alias():
+    # Same ownership test the guard enforces, applied in the other direction:
+    # a constraint whose sentence names 33 must never be attached to an action
+    # binding 44.
+    import json as _json
+    from mc_ai_bt.planning_pipeline import _inject_owned_reference_constraint
+    from mc_ai_bt.reference_extraction import extract_reference_constraints
+
+    intent = "记住离你最近的人叫33"
+    context = _json.dumps({"reference_constraints": extract_reference_constraints(intent)})
+    plan = {"root": {"type": "Sequence", "children": [
+        {"type": "Action", "skill": "remember_person", "args": {"name": "44", "target": "person"}},
+    ]}}
+    _inject_owned_reference_constraint(plan, context_json=context, intent_text=intent)
+    assert "reference_constraint_id" not in plan["root"]["children"][0]["args"]
+
+
+def test_an_action_that_already_chose_a_constraint_is_left_alone():
+    import json as _json
+    from mc_ai_bt.planning_pipeline import _inject_owned_reference_constraint
+    from mc_ai_bt.reference_extraction import extract_reference_constraints
+
+    intent = "记住离你最近的人叫33"
+    context = _json.dumps({"reference_constraints": extract_reference_constraints(intent)})
+    plan = {"root": {"type": "Sequence", "children": [
+        {"type": "Action", "skill": "remember_person",
+         "args": {"name": "33", "target": "person", "reference_constraint_id": "ref_9"}},
+    ]}}
+    _inject_owned_reference_constraint(plan, context_json=context, intent_text=intent)
+    assert plan["root"]["children"][0]["args"]["reference_constraint_id"] == "ref_9"
