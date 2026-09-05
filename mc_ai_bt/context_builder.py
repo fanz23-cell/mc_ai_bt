@@ -15,6 +15,23 @@ SnapshotProvider = Callable[[tuple[str, ...], float], str]
 DEFAULT_SCOPES = ("navigation", "people", "objects", "robot", "tasks")
 
 
+
+def _reference_source_text(mission: Mission, caller_context: dict) -> str:
+    """The text reference constraints are extracted from, and the text their
+    source_span must be validated against.
+
+    The Bridge's machine-owned user_utterance when it carried one (see that
+    repo's RobotGatewayBridge._recent_user_utterance), otherwise the submitted
+    intent_text. Never both: a span quoted from one text cannot be checked
+    against the other, and mixing them would let a constraint quoted from the
+    user's words be validated against a rewrite that never contained them."""
+    if isinstance(caller_context, dict):
+        raw = caller_context.get("user_utterance")
+        if isinstance(raw, str) and raw.strip():
+            return raw
+    return mission.intent_text
+
+
 class ContextBuilder:
     """Build the bounded planner context passed to the BT planner."""
 
@@ -77,7 +94,23 @@ class ContextBuilder:
             # by constraint_id (remember_person/remember_entity's
             # `reference_constraint_id` arg); it must never invent one of
             # its own.
-            "reference_constraints": extract_reference_constraints(mission.intent_text),
+            # FOUND LIVE 2026-09-05 (E1 TURN2): extract from the USER's own
+            # words when the Bridge carried them, not from Omega's rewrite.
+            # Omega composes its own intent_text, and three consecutive runs of
+            # "去33那里。" arrived as three different sentences, each producing a
+            # differently-shaped plan. Where provenance matters -- which entity
+            # was meant, what name was given -- a paraphrase is not evidence of
+            # what the user said.
+            #
+            # reference_source_text records WHICH text these came from, because
+            # planning_pipeline's guard re-checks each source_span against it:
+            # a constraint quoted from the user's words must be validated
+            # against those words, not against Omega's rewrite of them.
+            # Falls back to intent_text whenever the Bridge offered nothing
+            # (Omega-initiated missions have no user utterance behind them).
+            "reference_constraints": extract_reference_constraints(
+                _reference_source_text(mission, caller_context)),
+            "reference_source_text": _reference_source_text(mission, caller_context),
             "skills": [
                 {
                     "name": spec.name,

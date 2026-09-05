@@ -296,6 +296,23 @@ def _redundant_locate_matches_terminal(action: dict[str, Any], terminal_target: 
 _VALID_RELATIONS = frozenset({"front", "left", "right", "nearest"})
 
 
+def _reference_source_text(context_json: str, fallback: str) -> str:
+    """The text reference constraints were extracted from -- context_builder
+    records it as reference_source_text so the span check below runs against
+    the SAME text, not against Omega's rewrite of it (see that module's own
+    comment). Falls back to the mission's intent_text for any context that
+    predates the field or omits it."""
+    try:
+        context = json.loads(context_json) if context_json else {}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return fallback
+    if isinstance(context, dict):
+        text = context.get("reference_source_text")
+        if isinstance(text, str) and text.strip():
+            return text
+    return fallback
+
+
 def _trusted_reference_constraints(context_json: str) -> dict[str, dict[str, Any]]:
     """context_json.reference_constraints, keyed by constraint_id --
     reference_extraction.py's own deterministic output, computed from
@@ -927,10 +944,11 @@ class PlanningPipeline:
         _canonicalize_redundant_locate_prefix(plan, intent_text=mission.intent_text)
         _canonicalize_gate_the_terminal_resolves_itself(plan)
 
+        reference_text = _reference_source_text(context_json, mission.intent_text)
         _inject_owned_reference_constraint(
-            plan, context_json=context_json, intent_text=mission.intent_text)
+            plan, context_json=context_json, intent_text=reference_text)
         reference_error = _apply_reference_constraint_guard(
-            plan, context_json=context_json, intent_text=mission.intent_text)
+            plan, context_json=context_json, intent_text=reference_text)
         if reference_error:
             return PlanningResult(
                 False,
