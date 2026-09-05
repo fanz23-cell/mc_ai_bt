@@ -18,9 +18,9 @@ These tests pin the part that lives in this repo.
 
 import json
 
-from mc_ai_bt.context_builder import _reference_source_text
+from mc_ai_bt.context_builder import effective_execution_intent
 from mc_ai_bt.mission import Mission
-from mc_ai_bt.planning_pipeline import _reference_source_text as _pipeline_source_text
+from mc_ai_bt.planning_pipeline import _effective_execution_intent as _pipeline_intent
 from mc_ai_bt.reference_extraction import extract_reference_constraints
 
 
@@ -32,7 +32,7 @@ class _M:
 def test_the_users_own_words_win_over_omegas_rewrite():
     caller = {"user_utterance": "记住离你最近的人叫33。"}
     mission = _M("Remember the person closest to you and label them as 33")
-    assert _reference_source_text(mission, caller) == "记住离你最近的人叫33。"
+    assert effective_execution_intent(mission, caller) == "记住离你最近的人叫33。"
 
 
 def test_the_submitted_text_is_used_when_the_bridge_carried_nothing():
@@ -41,7 +41,7 @@ def test_the_submitted_text_is_used_when_the_bridge_carried_nothing():
     # sends nothing rather than a stale one.
     mission = _M("go check the kitchen")
     for caller in ({}, {"user_utterance": ""}, {"user_utterance": "   "}, None):
-        assert _reference_source_text(mission, caller or {}) == "go check the kitchen"
+        assert effective_execution_intent(mission, caller or {}) == "go check the kitchen"
 
 
 def test_the_rewrite_loses_the_constraint_that_the_users_words_keep():
@@ -67,13 +67,90 @@ def test_the_pipeline_validates_spans_against_the_same_text_they_came_from():
     users_words = "记住离你最近的人叫33。"
     context = json.dumps({
         "reference_constraints": extract_reference_constraints(users_words),
-        "reference_source_text": users_words,
+        "effective_execution_intent": users_words,
     })
-    assert _pipeline_source_text(context, "an unrelated rewrite") == users_words
+    assert _pipeline_intent(context, "an unrelated rewrite") == users_words
 
 
 def test_the_pipeline_falls_back_for_context_without_the_field():
     # Older/absent context must keep working exactly as before.
-    assert _pipeline_source_text("{}", "去33那里") == "去33那里"
-    assert _pipeline_source_text("", "去33那里") == "去33那里"
-    assert _pipeline_source_text("not json at all", "去33那里") == "去33那里"
+    assert _pipeline_intent("{}", "去33那里") == "去33那里"
+    assert _pipeline_intent("", "去33那里") == "去33那里"
+    assert _pipeline_intent("not json at all", "去33那里") == "去33那里"
+
+
+# --- Authoritative Execution Intent (2026-09-05) ---------------------------
+# The live evidence: one six-character request reached the planner as four
+# different sentences across four runs, and the fourth added a physical goal
+# the user never asked for. These pin the contract that ends that.
+
+_USERS_WORDS = "去33那里。"
+
+_OMEGAS_FOUR_REWRITES = [
+    "去33那里",
+    "去离我最近、我之前记住的那个叫33的人那里",
+    "Navigate to the person named 33 and approach them",
+    "Go to the person known as 33 and stop when you are directly in front of them, facing them",
+]
+
+
+def test_every_omega_rewrite_of_one_request_yields_the_same_authoritative_intent():
+    """The whole point: whatever Omega does to the wording, the planner plans
+    against what the user actually said."""
+    caller = {"user_utterance": _USERS_WORDS}
+    resolved = {
+        effective_execution_intent(_M(rewrite), caller) for rewrite in _OMEGAS_FOUR_REWRITES
+    }
+    assert resolved == {_USERS_WORDS}, (
+        "four rewrites must collapse to one authoritative intent; "
+        f"got {resolved}")
+
+
+def test_the_fourth_rewrite_no_longer_reaches_the_planner():
+    # This is the one that added "stop when you are directly in front of them,
+    # facing them" and produced locate_entity + face_entity. The user asked for
+    # none of that.
+    expanded = _OMEGAS_FOUR_REWRITES[3]
+    intent = effective_execution_intent(_M(expanded), {"user_utterance": _USERS_WORDS})
+    assert intent == _USERS_WORDS
+    assert "facing them" not in intent
+    assert "in front of" not in intent
+
+
+def test_an_omega_originated_mission_keeps_omegas_own_intent():
+    # E2 will have these: a reminder coming due, a world event Omega acted on.
+    # There is no user turn behind them and Omega's text is the real goal.
+    omega_task = "go remind Alice about her medication"
+    assert effective_execution_intent(_M(omega_task), {}) == omega_task
+
+
+def test_an_unrelated_user_remark_is_never_bound_to_an_omega_mission():
+    """The Bridge only carries user_utterance while its own per-turn reply
+    stream is open, so an unrelated remark cannot arrive here at all. Pinned
+    from this side too: given no carried utterance, Omega's text wins, no
+    matter how recently the user happened to say something else."""
+    omega_task = "go check on Alice because a world event fired"
+    for caller in ({}, {"user_utterance": ""}):
+        assert effective_execution_intent(_M(omega_task), caller) == omega_task
+
+
+def test_the_audit_trail_keeps_both_texts():
+    import json as _json
+    from mc_ai_bt.context_builder import ContextBuilder
+    from mc_ai_bt.mission import Identity, Mission
+
+    mission = Mission(
+        identity=Identity(mission_id="m1"),
+        intent_text=_OMEGAS_FOUR_REWRITES[3],
+        source="omegaclaw",
+        operator_id="omegaclaw",
+        priority=10,
+        allow_queue=True,
+        context_json=_json.dumps({"user_utterance": _USERS_WORDS}),
+    )
+    context = _json.loads(ContextBuilder().build_json(mission, ()))
+    assert context["effective_execution_intent"] == _USERS_WORDS
+    assert context["omega_submitted_intent"] == _OMEGAS_FOUR_REWRITES[3]
+    assert context["effective_intent_source"] == "user"
+    # what Omega submitted must remain visible, never overwritten
+    assert context["mission"]["intent_text"] == _OMEGAS_FOUR_REWRITES[3]

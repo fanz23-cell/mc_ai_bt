@@ -296,18 +296,24 @@ def _redundant_locate_matches_terminal(action: dict[str, Any], terminal_target: 
 _VALID_RELATIONS = frozenset({"front", "left", "right", "nearest"})
 
 
-def _reference_source_text(context_json: str, fallback: str) -> str:
-    """The text reference constraints were extracted from -- context_builder
-    records it as reference_source_text so the span check below runs against
-    the SAME text, not against Omega's rewrite of it (see that module's own
-    comment). Falls back to the mission's intent_text for any context that
-    predates the field or omits it."""
+def _effective_execution_intent(context_json: str, fallback: str) -> str:
+    """The one text this pipeline plans against, decided by context_builder
+    (see effective_execution_intent there for why authority over a physical
+    instruction belongs to whoever actually gave it).
+
+    Every consumer below whose behaviour changes the plan reads this: the
+    planner itself, the intent-sensitive canonicalizer, reference extraction
+    and its span validation. They must agree. Before this they did not --
+    reference logic read the user's words while the planner read Omega's
+    rewrite, so the same request produced four differently-shaped plans on four
+    runs. Falls back to the submitted intent_text for any context that predates
+    the field, so Omega-originated missions and older callers are unchanged."""
     try:
         context = json.loads(context_json) if context_json else {}
     except (TypeError, ValueError, json.JSONDecodeError):
         return fallback
     if isinstance(context, dict):
-        text = context.get("reference_source_text")
+        text = context.get("effective_execution_intent")
         if isinstance(text, str) and text.strip():
             return text
     return fallback
@@ -910,8 +916,13 @@ class PlanningPipeline:
         missions: tuple[Mission, ...],
     ) -> PlanningResult:
         context_json = self._context_builder.build_json(mission, missions)
+        # The single authoritative text for this mission -- see
+        # _effective_execution_intent. The planner gets it too: giving it
+        # Omega's rewrite while the deterministic layers read the user's words
+        # is what let one request produce four different plans.
+        execution_intent = _effective_execution_intent(context_json, mission.intent_text)
         try:
-            plan_json = self._planner.plan(mission.intent_text, context_json)
+            plan_json = self._planner.plan(execution_intent, context_json)
         except Exception as exc:  # noqa: BLE001
             return PlanningResult(
                 False,
@@ -941,14 +952,13 @@ class PlanningPipeline:
                 plan_json=plan_json,
             )
 
-        _canonicalize_redundant_locate_prefix(plan, intent_text=mission.intent_text)
+        _canonicalize_redundant_locate_prefix(plan, intent_text=execution_intent)
         _canonicalize_gate_the_terminal_resolves_itself(plan)
 
-        reference_text = _reference_source_text(context_json, mission.intent_text)
         _inject_owned_reference_constraint(
-            plan, context_json=context_json, intent_text=reference_text)
+            plan, context_json=context_json, intent_text=execution_intent)
         reference_error = _apply_reference_constraint_guard(
-            plan, context_json=context_json, intent_text=reference_text)
+            plan, context_json=context_json, intent_text=execution_intent)
         if reference_error:
             return PlanningResult(
                 False,
