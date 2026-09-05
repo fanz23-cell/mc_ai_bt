@@ -3,7 +3,10 @@ import json
 from mc_ai_bt.context_builder import ContextBuilder
 from mc_ai_bt.mission import MissionManager
 from mc_ai_bt.planner import BootstrapPlanner
-from mc_ai_bt.planning_pipeline import PlanningPipeline, _apply_reference_constraint_guard
+from mc_ai_bt.planning_pipeline import (
+    PlanningPipeline, _all_actions_in, _apply_reference_constraint_guard,
+    _append_missing_required_producers,
+)
 from mc_ai_bt.policy_guard import PolicyGuard
 from mc_ai_bt.validator import PlanValidator
 
@@ -989,3 +992,271 @@ def test_reference_constraint_guard_ignores_check_relations_own_unrelated_relati
     result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
 
     assert result.ok, result.message
+
+
+# --- CHANGE APPROVAL A (2026-09-05): append-all-missing-producer, zero -----
+# pruning. Root cause: a trusted, pre-planner reference_constraint can
+# already prove a mission requires a specific alias bound to a person, but
+# Stage-2 can omit any producer of it entirely -- no existing deterministic
+# layer required a plan to contain one. The fix only ever APPENDS a missing
+# producer; it never deletes, prunes, reorders, or rewrites any existing
+# Action. An earlier candidate that also pruned "redundant" same-target
+# actions was rejected on adversarial review: this registry has no
+# precondition/delete-effect model, so nothing here can formally prove an
+# existing action irrelevant, and that candidate was shown to silently
+# discard a real user request in exactly that case. These tests exist to
+# pin the ZERO-PRUNING safety property directly, not just its net effect
+# through the rest of the pipeline.
+#
+# B (multi-physical-action deterministic goal_spec composition) is a
+# separate, already-registered, orthogonal gap -- NOT GRANTED, not touched
+# here. A plan left with 2+ surviving physical actions and no structured
+# goal_spec still correctly fails at PolicyGuard, exactly as it did before
+# this change; that failure is expected and out of scope, not a regression.
+
+def _reference_constraint(
+    constraint_id: str, *, bind_alias: str, relation: str = "nearest",
+    entity_class: str = "person", source_span: str,
+) -> dict:
+    return {
+        "constraint_id": constraint_id, "entity_class": entity_class,
+        "relation": relation, "reference_frame": "robot", "source_span": source_span,
+        "bind_alias": bind_alias,
+    }
+
+
+def _skills_in(plan: dict) -> list[str]:
+    return [str(a.get("skill") or "") for a in _all_actions_in(plan.get("root"))]
+
+
+def test_append_missing_required_producers_is_a_no_op_when_a_producer_already_exists():
+    plan = {"root": {"type": "Sequence", "children": [
+        {"type": "Action", "skill": "remember_person", "args": {"name": "33", "target": "person"}},
+    ]}}
+    before = json.dumps(plan, sort_keys=True)
+    context_json = json.dumps({"reference_constraints": [_reference_constraint(
+        "ref_1", bind_alias="33", source_span="离你最近的人")]})
+
+    _append_missing_required_producers(
+        plan, context_json=context_json, intent_text="记住离你最近的人叫33")
+
+    assert json.dumps(plan, sort_keys=True) == before
+
+
+def test_append_missing_required_producers_appends_exactly_one_producer():
+    plan = {"root": {"type": "Sequence", "children": [
+        {"type": "Action", "skill": "search_for_entity", "args": {"target": "person"}},
+        {"type": "Action", "skill": "approach_entity", "args": {"target": "person"}},
+        {"type": "Action", "skill": "say", "args": {"text": "好的"}},
+    ]}}
+    context_json = json.dumps({"reference_constraints": [_reference_constraint(
+        "ref_1", bind_alias="33", source_span="离你最近的人")]})
+
+    _append_missing_required_producers(
+        plan, context_json=context_json, intent_text="记住离你最近的人叫33")
+
+    remember_actions = [a for a in _all_actions_in(plan["root"]) if a["skill"] == "remember_person"]
+    assert len(remember_actions) == 1
+    assert remember_actions[0]["args"]["name"] == "33"
+    assert remember_actions[0]["args"]["reference_constraint_id"] == "ref_1"
+    assert "relation" not in remember_actions[0]["args"], (
+        "relation must be left for the existing reference-constraint guard to fill in, "
+        "never set directly here"
+    )
+
+
+def test_append_missing_required_producers_appends_both_of_two_missing_aliases():
+    plan = {"root": {"type": "Sequence", "children": [
+        {"type": "Action", "skill": "say", "args": {"text": "好的"}},
+    ]}}
+    context_json = json.dumps({"reference_constraints": [
+        _reference_constraint("ref_left", bind_alias="23", relation="left", source_span="你左边的人"),
+        _reference_constraint("ref_right", bind_alias="44", relation="right", source_span="你右边的人"),
+    ]})
+
+    _append_missing_required_producers(
+        plan, context_json=context_json, intent_text="记住你左边的人叫23，你右边的人叫44")
+
+    names = sorted(
+        a["args"]["name"] for a in _all_actions_in(plan["root"]) if a["skill"] == "remember_person")
+    assert names == ["23", "44"], "both aliases must get their own producer, not just the first"
+
+
+def test_append_missing_required_producers_does_nothing_for_an_invalid_constraint():
+    # entity_class "chair" fails _validate_reference_constraint (the only
+    # class reference_extraction.py ever produces is "person") -- existing
+    # fail-closed behavior downstream is untouched, this stage does not
+    # invent a producer for a class it cannot uniquely resolve.
+    plan = {"root": {"type": "Sequence", "children": [
+        {"type": "Action", "skill": "search_for_entity", "args": {"target": "chair"}},
+    ]}}
+    before = json.dumps(plan, sort_keys=True)
+    context_json = json.dumps({"reference_constraints": [_reference_constraint(
+        "ref_1", bind_alias="99", entity_class="chair", source_span="离你最近的椅子")]})
+
+    _append_missing_required_producers(
+        plan, context_json=context_json, intent_text="记住离你最近的椅子叫99")
+
+    assert json.dumps(plan, sort_keys=True) == before
+
+
+def test_append_missing_required_producers_preserves_an_unrelated_gesture_exactly():
+    plan = {"root": {"type": "Sequence", "children": [
+        {"type": "Action", "skill": "play_animation", "args": {"animation": "wave"}},
+    ]}}
+    context_json = json.dumps({"reference_constraints": [_reference_constraint(
+        "ref_1", bind_alias="33", source_span="离你最近的人")]})
+
+    _append_missing_required_producers(
+        plan, context_json=context_json,
+        intent_text="记住离你最近的人叫33，然后跟他挥手")
+
+    skills = _skills_in(plan)
+    assert skills.count("play_animation") == 1
+    wave = next(a for a in _all_actions_in(plan["root"]) if a["skill"] == "play_animation")
+    assert wave["args"] == {"animation": "wave"}, "the gesture's own args must survive untouched"
+    assert "remember_person" in skills
+
+
+def test_append_missing_required_producers_preserves_a_same_target_physical_action():
+    # The rejected v3 candidate would have pruned this: an approach_entity
+    # whose own target happens to match the class the synthesized producer
+    # also targets. This stage never inspects `target` at all -- it cannot
+    # be tricked into deleting a same-target action because it has no
+    # deletion logic of any kind.
+    plan = {"root": {"type": "Sequence", "children": [
+        {"type": "Action", "skill": "approach_entity", "args": {"target": "person"}},
+    ]}}
+    context_json = json.dumps({"reference_constraints": [_reference_constraint(
+        "ref_1", bind_alias="33", source_span="离你最近的人")]})
+
+    _append_missing_required_producers(
+        plan, context_json=context_json, intent_text="记住离你最近的人叫33")
+
+    skills = _skills_in(plan)
+    assert skills.count("approach_entity") == 1
+    assert "remember_person" in skills
+
+
+def test_append_missing_required_producers_preserves_a_different_target_physical_action():
+    plan = {"root": {"type": "Sequence", "children": [
+        {"type": "Action", "skill": "approach_entity",
+         "args": {"target": "entity_id", "entity_id": "person_known_other"}},
+    ]}}
+    context_json = json.dumps({"reference_constraints": [_reference_constraint(
+        "ref_1", bind_alias="33", source_span="离你最近的人")]})
+
+    _append_missing_required_producers(
+        plan, context_json=context_json,
+        intent_text="去找那个人，然后把离你最近的人叫33")
+
+    approach_actions = [a for a in _all_actions_in(plan["root"]) if a["skill"] == "approach_entity"]
+    assert len(approach_actions) == 1
+    assert approach_actions[0]["args"] == {"target": "entity_id", "entity_id": "person_known_other"}
+
+
+def test_append_missing_required_producers_leaves_a_redundant_search_for_entity_for_later_stages():
+    # This new stage's own job is only to append; whether an existing
+    # search_for_entity is later cleaned up as redundant is
+    # _canonicalize_redundant_locate_prefix's pre-existing, unmodified
+    # responsibility (a separate stage, run after this one) -- not
+    # something this function does or needs to know about.
+    plan = {"root": {"type": "Sequence", "children": [
+        {"type": "Action", "skill": "search_for_entity", "args": {"target": "person"}},
+        {"type": "Action", "skill": "say", "args": {"text": "好的"}},
+    ]}}
+    context_json = json.dumps({"reference_constraints": [_reference_constraint(
+        "ref_1", bind_alias="33", source_span="离你最近的人")]})
+
+    _append_missing_required_producers(
+        plan, context_json=context_json, intent_text="记住离你最近的人叫33")
+
+    assert "search_for_entity" in _skills_in(plan)
+
+
+def test_append_missing_required_producers_does_nothing_without_a_bind_alias_constraint():
+    plan = {"root": {"type": "Sequence", "children": [
+        {"type": "Action", "skill": "go_to_place", "args": {"place": "kitchen"}},
+    ]}}
+    before = json.dumps(plan, sort_keys=True)
+
+    _append_missing_required_producers(
+        plan, context_json="{}", intent_text="go to the kitchen")
+
+    assert json.dumps(plan, sort_keys=True) == before
+
+
+def test_append_missing_required_producers_does_not_depend_on_intent_text_wording():
+    # Producer selection reads only the already-validated constraint dict
+    # (bind_alias, entity_class, constraint_id) -- never a literal keyword
+    # in intent_text ("记住"/"叫"/a specific alias). Two very differently
+    # worded sentences that both genuinely contain the same source_span
+    # must produce byte-identical synthesis.
+    context_json = json.dumps({"reference_constraints": [_reference_constraint(
+        "ref_1", bind_alias="33", source_span="离你最近的人")]})
+
+    plan_a = {"root": {"type": "Sequence", "children": [{"type": "Action", "skill": "say", "args": {}}]}}
+    plan_b = {"root": {"type": "Sequence", "children": [{"type": "Action", "skill": "say", "args": {}}]}}
+
+    _append_missing_required_producers(
+        plan_a, context_json=context_json, intent_text="记住离你最近的人叫33")
+    _append_missing_required_producers(
+        plan_b, context_json=context_json,
+        intent_text="麻烦你把离你最近的人记下来，他的名字是33")
+
+    assert json.dumps(plan_a, sort_keys=True) == json.dumps(plan_b, sort_keys=True)
+
+
+def test_planning_pipeline_end_to_end_synthesizes_the_missing_naming_terminal():
+    # The exact E1 root-cause scenario, through the REAL pipeline: Stage-2
+    # completely omits any alias-binding producer (a bare `say`, today's
+    # ALSO-latent false-success case: 0 physical actions, implicit
+    # goal_spec, previously accepted while binding nothing). The trusted
+    # reference_constraint (real extractor output, not hand-built) proves
+    # this mission requires binding alias "33" -- this change makes that
+    # requirement real: the plan now actually binds it and the mission can
+    # reach genuine, verifiable SUCCESS instead of a no-op false success.
+    mission, missions = _mission("记住离你最近的人叫33")
+    plan_json = json.dumps({
+        "schema": "mc_ai_bt.plan.v1",
+        "root": {"type": "Action", "skill": "say", "args": {"text": "好的"}},
+        "goal_spec": {"type": "human", "verification": {"mode": "implicit_conversation"}},
+    })
+
+    result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
+
+    assert result.ok, result.message
+    bt = json.loads(result.bt_json)
+    remember_actions = [a for a in bt["children"] if a["skill"] == "remember_person"]
+    assert len(remember_actions) == 1
+    assert remember_actions[0]["args"]["name"] == "33"
+    assert remember_actions[0]["args"]["relation"] == "nearest"
+    goal_spec = json.loads(result.goal_spec_json)
+    assert goal_spec["type"] == "structured"
+    assert goal_spec["predicate"] == "person_named"
+
+
+def test_planning_pipeline_end_to_end_is_unaffected_when_the_producer_is_already_planned():
+    mission, missions = _mission("记住离你最近的人叫33")
+    plan_json = json.dumps({
+        "schema": "mc_ai_bt.plan.v1",
+        "root": {"type": "Action", "skill": "remember_person",
+                  "args": {"name": "33", "target": "person"}},
+        "goal_spec": {"type": "human", "verification": {"mode": "implicit_conversation"}},
+    })
+
+    result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
+
+    assert result.ok, result.message
+    bt = json.loads(result.bt_json)
+    assert len([a for a in _all_actions_in(bt) if a["skill"] == "remember_person"]) == 1
+
+
+def test_planning_pipeline_end_to_end_ordinary_navigation_is_unaffected():
+    mission, missions = _mission()
+
+    result = _pipeline(BootstrapPlanner()).plan(mission, missions)
+
+    assert result.ok
+    assert json.loads(result.bt_json)["type"] == "Sequence"
+    assert json.loads(result.goal_spec_json)["predicate"] == "robot_at_place"

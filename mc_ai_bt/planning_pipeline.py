@@ -371,6 +371,123 @@ def _action_alias_or_name(args: dict[str, Any]) -> str:
     return str(args.get("alias") or args.get("name") or "")
 
 
+def _append_missing_required_producers(
+    plan: dict[str, Any], *, context_json: str, intent_text: str,
+) -> None:
+    """CHANGE APPROVAL A (2026-09-05, GPT-approved): a trusted, pre-planner
+    reference_constraint with a non-empty bind_alias already tells the
+    machine -- deterministically, before Stage-2 ever ran -- that this
+    mission requires a specific alias bound to a person. If the candidate
+    plan's own physical actions contain no producer of that binding at all
+    (Stage-2 can and does sometimes omit it entirely; see the E1 root-cause
+    audit trail), this appends one, built only from data the constraint
+    itself already carries: bind_alias, entity_class, and the constraint's
+    own id. This is the same "attach what the machine already owns,
+    deterministically, rather than argue with the model again" reasoning
+    _inject_owned_reference_constraint below already uses for a single
+    field -- generalized one level, from completing an existing action to
+    supplying a missing one.
+
+    ABSOLUTE SAFETY RULE, load-bearing: this function only ever APPENDS. It
+    never deletes, prunes, reorders, or rewrites any pre-existing Action --
+    not even ones that look like an obviously-redundant misfire (e.g. a
+    search_for_entity/approach_entity pair in front of no terminal at all).
+    An earlier candidate design also removed existing actions that shared
+    the missing producer's own `target` field, on the theory that they were
+    the model's wrong substitute for the same request; adversarial review
+    (see the closure audit) proved that theory unfalsifiable with this
+    registry's metadata -- SkillSpec has no precondition/delete-effect
+    model, only result_predicates (an add-list), so nothing here can
+    formally distinguish "the model's wrong guess" from "a second, genuine
+    request that happens to share a target class" -- and found concrete
+    cases where deleting silently discarded a real user request. That
+    design was rejected. This function does not attempt it: every
+    pre-existing Action, redundant-looking or not, survives untouched, and
+    it is left entirely to the pre-existing, unmodified downstream stages
+    (the canonicalizers below, PolicyGuard) to accept or reject the
+    resulting plan exactly as they would any planner-authored one.
+
+    Every still-missing, still-valid bind_alias gets its own appended
+    producer -- not just the first one a constraint dict happens to
+    iterate to. Stopping at the first match was found, in review, to
+    silently leave a second genuinely-distinct alias with no producer at
+    all while still reporting the mission as planned.
+
+    Producer selection is registry-derived, not invented. Today
+    reference_extraction.py's own extractor hardcodes entity_class to
+    "person" (its only literal value, see that module), and
+    _validate_reference_constraint below rejects any constraint whose
+    entity_class is not "person" -- so "person" is the only entity_class a
+    trusted constraint can ever carry. remember_person is the one skill in
+    DEFAULT_SKILLS whose own description names exactly that class ("Bind a
+    name to a person the robot can currently see..."). For any other
+    entity_class -- unreachable today, since the check above already
+    excludes it -- this function does nothing: remember_entity ALSO
+    declares subsumes_locate_skills and could plausibly apply, and nothing
+    in the registry disambiguates the two for a class neither extractor nor
+    validator can ever actually produce, so this deliberately does not
+    guess rather than invent a preference the registry does not state.
+
+    Mutates `plan` in place for the append case; a no-op otherwise. Runs
+    before every other stage below so the rest of the pipeline (redundant-
+    locate canonicalization, reference-constraint injection/guard,
+    grounding normalization, deterministic goal_spec fill, PolicyGuard)
+    treats an appended producer exactly as it would treat one the model
+    wrote itself."""
+    constraints = _trusted_reference_constraints(context_json)
+    if not constraints:
+        return
+
+    present_aliases: set[str] = set()
+    for action in _all_actions_in(plan.get("root")):
+        if str(action.get("skill") or "") not in _SELF_LOCATING_TERMINAL_SKILLS:
+            continue
+        args = action.get("args") if isinstance(action.get("args"), dict) else {}
+        alias = _normalize_alias(_action_alias_or_name(args))
+        if alias:
+            present_aliases.add(alias)
+
+    to_append: list[dict[str, Any]] = []
+    handled_aliases: set[str] = set()
+    for constraint_id, constraint in constraints.items():
+        bind_alias = str(constraint.get("bind_alias") or "").strip()
+        if not bind_alias:
+            continue
+        normalized_alias = _normalize_alias(bind_alias)
+        if normalized_alias in present_aliases or normalized_alias in handled_aliases:
+            continue
+        _, error = _validate_reference_constraint(constraint, intent_text=intent_text)
+        if error:
+            continue
+        entity_class = str(constraint.get("entity_class") or "").strip().lower()
+        if entity_class != "person":
+            continue  # no registry-unambiguous producer for this class; see docstring
+        handled_aliases.add(normalized_alias)
+        to_append.append({
+            "type": "Action",
+            "skill": "remember_person",
+            "args": {
+                "name": bind_alias,
+                "target": entity_class,
+                "reference_constraint_id": constraint_id,
+            },
+        })
+
+    if not to_append:
+        return
+    root = plan.get("root")
+    if not isinstance(root, dict):
+        return
+    if root.get("type") == "Sequence":
+        children = root.get("children")
+        if not isinstance(children, list):
+            children = []
+            root["children"] = children
+        children.extend(to_append)
+    else:
+        plan["root"] = {"type": "Sequence", "children": [root, *to_append]}
+
+
 def _inject_owned_reference_constraint(
     plan: dict[str, Any], *, context_json: str, intent_text: str,
 ) -> None:
@@ -923,6 +1040,9 @@ class PlanningPipeline:
                 context_json=context_json,
                 plan_json=plan_json,
             )
+
+        _append_missing_required_producers(
+            plan, context_json=context_json, intent_text=mission.intent_text)
 
         _canonicalize_redundant_locate_prefix(plan, intent_text=mission.intent_text)
         _canonicalize_gate_the_terminal_resolves_itself(plan)
