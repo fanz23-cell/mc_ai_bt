@@ -95,3 +95,18 @@ def test_self_sufficient_terminals_are_a_superset_of_nothing_unexpected():
     # rule tells the planner such skills are exactly what NOT to plan alongside.
     for name in ("approach_entity", "go_to_place", "come_to_me", "simple_move"):
         assert not DEFAULT_SKILLS[name].self_sufficient_physical_terminal
+
+
+def test_the_rule_also_forbids_a_precondition_gate_in_front_of_the_terminal():
+    # FOUND LIVE 2026-09-05, fourth attempt: with the physical-Action half of
+    # this rule in place the planner stopped adding approach_entity -- and put a
+    # Condition(entity_located) in front of remember_person instead. Nothing in
+    # that plan produces entity_located (remember_person produces person_named),
+    # so the gate could only ever be UNKNOWN and the mission stalled awaiting a
+    # decision. Same concept as the Action half: a self-sufficient terminal
+    # establishes its own preconditions, so nothing precedes it -- the rule has
+    # to say that about node types, not only about skills.
+    rule = _self_sufficient_terminal_rule()
+    assert "Condition or GoalCheck gate" in rule
+    assert "entity_located" in rule
+    assert "produced BY it, not required before it" in rule

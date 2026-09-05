@@ -55,12 +55,16 @@ def _self_sufficient_terminal_rule() -> str:
     return (
         f"{listed} each perform ALL the physical work their own goal needs, including "
         "locating the target themselves (turning to look if needed). When the plan's goal "
-        f"is one of them, that Action is the plan's ONLY physical Action: never put any "
-        "other physical skill in front of it for the same target -- not a look_at, not a "
-        "search_for_entity/locate_entity, and above all not a walk/navigate step such as "
-        "approach_entity or go_to_place. Binding a name to someone requires SEEING them, "
-        "never travelling to them. Keeping it a single physical Action is also what lets "
-        "the goal_spec be filled in unambiguously."
+        f"is one of them, NOTHING goes in front of it for the same target -- not another "
+        "physical Action (no look_at, no search_for_entity/locate_entity, and above all no "
+        "walk/navigate step such as approach_entity or go_to_place), and equally no "
+        "Condition or GoalCheck gate. A gate asking whether the target has been located "
+        "yet (entity_located, search_for_entity_completed, pose_available ...) can only "
+        "ever be UNKNOWN here, because nothing has run to establish it: the terminal does "
+        "its own locating, so the answer is produced BY it, not required before it. "
+        "Binding a name to someone requires SEEING them, never travelling to them. Keeping "
+        "it the plan's single step for that goal is also what lets the goal_spec be filled "
+        "in unambiguously."
     )
 
 
