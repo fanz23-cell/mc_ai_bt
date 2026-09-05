@@ -87,13 +87,14 @@ _PERSON_RELATION_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
 # planner from referencing the LEFT one for alias "44". _bind_alias_
 # immediately_after captures which alias/name a constraint's own sentence
 # assigns, WHEN it does so unambiguously -- planning_pipeline.py's guard
-# then requires an EXACT match between this and the alias/name the
-# referencing action actually uses, WHENEVER a bind_alias was captured at
-# all (see that guard's own comment on why this no longer depends on how
-# many constraints exist in the mission -- a v2 round's own singleton
-# bypass turned out to still let "Remember the person on your left as 33"
-# be answered with alias "44" through, since it was the ONLY constraint
-# extracted).
+# then requires a NON-EMPTY bind_alias that EXACTLY matches the alias/name
+# the referencing action actually uses. Both halves are unconditional: an
+# empty bind_alias is rejected outright, and a captured one must match --
+# neither check depends on how many constraints the mission produced (a v2
+# round conditioned the match on "2+ constraints exist" and a v3 round
+# still let an EMPTY bind_alias through when it was the only constraint;
+# both exemptions turned out to be real holes, so v4 removed them -- see
+# that guard's own comment).
 #
 # Two tiers of capture, both narrow and explicit:
 #
@@ -153,9 +154,13 @@ def extract_reference_constraints(intent_text: str) -> list[dict[str, Any]]:
     Each constraint's source_span is copied VERBATIM from the original (not
     lowercased) intent_text, exactly as matched -- a real quote, not a
     reconstruction. `bind_alias` (see _bind_alias_immediately_after above)
-    is "" when no immediately-adjacent naming marker was found -- legal,
-    and still fully usable when it is the ONLY constraint this call
-    produces."""
+    is "" when no unambiguous naming marker was found. An extracted
+    constraint is still a legal, real constraint in that case -- but
+    planning_pipeline.py's guard will REJECT any attempt to use it for
+    identity binding (remember_person/remember_entity), unconditionally,
+    including when it is the only constraint this call produced. Only a
+    non-empty bind_alias that exactly matches the referencing action's own
+    alias/name is usable for binding."""
     text = intent_text or ""
     constraints: list[dict[str, Any]] = []
     seen_spans: list[tuple[int, int]] = []

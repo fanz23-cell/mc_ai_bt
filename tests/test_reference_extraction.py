@@ -152,11 +152,13 @@ def test_bind_alias_captures_the_original_e1_cross_sentence_phrasing():
 
 def test_bind_alias_is_empty_with_no_naming_continuation_at_all():
     # No "as"/"叫" marker anywhere nearby, same-clause or next-sentence --
-    # genuinely no deterministic way to know who this is for. Still legal
-    # and still usable AS THE SOLE constraint (planning_pipeline.py's
-    # guard only requires a match when bind_alias is non-empty, or when
-    # 2+ constraints exist) -- just not verifiable against a SPECIFIC
-    # alias/name the way the "as"/cross-sentence cases now are.
+    # genuinely no deterministic way to know who this is for. The
+    # constraint itself is still real and legal (relation/frame/class are
+    # all verified), but as of v4 planning_pipeline.py's guard REJECTS any
+    # identity-binding use of it unconditionally -- including when it is
+    # the only constraint in the mission. See that guard's own test,
+    # test_reference_constraint_guard_rejects_a_single_constraint_with_no_
+    # captured_bind_alias, which pins exactly this sentence's behavior.
     result = extract_reference_constraints("There is a person right in front of you. They seem friendly.")
     assert result[0]["bind_alias"] == ""
 
