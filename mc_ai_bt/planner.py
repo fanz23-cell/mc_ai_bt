@@ -34,6 +34,36 @@ def _predicate_names_with_producing_skill() -> str:
     return ", ".join(parts)
 
 
+def _execution_only_predicate_rule() -> str:
+    """FOUND LIVE 2026-09-05 (E1 TURN2): the planner gated an approach on
+    Condition(person_named) -- asking whether alias 33 was bound. That IS
+    durable truth sitting in entity_aliases, but person_named cannot see it:
+    it is answerable only from the execution facts of the mission that just did
+    the naming. The mission stalled on "condition UNKNOWN: no verification
+    evidence for person_named" with the answer available the whole time.
+
+    The registry invited that mistake -- person_named declared
+    scopes=("people","people_names"), which reads as world-state checkable, and
+    18 predicates were declared that way without any evaluator behind them.
+    They now say so (PredicateSpec.execution_only) and this sentence is derived
+    from that, so the two cannot drift apart."""
+    names = sorted(
+        name for name, spec in PREDICATE_REGISTRY.items() if spec.execution_only
+    )
+    if not names:  # pragma: no cover -- defensive
+        return ""
+    return (
+        "These predicates report only what an action in THIS plan just did, and are "
+        f"answerable only from that action's own result: {', '.join(names)}. Use one "
+        "solely as a check AFTER the Action that produces it. Never put one in a "
+        "Condition/GoalCheck before that Action, and never use one to ask about "
+        "something an earlier mission established -- it cannot see durable world "
+        "state, so it will always come back UNKNOWN and stall the mission. To ask "
+        "whether a name is already bound to someone, the predicate that can actually "
+        "read that is entity_alias_bound."
+    )
+
+
 def _target_acquisition_rule() -> str:
     """FOUND LIVE 2026-09-05: rendered from the registry rather than hand-typed,
     because the sentence this replaced named exactly two skills (look_at,
@@ -670,6 +700,9 @@ def build_planner_messages(
                 # target first internally (turning to look if needed) -- exactly the
                 # same work search_for_entity/look_at would separately do.
                 _target_acquisition_rule()
+            ),
+            (
+                _execution_only_predicate_rule()
             ),
             (
                 "Never write a say node whose text states the outcome of a Condition/GoalCheck/"

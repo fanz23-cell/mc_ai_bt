@@ -44,6 +44,26 @@ class PredicateSpec:
     name: str
     scopes: tuple[str, ...]
     snapshot_scope: str = "robot"
+    # FOUND LIVE 2026-09-05 (E1 TURN2): this predicate can ONLY be answered from
+    # the execution facts of the mission that just produced it -- _check_snapshot
+    # below has no branch for it, so a world-state fallback always returns
+    # UNKNOWN no matter what the scopes above say.
+    #
+    # Those scopes were the problem. Every predicate here declares scopes and a
+    # snapshot_scope, which reads as "this is checkable against world state",
+    # and for 18 of them that was simply untrue. A planner took the declaration
+    # at face value and gated a TURN2 approach on Condition(person_named) --
+    # asking whether alias 33 was bound, which IS durable truth, but through a
+    # predicate that cannot see it. The mission stalled on "condition UNKNOWN:
+    # no verification evidence for person_named" with the answer sitting in
+    # entity_aliases the whole time. entity_alias_bound is the predicate that
+    # can actually read it.
+    #
+    # Marking them makes the registry honest and lets planner.py render the
+    # rule from data instead of a hand-written list. Runtime behaviour is
+    # deliberately unchanged: the snapshot fetch still happens, it just could
+    # never have helped.
+    execution_only: bool = False
 
 
 PREDICATE_REGISTRY: dict[str, PredicateSpec] = {
@@ -61,17 +81,17 @@ PREDICATE_REGISTRY: dict[str, PredicateSpec] = {
     "object_at_place": PredicateSpec("object_at_place", ("objects", "places", "place_regions"), "objects"),
     "entity_following": PredicateSpec("entity_following", ("entities", "people", "objects"), "entities"),
     "person_following": PredicateSpec("person_following", ("people",), "people"),
-    "entity_at_place": PredicateSpec("entity_at_place", ("entities", "people", "places", "place_regions"), "entities"),
-    "reach_completed": PredicateSpec("reach_completed", ("robot", "objects", "people", "interactions"), "robot"),
-    "contact_detected": PredicateSpec("contact_detected", ("robot", "objects", "people", "interactions"), "robot"),
-    "target_state_changed": PredicateSpec("target_state_changed", ("robot", "objects", "interactions"), "robot"),
-    "axis_aligned": PredicateSpec("axis_aligned", ("robot", "objects", "interactions"), "robot"),
-    "axis_motion_completed": PredicateSpec("axis_motion_completed", ("robot", "objects", "interactions"), "robot"),
-    "distance_maintained": PredicateSpec("distance_maintained", ("robot", "entities", "people", "objects"), "robot"),
-    "pose_held": PredicateSpec("pose_held", ("robot", "objects", "people", "interactions"), "robot"),
-    "oscillation_completed": PredicateSpec("oscillation_completed", ("robot", "objects", "people", "interactions"), "robot"),
-    "retracted": PredicateSpec("retracted", ("robot",), "robot"),
-    "human_confirmation": PredicateSpec("human_confirmation", ("tasks",), "tasks"),
+    "entity_at_place": PredicateSpec("entity_at_place", ("entities", "people", "places", "place_regions"), "entities", execution_only=True),
+    "reach_completed": PredicateSpec("reach_completed", ("robot", "objects", "people", "interactions"), "robot", execution_only=True),
+    "contact_detected": PredicateSpec("contact_detected", ("robot", "objects", "people", "interactions"), "robot", execution_only=True),
+    "target_state_changed": PredicateSpec("target_state_changed", ("robot", "objects", "interactions"), "robot", execution_only=True),
+    "axis_aligned": PredicateSpec("axis_aligned", ("robot", "objects", "interactions"), "robot", execution_only=True),
+    "axis_motion_completed": PredicateSpec("axis_motion_completed", ("robot", "objects", "interactions"), "robot", execution_only=True),
+    "distance_maintained": PredicateSpec("distance_maintained", ("robot", "entities", "people", "objects"), "robot", execution_only=True),
+    "pose_held": PredicateSpec("pose_held", ("robot", "objects", "people", "interactions"), "robot", execution_only=True),
+    "oscillation_completed": PredicateSpec("oscillation_completed", ("robot", "objects", "people", "interactions"), "robot", execution_only=True),
+    "retracted": PredicateSpec("retracted", ("robot",), "robot", execution_only=True),
+    "human_confirmation": PredicateSpec("human_confirmation", ("tasks",), "tasks", execution_only=True),
     # locate_entity/get_pose/search_for_entity/check_relation (mc_embodied_skills,
     # RosActionSkillProvider) populate these via the generic PREDICATE_REGISTRY path
     # below -- their evidence already carries a "matched" bool, exactly the shape
@@ -80,30 +100,30 @@ PREDICATE_REGISTRY: dict[str, PredicateSpec] = {
     # fact under these names, so the world-state snapshot fallback always reports
     # UNKNOWN for them; execution facts (the action that just ran) are the only real
     # source, same as animation_played/robot_at_place above.
-    "entity_located": PredicateSpec("entity_located", ("objects", "people", "entities"), "objects"),
-    "pose_available": PredicateSpec("pose_available", ("objects", "people", "entities"), "objects"),
-    "relation_checked": PredicateSpec("relation_checked", ("objects", "people", "entities"), "objects"),
+    "entity_located": PredicateSpec("entity_located", ("objects", "people", "entities"), "objects", execution_only=True),
+    "pose_available": PredicateSpec("pose_available", ("objects", "people", "entities"), "objects", execution_only=True),
+    "relation_checked": PredicateSpec("relation_checked", ("objects", "people", "entities"), "objects", execution_only=True),
     "search_for_entity_completed": PredicateSpec(
-        "search_for_entity_completed", ("objects", "people", "entities"), "objects"),
+        "search_for_entity_completed", ("objects", "people", "entities"), "objects", execution_only=True),
     # approach_entity (mc_embodied_skills) -- navigates to a located entity's live
     # position via nav2's raw NavigateToPose, not a preconfigured place (go_to_place).
-    "entity_approached": PredicateSpec("entity_approached", ("objects", "people", "entities"), "objects"),
+    "entity_approached": PredicateSpec("entity_approached", ("objects", "people", "entities"), "objects", execution_only=True),
     # wait_for_participant (mc_embodied_skills) -- polls mc_world_state's "people"
     # scope directly until a matching SemanticPerson fact appears; evidence already
     # carries "matched", same generic path as entity_located et al. above.
-    "participant_ready": PredicateSpec("participant_ready", ("people",), "people"),
+    "participant_ready": PredicateSpec("participant_ready", ("people",), "people", execution_only=True),
     # face_entity (mc_embodied_skills) -- rotates in place via SimpleMove/Spin; v1
     # deliberately has no hard semantic re-verification (no "is the robot actually
     # facing X" world-state fact exists yet, same caveat reach_to's own evidence
     # lives with for some of its fields), so semantic_verified is always False in
     # its evidence -- but "matched" still reflects whether the Spin action itself
     # reported success, which is what this generic path reads.
-    "entity_faced": PredicateSpec("entity_faced", ("robot", "objects", "people", "entities"), "robot"),
+    "entity_faced": PredicateSpec("entity_faced", ("robot", "objects", "people", "entities"), "robot", execution_only=True),
     # remember_person (mc_embodied_skills) -- only ever produces evidence after actually
     # locating the person (same _locate_with_scan real-evidence contract search_for_entity/
     # locate_entity use); "matched" reflects whether a person was genuinely found and the
     # name bound to it, same generic path as entity_located et al. above.
-    "person_named": PredicateSpec("person_named", ("people", "people_names"), "people_names"),
+    "person_named": PredicateSpec("person_named", ("people", "people_names"), "people_names", execution_only=True),
     # scan_room (mc_embodied_skills) -- a bounded turn-and-count sweep; "matched"
     # reflects whether the sweep could query world state at all, same generic path
     # as entity_located et al. above. observed_track_count/frames_checked (renamed
@@ -112,7 +132,7 @@ PREDICATE_REGISTRY: dict[str, PredicateSpec] = {
     # lower bound) are the skill's own evidence fields, read directly by whoever
     # consumes the goal_spec args (e.g. query_world.py), not by this generic
     # predicate check itself.
-    "room_scanned": PredicateSpec("room_scanned", ("people",), "people"),
+    "room_scanned": PredicateSpec("room_scanned", ("people",), "people", execution_only=True),
     # remember_entity (mc_embodied_skills, C.2) -- bespoke handler below (not the
     # generic PREDICATE_REGISTRY path): the evidence/world-state shape is
     # {alias, entity_id, entity_class, created_by}, with no "matched"/"state"/

@@ -246,3 +246,51 @@ def test_the_rule_no_longer_claims_the_mission_may_hold_nothing_else():
     rule = _target_acquisition_rule()
     assert "rest of the mission" in rule
     assert "if the user genuinely asked for another action too, plan it" in rule
+
+
+# --- execution-only predicate contract (2026-09-05, E1 TURN2) --------------
+
+def test_execution_only_declaration_matches_what_check_snapshot_can_actually_do():
+    """The registry must not claim world-state checkability it does not have.
+
+    This is the drift guard for the defect itself: person_named declared
+    scopes=("people","people_names"), which reads as snapshot-checkable, while
+    _check_snapshot had no branch for it -- so a planner gated TURN2 on it and
+    the mission stalled with the answer sitting in entity_aliases. Reading the
+    evaluator's own source keeps the declaration honest in BOTH directions:
+    add a branch without clearing the flag, or set the flag on something that
+    really is checkable, and this fails.
+    """
+    import inspect
+    import re
+    from mc_ai_bt.goal_check import PREDICATE_REGISTRY, GoalChecker
+
+    source = inspect.getsource(GoalChecker._check_snapshot)
+    has_evaluator = set(re.findall(r'predicate == "([a-z_]+)"', source))
+    # a couple of branches are shared by two predicates via a scope_name switch
+    for pair in (("person_at_place", "object_at_place"), ("entity_following", "person_following")):
+        if pair[0] in has_evaluator:
+            has_evaluator.add(pair[1])
+
+    for name, spec in PREDICATE_REGISTRY.items():
+        if name in has_evaluator:
+            assert not spec.execution_only, (
+                f"{name} has a real _check_snapshot branch but is marked execution_only")
+        else:
+            assert spec.execution_only, (
+                f"{name} has no _check_snapshot branch, so its scopes claim a world-state "
+                "check that can never happen -- mark it execution_only")
+
+
+def test_the_predicate_that_can_actually_read_a_binding_is_not_execution_only():
+    from mc_ai_bt.goal_check import PREDICATE_REGISTRY
+    assert not PREDICATE_REGISTRY["entity_alias_bound"].execution_only
+    assert PREDICATE_REGISTRY["person_named"].execution_only
+
+
+def test_the_execution_only_rule_reaches_the_prompt_and_names_the_alternative():
+    from mc_ai_bt.planner import _execution_only_predicate_rule
+    rule = _execution_only_predicate_rule()
+    assert "person_named" in rule
+    assert "entity_alias_bound" in rule
+    assert rule in _prompt_text()
