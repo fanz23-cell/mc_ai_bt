@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, replace
+from typing import Any
 
 from .identity import Identity
 
@@ -56,6 +58,131 @@ class MissionEvent:
     mission: Mission
     message: str = ""
     payload_json: str = ""
+
+
+# P0.1 (2026-09-06, GPT-approved CHANGE APPROVAL -- Grounded Cognitive
+# Substrate / mission-outcome-to-Omega seam): a machine-owned, versioned
+# summary of a mission's terminal outcome, built ONLY from data this
+# mission already carries (context_json/goal_spec_json/bt_json, all
+# frozen-dataclass fields untouched by mark_terminal's own `replace()`),
+# never from a fresh terminal-time query -- see this function's own
+# semantic_entity_ids extraction for why mission-time data is the
+# correct, temporally-safe source (a terminal-time WorldState reverse
+# lookup could resolve to a DIFFERENT decision than the one this mission
+# actually acted on). Carried in the existing, free-form
+# MissionEvent.payload_json field -- no new wire schema, no new message
+# type. Bridge (mc_voice_pipeline_legacy) is the only other layer that
+# touches this, and only to mechanically re-encode it as a text trailer;
+# it must never be asked to reconstruct any of these fields itself.
+MISSION_OUTCOME_SCHEMA = "mc.mission_outcome.v1"
+
+_TERMINAL_STATE_NAMES = {
+    STATE_SUCCEEDED: "SUCCEEDED",
+    STATE_FAILED: "FAILED",
+    STATE_BLOCKED: "BLOCKED",
+    STATE_CANCELED: "CANCELED",
+}
+
+
+def _mission_semantic_entity_ids(mission: "Mission") -> tuple[str, ...]:
+    """The semantic_entity_id(s) this mission's own STRUCTURED goal
+    actually targets -- found by joining goal_spec_json.args.entity_id
+    (the live id this mission's own planning resolved) against this
+    SAME mission's own context_json.caller_context.grounded_entities
+    (the identical JSON shape ContextBuilder/Bridge already produce --
+    no new parsing rules invented here, just a plain dict lookup by
+    entity_id, no alias-string matching/normalization needed).
+
+    Deliberately, honestly returns () -- not a guess -- when nothing
+    matches: a freshly-minted naming target (B-v1 TURN1-shaped mission)
+    has no pre-existing grounded_entities entry at PLANNING time, because
+    WorldState only mints that semantic_entity_id during EXECUTION, after
+    this mission's context_json was already fixed. That is not a defect
+    in this function; it is the honest limit of what mission-time data
+    can know, and this round is explicitly scoped to not touch execution/
+    GoalCheck to plumb a post-hoc value back in.
+    """
+    try:
+        goal_spec = json.loads(mission.goal_spec_json) if mission.goal_spec_json else {}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return ()
+    args = goal_spec.get("args") if isinstance(goal_spec, dict) else None
+    entity_id = str(args.get("entity_id") or "").strip() if isinstance(args, dict) else ""
+    if not entity_id:
+        return ()
+    try:
+        context = json.loads(mission.context_json) if mission.context_json else {}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return ()
+    caller_context = context.get("caller_context") if isinstance(context, dict) else None
+    grounded = caller_context.get("grounded_entities") if isinstance(caller_context, dict) else None
+    if not isinstance(grounded, list):
+        return ()
+    for entry in grounded:
+        if isinstance(entry, dict) and str(entry.get("entity_id") or "") == entity_id:
+            semantic_id = str(entry.get("semantic_entity_id") or "").strip()
+            if semantic_id:
+                return (semantic_id,)
+    return ()
+
+
+def _mission_grounding_refs(mission: "Mission") -> tuple[str, ...]:
+    """The planning-time grounding_ref this mission's synthesized Action
+    carries, if any -- reads the SAME key name planning_pipeline.py's
+    _INTERNAL_GROUNDING_FIELD writes ("_planning_grounding_ref"),
+    duplicated here as a literal rather than imported to avoid a new
+    mission.py -> planning_pipeline.py dependency (planning_pipeline.py
+    already imports Mission from this module; importing back would be
+    circular). Proves reference-resolution provenance for the ONE
+    B-v1 explicit-entity_id naming path that mints it -- it does NOT
+    prove the mission succeeded (see MISSION_OUTCOME_SCHEMA's own
+    "grounding_refs, not evidence_refs" naming). Every other path
+    (alias_reference targets, legacy/LLM-planned missions, anything
+    the mission_goal_contract trust boundary already strips) has none,
+    correctly returns () rather than inventing one.
+    """
+    try:
+        root = json.loads(mission.bt_json) if mission.bt_json else {}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return ()
+    args = root.get("args") if isinstance(root, dict) else None
+    ref = str(args.get("_planning_grounding_ref") or "").strip() if isinstance(args, dict) else ""
+    return (ref,) if ref else ()
+
+
+def _build_mission_outcome_envelope(mission: "Mission") -> str:
+    """Returns a compact-JSON MISSION_OUTCOME_SCHEMA envelope for this
+    mission's CURRENT (already-terminal) state, or "" if mission.state
+    is not one of the states this schema covers (see
+    _TERMINAL_STATE_NAMES). Never raises -- envelope construction must
+    never be allowed to block a terminal event from being published, so
+    every field here is best-effort and independently fail-safe; the
+    caller does not need its own try/except."""
+    terminal_state = _TERMINAL_STATE_NAMES.get(mission.state)
+    if terminal_state is None:
+        return ""
+    try:
+        envelope: dict[str, Any] = {
+            "schema": MISSION_OUTCOME_SCHEMA,
+            "mission_id": mission.identity.mission_id,
+            "terminal_state": terminal_state,
+        }
+        if mission.identity.execution_id:
+            envelope["execution_id"] = mission.identity.execution_id
+        try:
+            goal_spec = json.loads(mission.goal_spec_json) if mission.goal_spec_json else {}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            goal_spec = {}
+        predicate = goal_spec.get("predicate") if isinstance(goal_spec, dict) else None
+        if isinstance(predicate, str) and predicate:
+            envelope["goal_predicate"] = predicate
+        envelope["semantic_entity_ids"] = list(_mission_semantic_entity_ids(mission))
+        envelope["grounding_refs"] = list(_mission_grounding_refs(mission))
+        if mission.error_code:
+            envelope["error_code"] = mission.error_code
+        return json.dumps(envelope, sort_keys=True, separators=(",", ":"))
+    except Exception:  # noqa: BLE001 -- see docstring: must never block the terminal event itself
+        return ""
 
 
 class MissionManager:
@@ -360,7 +487,10 @@ class MissionManager:
         if self._active_id == mission_id:
             self._promote_next_queued()
         self._resumed_from_reason.pop(mission_id, None)
-        return MissionEvent(EVENT_CANCELED, canceled, canceled.status_text)
+        return MissionEvent(
+            EVENT_CANCELED, canceled, canceled.status_text,
+            payload_json=_build_mission_outcome_envelope(canceled),
+        )
 
     def mark_terminal(
         self,
@@ -389,7 +519,10 @@ class MissionManager:
             STATE_FAILED: EVENT_FAILED,
             STATE_BLOCKED: EVENT_BLOCKED,
         }[state]
-        return MissionEvent(event, done, message)
+        return MissionEvent(
+            event, done, message,
+            payload_json=_build_mission_outcome_envelope(done),
+        )
 
     def accepts_async_result(self, identity: Identity) -> bool:
         mission = self._missions.get(identity.mission_id)

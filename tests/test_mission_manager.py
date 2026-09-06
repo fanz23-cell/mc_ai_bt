@@ -1,16 +1,25 @@
+import json
+
 from mc_ai_bt.identity import Identity
 from mc_ai_bt.mission import (
     EVENT_BLOCKED,
+    EVENT_CANCELED,
+    EVENT_FAILED,
     EVENT_PAUSED,
     EVENT_PREEMPTED,
+    EVENT_SUCCEEDED,
+    MISSION_OUTCOME_SCHEMA,
+    Mission,
     MissionManager,
     STATE_BLOCKED,
     STATE_CANCELED,
+    STATE_FAILED,
     STATE_PAUSED,
     STATE_QUEUED,
     STATE_PLANNING,
     STATE_RUNNING,
     STATE_SUCCEEDED,
+    _build_mission_outcome_envelope,
 )
 
 
@@ -619,3 +628,203 @@ def test_resume_requeues_instead_of_stealing_an_occupied_slot():
         "once the slot frees up, the re-queued (resumed) mission takes its turn "
         "like any other queued mission"
     )
+
+
+# --- P0.1 (2026-09-06, GPT-approved): MissionOutcomeEnvelope construction ---
+# in MissionEvent.payload_json for terminal events. See mission.py's own
+# _build_mission_outcome_envelope/_mission_semantic_entity_ids/
+# _mission_grounding_refs docstrings for the design rationale (mission-time
+# data only, never a terminal-time re-query; honest [] when nothing matches;
+# must never block the terminal event itself even on malformed legacy data).
+
+def _mission(
+    *, state, goal_spec_json="", bt_json="", context_json="", error_code="",
+    execution_id="exec1",
+) -> Mission:
+    identity = Identity(mission_id="m1", execution_id=execution_id)
+    return Mission(
+        identity=identity, intent_text="test", source="voice", operator_id="user",
+        priority=10, allow_queue=True, context_json=context_json, state=state,
+        goal_spec_json=goal_spec_json, bt_json=bt_json, error_code=error_code,
+    )
+
+
+def _grounded_entities_context(entries: list[dict]) -> str:
+    return json.dumps({"caller_context": {"grounded_entities": entries}})
+
+
+def test_envelope_includes_semantic_entity_id_when_goal_targets_a_grounded_entity():
+    context_json = _grounded_entities_context([
+        {"alias": "66", "entity_id": "person_x1", "semantic_entity_id": "person_sem_1"},
+    ])
+    goal_spec_json = json.dumps({"predicate": "entity_approached", "args": {"entity_id": "person_x1"}})
+    mission = _mission(
+        state=STATE_SUCCEEDED, goal_spec_json=goal_spec_json, context_json=context_json)
+
+    envelope = json.loads(_build_mission_outcome_envelope(mission))
+
+    assert envelope["schema"] == MISSION_OUTCOME_SCHEMA
+    assert envelope["mission_id"] == "m1"
+    assert envelope["execution_id"] == "exec1"
+    assert envelope["terminal_state"] == "SUCCEEDED"
+    assert envelope["goal_predicate"] == "entity_approached"
+    assert envelope["semantic_entity_ids"] == ["person_sem_1"]
+    assert envelope["grounding_refs"] == []
+    assert "error_code" not in envelope
+
+
+def test_envelope_semantic_entity_ids_empty_when_no_grounded_entity_matches():
+    # Freshly-minted naming target (B-v1 TURN1 shape): goal_spec references
+    # an entity_id that WorldState only bound to a semantic_entity_id DURING
+    # execution -- this mission's own (planning-time) context_json has no
+    # entry for it yet. Honest [], not a guess, not an error.
+    goal_spec_json = json.dumps({"predicate": "person_named", "args": {"entity_id": "person_x1", "name": "66"}})
+    mission = _mission(
+        state=STATE_SUCCEEDED, goal_spec_json=goal_spec_json,
+        context_json=_grounded_entities_context([]))
+
+    envelope = json.loads(_build_mission_outcome_envelope(mission))
+
+    assert envelope["semantic_entity_ids"] == []
+
+
+def test_envelope_omits_goal_predicate_and_subjects_for_implicit_human_goal_spec():
+    goal_spec_json = json.dumps({"type": "human", "verification": {"mode": "implicit_conversation"}})
+    mission = _mission(state=STATE_SUCCEEDED, goal_spec_json=goal_spec_json)
+
+    envelope = json.loads(_build_mission_outcome_envelope(mission))
+
+    assert "goal_predicate" not in envelope
+    assert envelope["semantic_entity_ids"] == []
+
+
+def test_envelope_includes_grounding_ref_when_bt_json_carries_one():
+    bt_json = json.dumps({
+        "type": "Action", "skill": "remember_person",
+        "args": {"entity_id": "person_x1", "name": "66", "_planning_grounding_ref": "gnd_abc123"},
+    })
+    mission = _mission(state=STATE_SUCCEEDED, bt_json=bt_json)
+
+    envelope = json.loads(_build_mission_outcome_envelope(mission))
+
+    assert envelope["grounding_refs"] == ["gnd_abc123"]
+
+
+def test_envelope_grounding_refs_empty_for_legacy_plan_without_the_field():
+    bt_json = json.dumps({"type": "Action", "skill": "go_to_place", "args": {"name": "kitchen"}})
+    mission = _mission(state=STATE_SUCCEEDED, bt_json=bt_json)
+
+    envelope = json.loads(_build_mission_outcome_envelope(mission))
+
+    assert envelope["grounding_refs"] == []
+
+
+def test_envelope_includes_error_code_only_when_present():
+    with_code = _mission(state=STATE_FAILED, error_code="NAV_TIMEOUT")
+    without_code = _mission(state=STATE_FAILED)
+
+    assert json.loads(_build_mission_outcome_envelope(with_code))["error_code"] == "NAV_TIMEOUT"
+    assert "error_code" not in json.loads(_build_mission_outcome_envelope(without_code))
+
+
+def test_envelope_omits_execution_id_when_legitimately_absent():
+    mission = _mission(state=STATE_BLOCKED, execution_id="")
+
+    envelope = json.loads(_build_mission_outcome_envelope(mission))
+
+    assert "execution_id" not in envelope
+
+
+def test_envelope_covers_succeeded_failed_blocked_canceled():
+    for state, name in (
+        (STATE_SUCCEEDED, "SUCCEEDED"), (STATE_FAILED, "FAILED"),
+        (STATE_BLOCKED, "BLOCKED"), (STATE_CANCELED, "CANCELED"),
+    ):
+        envelope = json.loads(_build_mission_outcome_envelope(_mission(state=state)))
+        assert envelope["terminal_state"] == name
+
+
+def test_envelope_is_empty_string_for_non_terminal_state():
+    # PAUSED is explicitly NOT in V1's terminal-state map (mid-mission,
+    # not a mission outcome) -- confirms it is never blindly included.
+    assert _build_mission_outcome_envelope(_mission(state=STATE_PAUSED)) == ""
+    assert _build_mission_outcome_envelope(_mission(state=STATE_RUNNING)) == ""
+
+
+def test_envelope_construction_never_raises_on_malformed_legacy_data():
+    # Envelope generation must never be allowed to block the terminal event
+    # itself -- garbage in every JSON-bearing field must still yield a
+    # valid minimal envelope, never an exception.
+    mission = _mission(
+        state=STATE_SUCCEEDED, goal_spec_json="not json{{{",
+        bt_json="also not json", context_json="{broken",
+    )
+
+    result = _build_mission_outcome_envelope(mission)
+
+    envelope = json.loads(result)
+    assert envelope["schema"] == MISSION_OUTCOME_SCHEMA
+    assert envelope["mission_id"] == "m1"
+    assert envelope["terminal_state"] == "SUCCEEDED"
+    assert envelope["semantic_entity_ids"] == []
+    assert envelope["grounding_refs"] == []
+
+
+def test_mark_terminal_attaches_envelope_to_the_real_event_payload_json():
+    manager = MissionManager()
+    _accepted, _message, mission, _event = manager.submit(
+        intent_text="go to 66", source="voice", operator_id="user",
+        parent_mission_id="", priority=10, allow_queue=True, context_json="{}",
+    )
+    manager.set_plan(
+        mission.identity.mission_id,
+        json.dumps({"type": "Action", "skill": "approach_entity", "args": {"entity_id": "person_x1"}}),
+        json.dumps({"predicate": "entity_approached", "args": {"entity_id": "person_x1"}}),
+    )
+
+    event = manager.mark_terminal(
+        mission.identity.mission_id, state=STATE_SUCCEEDED, message="goal check TRUE")
+
+    assert event.event == EVENT_SUCCEEDED
+    envelope = json.loads(event.payload_json)
+    assert envelope["schema"] == MISSION_OUTCOME_SCHEMA
+    assert envelope["mission_id"] == mission.identity.mission_id
+    assert envelope["terminal_state"] == "SUCCEEDED"
+    assert envelope["goal_predicate"] == "entity_approached"
+
+
+def test_cancel_attaches_envelope_to_the_real_event_payload_json():
+    manager = MissionManager()
+    _accepted, _message, mission, _event = manager.submit(
+        intent_text="go to 66", source="voice", operator_id="user",
+        parent_mission_id="", priority=10, allow_queue=True, context_json="{}",
+    )
+
+    event = manager.cancel(mission.identity.mission_id, "user said stop")
+
+    assert event.event == EVENT_CANCELED
+    envelope = json.loads(event.payload_json)
+    assert envelope["terminal_state"] == "CANCELED"
+
+
+def test_preempted_payload_json_is_unaffected_by_the_new_envelope():
+    # Regression guard: EVENT_PREEMPTED's own hand-built payload_json
+    # ('{"preempted_mission_id": "..."}') must remain byte-for-byte what it
+    # was before this change -- it is a different event type, never routed
+    # through _build_mission_outcome_envelope at all.
+    manager = MissionManager()
+    _accepted, _message, first, _event = manager.submit(
+        intent_text="first", source="voice", operator_id="user",
+        parent_mission_id="", priority=1, allow_queue=True, context_json="{}",
+    )
+    manager.set_plan(first.identity.mission_id, "bt", "goal")
+    _accepted, _message, second, _event = manager.submit(
+        intent_text="second", source="voice", operator_id="user",
+        parent_mission_id="", priority=2, allow_queue=True, context_json="{}",
+    )
+
+    event = manager.reprioritize(
+        second.identity.mission_id, priority=50, preempt_if_needed=True, reason="urgent")
+
+    assert event.event == EVENT_PREEMPTED
+    assert json.loads(event.payload_json) == {"preempted_mission_id": first.identity.mission_id}
