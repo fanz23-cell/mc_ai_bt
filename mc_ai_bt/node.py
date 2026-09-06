@@ -61,7 +61,7 @@ from .trigger_manager import (
 from .decision_broker import DecisionBroker, LiveObjectLocator
 from .validator import PlanValidator
 from .visual_client import MissionCheckExecutor, VisualCheckClient, VisualCheckSettings
-from .world_state_client import WorldStateClient, WorldStateWriter
+from .world_state_client import ReferenceResolverClient, WorldStateClient, WorldStateWriter
 
 
 def _runner_key(identity: Identity) -> str:
@@ -119,11 +119,16 @@ class AiBtNode(Node):
             snapshot_provider=self._world_state.snapshot_json,
             skill_registry=self._skill_registry,
         )
+        self._reference_resolver = ReferenceResolverClient(
+            self,
+            callback_group=self._client_callback_group,
+        )
         self._planning = PlanningPipeline(
             planner=self._planner,
             context_builder=self._context_builder,
             validator=self._validator,
             policy_guard=self._policy_guard,
+            reference_resolver=self._reference_resolver,
         )
         self._lease_client = ResourceLeaseClient(
             self,

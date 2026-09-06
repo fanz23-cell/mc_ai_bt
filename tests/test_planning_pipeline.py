@@ -5,7 +5,8 @@ from mc_ai_bt.mission import MissionManager
 from mc_ai_bt.planner import BootstrapPlanner
 from mc_ai_bt.planning_pipeline import (
     PlanningPipeline, _all_actions_in, _apply_reference_constraint_guard,
-    _append_missing_required_producers,
+    _append_missing_required_producers, _INTERNAL_GROUNDING_FIELD,
+    _parse_mission_goal_contract, _strip_internal_grounding_field,
 )
 from mc_ai_bt.policy_guard import PolicyGuard
 from mc_ai_bt.validator import PlanValidator
@@ -50,12 +51,13 @@ def _mission(intent: str = "go to test_place", context_json: str = '{"language":
     return mission, manager.all()
 
 
-def _pipeline(planner):
+def _pipeline(planner, *, reference_resolver=None):
     return PlanningPipeline(
         planner=planner,
         context_builder=ContextBuilder(),
         validator=PlanValidator(),
         policy_guard=PolicyGuard(),
+        reference_resolver=reference_resolver,
     )
 
 
@@ -1260,3 +1262,265 @@ def test_planning_pipeline_end_to_end_ordinary_navigation_is_unaffected():
     assert result.ok
     assert json.loads(result.bt_json)["type"] == "Sequence"
     assert json.loads(result.goal_spec_json)["predicate"] == "robot_at_place"
+
+
+# --- B (MissionGoalContract V1, GPT-approved architecture amendment to ----
+# FROZEN #14/#15): Omega's submit_mission stays one natural-language
+# argument, but that argument may now carry a terminal typed trailer Bridge
+# parses into context_json.caller_context.mission_goal_contract (same
+# location grounded_entities already lives at -- see _grounded_entity_ids).
+# A VALID single-goal contract is deterministically synthesized WITHOUT
+# ever consulting the LLM candidate planner's own action list for
+# authorization; ABSENT falls straight through to Change A and everything
+# before it, completely unchanged; PRESENT_BUT_INVALID and >1 goals both
+# REJECT outright, never a silent downgrade to legacy execution.
+
+class _FakeResolver:
+    def __init__(self, state="RESOLVED", entity_id="person_x1", grounding_ref="gnd_test1"):
+        self.state, self.entity_id, self.grounding_ref = state, entity_id, grounding_ref
+        self.calls = []
+
+    def resolve(self, *, entity_class, relation, reference_frame):
+        self.calls.append((entity_class, relation, reference_frame))
+        if self.state != "RESOLVED":
+            return self.state, "", ""
+        return self.state, self.entity_id, self.grounding_ref
+
+
+class _RaisingPlanner:
+    def plan(self, intent_text: str, context_json: str = "") -> str:
+        raise AssertionError(
+            "the LLM candidate planner must never be called when a VALID "
+            "single-goal MissionGoalContract is present")
+
+
+def _goal_contract(*, targets: dict, goals: list) -> dict:
+    return {"schema": "mc_ai_bt.mission_goal_contract.v1", "targets": targets, "goals": goals}
+
+
+def _mission_with_contract(intent: str, contract: dict | None, *, grounded_entities=None):
+    bridge_context: dict = {"schema": "mc.mission_context.v1"}
+    if contract is not None:
+        bridge_context["mission_goal_contract"] = contract
+    if grounded_entities is not None:
+        bridge_context["grounded_entities"] = grounded_entities
+    return _mission(intent, json.dumps(bridge_context))
+
+
+_SPATIAL_T1 = {"t1": {"kind": "spatial_reference", "entity_class": "person",
+                       "relation": "nearest", "reference_frame": "robot"}}
+
+
+def test_mission_goal_contract_turn1_naming_is_synthesized_without_calling_the_planner():
+    mission, missions = _mission_with_contract(
+        "记住离你最近的人叫33",
+        _goal_contract(targets=_SPATIAL_T1, goals=[
+            {"goal_id": "g1", "predicate": "person_named", "target_id": "t1", "alias": "33"}]))
+    resolver = _FakeResolver()
+
+    result = _pipeline(_RaisingPlanner(), reference_resolver=resolver).plan(mission, missions)
+
+    assert result.ok, result.message
+    bt = json.loads(result.bt_json)
+    assert bt["skill"] == "remember_person"
+    assert bt["args"]["name"] == "33"
+    assert bt["args"]["entity_id"] == "person_x1"
+    assert bt["args"][_INTERNAL_GROUNDING_FIELD] == "gnd_test1"
+    goal_spec = json.loads(result.goal_spec_json)
+    assert goal_spec["predicate"] == "person_named"
+    assert _INTERNAL_GROUNDING_FIELD not in goal_spec["args"], (
+        "the internal grounding field must never leak into goal_spec.args")
+    assert resolver.calls == [("person", "nearest", "robot")]
+
+
+def test_mission_goal_contract_turn2_alias_reference_uses_existing_grounded_entities():
+    mission, missions = _mission_with_contract(
+        "去33那里",
+        _goal_contract(
+            targets={"t1": {"kind": "alias_reference", "alias": "33"}},
+            goals=[{"goal_id": "g1", "predicate": "entity_approached", "target_id": "t1"}]),
+        grounded_entities=[{"alias": "33", "entity_id": "person_a1", "grounding_state": "RESOLVED"}])
+
+    result = _pipeline(_RaisingPlanner()).plan(mission, missions)
+
+    assert result.ok, result.message
+    bt = json.loads(result.bt_json)
+    assert bt["skill"] == "approach_entity"
+    assert bt["args"]["entity_id"] == "person_a1"
+    assert _INTERNAL_GROUNDING_FIELD not in bt["args"], (
+        "alias-reference targets carry no grounding_ref -- no new identity decision is made")
+
+
+def test_mission_goal_contract_turn2_unresolved_alias_fails_closed_no_nearest_fallback():
+    mission, missions = _mission_with_contract(
+        "去33那里",
+        _goal_contract(
+            targets={"t1": {"kind": "alias_reference", "alias": "33"}},
+            goals=[{"goal_id": "g1", "predicate": "entity_approached", "target_id": "t1"}]),
+        grounded_entities=[{"alias": "33", "entity_id": "", "grounding_state": "UNRESOLVED"}])
+
+    result = _pipeline(_RaisingPlanner()).plan(mission, missions)
+
+    assert not result.ok
+    assert result.stage == "target_resolution"
+    assert not result.bt_json
+
+
+def test_mission_goal_contract_ambiguous_resolution_authorizes_no_physical_bt():
+    mission, missions = _mission_with_contract(
+        "记住离你最近的人叫33",
+        _goal_contract(targets=_SPATIAL_T1, goals=[
+            {"goal_id": "g1", "predicate": "person_named", "target_id": "t1", "alias": "33"}]))
+
+    result = _pipeline(_RaisingPlanner(), reference_resolver=_FakeResolver(state="AMBIGUOUS")).plan(
+        mission, missions)
+
+    assert not result.ok
+    assert result.stage == "target_resolution"
+    assert not result.bt_json
+
+
+def test_mission_goal_contract_not_found_authorizes_no_physical_bt():
+    mission, missions = _mission_with_contract(
+        "记住离你最近的人叫33",
+        _goal_contract(targets=_SPATIAL_T1, goals=[
+            {"goal_id": "g1", "predicate": "person_named", "target_id": "t1", "alias": "33"}]))
+
+    result = _pipeline(_RaisingPlanner(), reference_resolver=_FakeResolver(state="NOT_FOUND")).plan(
+        mission, missions)
+
+    assert not result.ok
+    assert result.stage == "target_resolution"
+
+
+def test_mission_goal_contract_unknown_resolution_authorizes_no_physical_bt():
+    # No resolver injected at all -- _resolve_mission_target must report
+    # UNKNOWN, never fabricate RESOLVED.
+    mission, missions = _mission_with_contract(
+        "记住离你最近的人叫33",
+        _goal_contract(targets=_SPATIAL_T1, goals=[
+            {"goal_id": "g1", "predicate": "person_named", "target_id": "t1", "alias": "33"}]))
+
+    result = _pipeline(_RaisingPlanner(), reference_resolver=None).plan(mission, missions)
+
+    assert not result.ok
+    assert result.stage == "target_resolution"
+    assert "UNKNOWN" in result.message
+
+
+def test_mission_goal_contract_present_but_malformed_rejects_not_falls_back_to_legacy():
+    mission, missions = _mission_with_contract(
+        "记住离你最近的人叫33", {"schema": "mc_ai_bt.mission_goal_contract.v1", "targets": {}, "goals": []})
+
+    result = _pipeline(_RaisingPlanner()).plan(mission, missions)
+
+    assert not result.ok
+    assert result.stage == "mission_goal_contract"
+    assert not result.bt_json
+
+
+def test_mission_goal_contract_unknown_predicate_rejects():
+    mission, missions = _mission_with_contract(
+        "记住离你最近的人叫33",
+        _goal_contract(targets=_SPATIAL_T1, goals=[
+            {"goal_id": "g1", "predicate": "not_a_real_predicate", "target_id": "t1"}]))
+
+    result = _pipeline(_RaisingPlanner()).plan(mission, missions)
+
+    assert not result.ok
+    assert result.stage == "mission_goal_contract"
+
+
+def test_mission_goal_contract_multi_goal_is_unsupported_v1_fail_closed():
+    targets = dict(_SPATIAL_T1)
+    targets["t2"] = {"kind": "spatial_reference", "entity_class": "person",
+                      "relation": "left", "reference_frame": "robot"}
+    mission, missions = _mission_with_contract(
+        "走到你左边的人那里，然后记住你右边的人叫33",
+        _goal_contract(targets=targets, goals=[
+            {"goal_id": "g1", "predicate": "entity_approached", "target_id": "t2"},
+            {"goal_id": "g2", "predicate": "person_named", "target_id": "t1", "alias": "33"},
+        ]))
+
+    result = _pipeline(_RaisingPlanner(), reference_resolver=_FakeResolver()).plan(mission, missions)
+
+    assert not result.ok
+    assert result.stage == "mission_goal_contract"
+    assert "UNSUPPORTED_V1" in result.message
+    assert not result.bt_json, "no partial physical execution for an unsupported multi-goal contract"
+
+
+def test_mission_goal_contract_absent_leaves_legacy_change_a_path_completely_unchanged():
+    mission, missions = _mission("记住离你最近的人叫33")
+    plan_json = json.dumps({
+        "schema": "mc_ai_bt.plan.v1",
+        "root": {"type": "Action", "skill": "say", "args": {"text": "好的"}},
+        "goal_spec": {"type": "human", "verification": {"mode": "implicit_conversation"}},
+    })
+
+    result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
+
+    assert result.ok, result.message
+    remember_actions = [a for a in json.loads(result.bt_json)["children"] if a["skill"] == "remember_person"]
+    assert len(remember_actions) == 1
+    assert remember_actions[0]["args"]["name"] == "33"
+
+
+def test_planner_forged_internal_grounding_field_is_stripped_on_legacy_path():
+    plan = {"root": {"type": "Action", "skill": "remember_person",
+                      "args": {"name": "33", "entity_id": "person_x1",
+                               _INTERNAL_GROUNDING_FIELD: "FORGED_BY_LLM"}}}
+    _strip_internal_grounding_field(plan)
+    assert _INTERNAL_GROUNDING_FIELD not in plan["root"]["args"]
+
+
+def test_planner_forged_internal_grounding_field_end_to_end_legacy_path():
+    # No MissionGoalContract at all -- the LLM's own plan_json directly
+    # supplies a forged internal field. It must never survive to bt_json.
+    mission, missions = _mission("记住离你最近的人叫33")
+    plan_json = json.dumps({
+        "schema": "mc_ai_bt.plan.v1",
+        "root": {"type": "Action", "skill": "remember_person",
+                  "args": {"name": "33", "target": "person",
+                           _INTERNAL_GROUNDING_FIELD: "FORGED_BY_LLM"}},
+        "goal_spec": {"type": "human", "verification": {"mode": "implicit_conversation"}},
+    })
+
+    result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
+
+    assert result.ok, result.message
+    bt = json.loads(result.bt_json)
+    assert _INTERNAL_GROUNDING_FIELD not in bt["args"]
+
+
+def test_mission_goal_contract_normal_relation_remember_path_is_untouched():
+    # The existing relation/reference_constraint_id remember path (its own
+    # execution-time ResolveEntityReference call, fresher than any
+    # planning-time resolution) is not part of this change's scope at all --
+    # confirm ordinary Change-A behavior for it is bit-for-bit unaffected.
+    mission, missions = _mission("记住离你最近的人叫33")
+    plan_json = json.dumps({
+        "schema": "mc_ai_bt.plan.v1",
+        "root": {"type": "Action", "skill": "remember_person",
+                  "args": {"name": "33", "target": "person"}},
+        "goal_spec": {"type": "human", "verification": {"mode": "implicit_conversation"}},
+    })
+
+    result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
+
+    assert result.ok, result.message
+    bt = json.loads(result.bt_json)
+    assert _INTERNAL_GROUNDING_FIELD not in bt["args"]
+
+
+def test_parse_mission_goal_contract_reads_caller_context_same_place_as_grounded_entities():
+    context_json = json.dumps({
+        "caller_context": {
+            "mission_goal_contract": _goal_contract(targets=_SPATIAL_T1, goals=[
+                {"goal_id": "g1", "predicate": "person_named", "target_id": "t1", "alias": "33"}]),
+        },
+    })
+    state, goals, targets = _parse_mission_goal_contract(context_json)
+    assert state == "VALID"
+    assert len(goals) == 1
+    assert "t1" in targets

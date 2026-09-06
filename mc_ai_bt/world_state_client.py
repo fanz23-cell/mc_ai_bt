@@ -47,6 +47,72 @@ class WorldStateClient:
         return str(getattr(snapshot, "world_json", "") or "")
 
 
+class ReferenceResolverClient:
+    """B (MissionGoalContract V1, GPT-approved): the planning-time CALLER of
+    the existing, unmodified /mc_world_state/resolve_entity_reference
+    service -- the same authoritative service remember_person/remember_entity
+    already call at execution time (seattle_lab/mc_embodied_skills/node.py),
+    just invoked one stage earlier so a spatial semantic target
+    (entity_class/relation/reference_frame) can be materialized into a real
+    entity_id + grounding_ref BEFORE synthesizing a producer Action, instead
+    of only ever happening inside a single skill's own execution. This adds
+    no new grounding capability -- WorldState remains the sole authority on
+    what "nearest"/"left"/"right" resolves to; this is one more client of a
+    service that already exists."""
+
+    def __init__(
+        self,
+        node: Node,
+        *,
+        service_name: str = "/mc_world_state/resolve_entity_reference",
+        callback_group=None,
+    ) -> None:
+        from mc_one.srv import ResolveEntityReference
+
+        self._service_type = ResolveEntityReference
+        self._client = node.create_client(
+            ResolveEntityReference,
+            service_name,
+            callback_group=callback_group,
+        )
+
+    def resolve(
+        self,
+        *,
+        entity_class: str,
+        relation: str,
+        reference_frame: str,
+        max_age_sec: float = 0.0,
+        timeout_sec: float = 2.0,
+    ) -> tuple[str, str, str]:
+        """Returns (state, live_entity_id, grounding_ref). state is one of
+        RESOLVED/AMBIGUOUS/NOT_FOUND/UNKNOWN (the service's own vocabulary)
+        -- or "UNKNOWN" if the service is not ready / the call times out,
+        never fabricated as RESOLVED. live_entity_id/grounding_ref are only
+        ever non-empty when state == RESOLVED."""
+        if not self._client.service_is_ready():
+            return "UNKNOWN", "", ""
+        request = self._service_type.Request()
+        request.entity_class = entity_class
+        request.relation = relation
+        request.reference_frame = reference_frame
+        request.max_age_sec = max_age_sec
+        ok, response_or_message = _wait_future(
+            self._client.call_async(request),
+            timeout_sec=timeout_sec,
+        )
+        if not ok:
+            return "UNKNOWN", "", ""
+        response = response_or_message
+        if not bool(getattr(response, "success", False)):
+            return "UNKNOWN", "", ""
+        state = str(getattr(response, "state", "") or "UNKNOWN")
+        if state != "RESOLVED":
+            return state, "", ""
+        return state, str(getattr(response, "live_entity_id", "") or ""), str(
+            getattr(response, "grounding_ref", "") or "")
+
+
 class WorldStateWriter:
     def __init__(
         self,

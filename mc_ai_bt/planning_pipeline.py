@@ -11,7 +11,7 @@ from .planner import Planner
 from .policy_guard import PHYSICAL_SKILLS, PolicyGuard
 from .reference_extraction import has_explicit_look_instruction
 from .skill_registry import DEFAULT_SKILLS, internally_resolved_predicates
-from .validator import PlanValidator
+from .validator import KNOWN_PREDICATE_NAMES, PlanValidator
 
 
 @dataclass(frozen=True)
@@ -936,6 +936,188 @@ def _canonicalize_redundant_locate_prefix(plan: dict[str, Any], *, intent_text: 
     plan["root"] = _without_redundant_locate_actions(plan.get("root"), redundant_ids)
 
 
+_MISSION_GOAL_CONTRACT_SCHEMA = "mc_ai_bt.mission_goal_contract.v1"
+_VALID_TARGET_KINDS = frozenset({"spatial_reference", "alias_reference"})
+# Machine-owned execution metadata, never a planner-facing semantic Action
+# input -- deliberately absent from every SkillSpec.args_schema (those are
+# the LLM-prompt catalog). It only ever exists because THIS module's own
+# _synthesize_mission_goal constructs it from scratch; the LLM planner is
+# never consulted for a V1 mission-goal plan's action list at all (see
+# PlanningPipeline.plan's own comment), so there is no untrusted candidate
+# to strip a forged copy of this key from in the first place.
+_INTERNAL_GROUNDING_FIELD = "_planning_grounding_ref"
+
+
+def _strip_internal_grounding_field(plan: dict[str, Any]) -> None:
+    """Trust-boundary enforcement for the LEGACY (no MissionGoalContract)
+    path only: _synthesize_mission_goal above never reads plan_json at all,
+    so it has nothing to strip a forged copy of _INTERNAL_GROUNDING_FIELD
+    from. THIS path is different -- plan_json here is the LLM planner's own
+    untrusted output, and although it is never told this key exists (it is
+    absent from every SkillSpec.args_schema), a planner that guessed or
+    hallucinated it must not be able to smuggle a fake -- or a real but
+    unrelated -- grounding_ref past seattle_lab's explicit-entity_id
+    evidence_ref propagation (GPT-approved trust boundary). Unconditional:
+    it does not matter whether a present value looks plausible: this key
+    is machine-owned in every code path, so any externally-authored
+    occurrence of it is stripped before any other stage ever sees it,
+    the same "strip first, only a trusted stage may inject" shape
+    _apply_grounding_normalizer already uses for entity_id."""
+    for action in _all_actions_in(plan.get("root")):
+        args = action.get("args")
+        if isinstance(args, dict):
+            args.pop(_INTERNAL_GROUNDING_FIELD, None)
+
+
+@dataclass(frozen=True)
+class MissionGoal:
+    goal_id: str
+    predicate: str
+    target_id: str
+    alias: str = ""
+
+
+def _parse_mission_goal_contract(
+    context_json: str,
+) -> tuple[str, tuple[MissionGoal, ...], dict[str, dict[str, str]]]:
+    """B (MissionGoalContract V1, GPT-approved architecture amendment to
+    FROZEN #14/#15): reads context_json.mission_goal_contract -- a
+    machine-materialized structure Bridge produces from Omega's own
+    terminal trailer syntax on submit_mission's single argument, never
+    free-form text this module itself interprets (Bridge already stripped
+    and parsed it; this function never sees intent_text).
+
+    Returns (state, goals, targets):
+      "ABSENT"              -- no contract this mission; legacy pipeline
+                                (Change A and everything before it) runs
+                                completely unchanged, see plan().
+      "VALID"               -- well-formed: every goal's target_id resolves
+                                to a declared target, every predicate is a
+                                real registry predicate, every relation/
+                                entity_class/reference_frame is in the same
+                                closed vocabulary _validate_reference_constraint
+                                already enforces above.
+      "PRESENT_BUT_INVALID" -- Omega/Bridge intended to provide one but it
+                                fails validation -- plan() must REJECT this
+                                mission outright, never silently fall back
+                                to legacy execution (an invalid semantic
+                                authorization is not the same epistemic
+                                state as no authorization being offered).
+
+    Defense in depth, same posture as _validate_reference_constraint: this
+    does not blindly trust Bridge's own JSON shape either, even though
+    Bridge is the machine-owned materializer -- a stale/hand-crafted
+    context_json must fail exactly like a hallucinated one would."""
+    try:
+        context = json.loads(context_json) if context_json else {}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return "ABSENT", (), {}
+    if not isinstance(context, dict):
+        return "ABSENT", (), {}
+    # Same location grounded_entities already lives at (_grounded_entity_ids
+    # above reads caller_context too) -- Bridge owns and constructs
+    # mission.context_json, which ContextBuilder.build_json wraps unchanged
+    # into context.caller_context; this is not a second, competing
+    # context-building authority, just the same existing field.
+    caller_context = context.get("caller_context")
+    if not isinstance(caller_context, dict):
+        return "ABSENT", (), {}
+    contract = caller_context.get("mission_goal_contract")
+    if contract is None:
+        return "ABSENT", (), {}
+    if not isinstance(contract, dict) or contract.get("schema") != _MISSION_GOAL_CONTRACT_SCHEMA:
+        return "PRESENT_BUT_INVALID", (), {}
+
+    raw_targets = contract.get("targets")
+    raw_goals = contract.get("goals")
+    if not isinstance(raw_targets, dict) or not raw_targets:
+        return "PRESENT_BUT_INVALID", (), {}
+    if not isinstance(raw_goals, list) or not raw_goals:
+        return "PRESENT_BUT_INVALID", (), {}
+
+    targets: dict[str, dict[str, str]] = {}
+    for target_id, raw_target in raw_targets.items():
+        if not isinstance(target_id, str) or not target_id or not isinstance(raw_target, dict):
+            return "PRESENT_BUT_INVALID", (), {}
+        kind = str(raw_target.get("kind") or "")
+        if kind not in _VALID_TARGET_KINDS:
+            return "PRESENT_BUT_INVALID", (), {}
+        if kind == "spatial_reference":
+            entity_class = str(raw_target.get("entity_class") or "").strip().lower()
+            relation = str(raw_target.get("relation") or "").strip().lower()
+            reference_frame = str(raw_target.get("reference_frame") or "").strip().lower()
+            if entity_class != "person" or relation not in _VALID_RELATIONS or reference_frame != "robot":
+                return "PRESENT_BUT_INVALID", (), {}
+            targets[target_id] = {
+                "kind": kind, "entity_class": entity_class,
+                "relation": relation, "reference_frame": reference_frame,
+            }
+        else:  # alias_reference
+            alias = str(raw_target.get("alias") or "").strip()
+            if not alias:
+                return "PRESENT_BUT_INVALID", (), {}
+            targets[target_id] = {"kind": kind, "alias": alias}
+
+    goals: list[MissionGoal] = []
+    seen_goal_ids: set[str] = set()
+    for raw_goal in raw_goals:
+        if not isinstance(raw_goal, dict):
+            return "PRESENT_BUT_INVALID", (), {}
+        goal_id = str(raw_goal.get("goal_id") or "").strip()
+        predicate = str(raw_goal.get("predicate") or "").strip()
+        target_id = str(raw_goal.get("target_id") or "").strip()
+        alias = str(raw_goal.get("alias") or "").strip()
+        if (
+            not goal_id or goal_id in seen_goal_ids
+            or predicate not in KNOWN_PREDICATE_NAMES
+            or target_id not in targets
+        ):
+            return "PRESENT_BUT_INVALID", (), {}
+        seen_goal_ids.add(goal_id)
+        goals.append(MissionGoal(goal_id=goal_id, predicate=predicate, target_id=target_id, alias=alias))
+
+    if not goals:
+        return "PRESENT_BUT_INVALID", (), {}
+    return "VALID", tuple(goals), targets
+
+
+def _resolve_mission_target(
+    target: dict[str, str], *, context_json: str, reference_resolver: Any,
+) -> tuple[str, str, str]:
+    """(state, entity_id, grounding_ref). state is one of
+    RESOLVED/AMBIGUOUS/NOT_FOUND/UNKNOWN.
+
+    alias_reference targets reuse the EXISTING, Bridge-materialized
+    grounded_entities lookup (_grounded_entity_ids above) -- the identical
+    data _apply_grounding_normalizer already trusts for navigating to an
+    already-bound alias (E1 TURN2's own path); no grounding_ref concept
+    applies here (no NEW identity decision is being made, only navigation
+    to one already on record), and an UNRESOLVED alias fails closed with
+    no nearest-same-class fallback, exactly like the existing negative-test
+    contract.
+
+    spatial_reference targets go through reference_resolver -- the
+    planning-time CALLER of the existing, unmodified
+    /mc_world_state/resolve_entity_reference service (the SAME authoritative
+    service remember_person/remember_entity's own execution already calls;
+    this is one more caller of it, not a new grounding engine). Returns
+    UNKNOWN (never fabricates RESOLVED) if no resolver was injected or the
+    service is not reachable."""
+    if target["kind"] == "alias_reference":
+        grounded = _grounded_entity_ids(context_json)
+        entry = grounded.get(_normalize_alias(target["alias"]))
+        if entry is None or entry.get("grounding_state") != "RESOLVED" or not entry.get("entity_id"):
+            return "NOT_FOUND", "", ""
+        return "RESOLVED", entry["entity_id"], ""
+    if reference_resolver is None:
+        return "UNKNOWN", "", ""
+    return reference_resolver.resolve(
+        entity_class=target["entity_class"],
+        relation=target["relation"],
+        reference_frame=target["reference_frame"],
+    )
+
+
 def _apply_deterministic_goal_spec(plan: dict[str, Any]) -> None:
     """E.1 follow-up (2026-09-02, GPT spec): the LLM/bootstrap planner does
     not always produce a structured goal_spec for a mission containing a
@@ -998,11 +1180,109 @@ class PlanningPipeline:
         context_builder: ContextBuilder,
         validator: PlanValidator,
         policy_guard: PolicyGuard,
+        reference_resolver: Any = None,
     ) -> None:
         self._planner = planner
         self._context_builder = context_builder
         self._validator = validator
         self._policy_guard = policy_guard
+        # B (MissionGoalContract V1, GPT-approved): optional -- every
+        # existing caller/test that omits it gets exactly today's behavior,
+        # since it is only ever consulted inside _synthesize_mission_goal,
+        # itself only reached when a VALID V1 contract is present (see
+        # plan() below). None here plus no contract in context_json is a
+        # complete no-op, not a degraded mode.
+        self._reference_resolver = reference_resolver
+
+    def _synthesize_mission_goal(
+        self, goal: "MissionGoal", targets: dict[str, dict[str, str]], *, context_json: str,
+    ) -> PlanningResult:
+        """B (MissionGoalContract V1, GPT-approved): the LLM candidate
+        planner is never consulted here -- plan() does not even call it for
+        a mission carrying a VALID single-goal contract (see plan()'s own
+        comment on why that makes the usual "strip a planner-forged
+        internal field" defense vacuous rather than skipped: there is no
+        externally-sourced args dict for this method to strip a forged
+        value FROM in the first place, every key below is constructed by
+        this function alone). Deterministic, registry-derived producer
+        selection -- 0 or 2+ producers is a fail-closed reject, not a guess
+        (same posture as every other producer-selection rule in this
+        module)."""
+        producers = [
+            name for name, spec in DEFAULT_SKILLS.items()
+            if goal.predicate in spec.result_predicates
+        ]
+        if len(producers) != 1:
+            return PlanningResult(
+                False, "mission_goal_contract",
+                f"predicate {goal.predicate!r} has {len(producers)} registry producer(s) (need exactly 1)",
+                context_json=context_json,
+            )
+        skill = producers[0]
+
+        target = targets.get(goal.target_id)
+        if target is None:
+            return PlanningResult(
+                False, "mission_goal_contract",
+                f"goal {goal.goal_id!r} references unknown target_id {goal.target_id!r}",
+                context_json=context_json,
+            )
+
+        state, entity_id, grounding_ref = _resolve_mission_target(
+            target, context_json=context_json, reference_resolver=self._reference_resolver)
+        if state != "RESOLVED":
+            return PlanningResult(
+                False, "target_resolution",
+                f"target {goal.target_id!r} resolution state is {state} -- no physical BT authorized "
+                "(no nearest/same-class fallback)",
+                context_json=context_json,
+            )
+
+        if target["kind"] == "spatial_reference":
+            label = f"{target['relation']} {target['entity_class']}"
+        else:
+            label = target["alias"]
+        args: dict[str, Any] = {"target": label, "entity_id": entity_id}
+        goal_spec_args: dict[str, Any] = {"target": label, "entity_id": entity_id}
+
+        if skill in _SELF_LOCATING_TERMINAL_SKILLS:
+            if not goal.alias:
+                return PlanningResult(
+                    False, "mission_goal_contract",
+                    f"goal {goal.goal_id!r} (predicate {goal.predicate!r}) requires an alias, none provided",
+                    context_json=context_json,
+                )
+            name_key = "name" if skill == "remember_person" else "alias"
+            args[name_key] = goal.alias
+            goal_spec_args[name_key] = goal.alias
+            # Machine-owned evidence propagation (GPT-approved trust
+            # boundary): only the explicit-entity_id naming path, which
+            # today has no upstream decision evidence of its own to point
+            # to (seattle_lab/mc_embodied_skills/node.py's own
+            # _remember_entity_by_id, evidence_ref=""), consumes this.
+            # The normal relation/reference_constraint_id path is untouched
+            # and keeps producing its own fresher, execution-time evidence.
+            if target["kind"] == "spatial_reference" and grounding_ref:
+                args[_INTERNAL_GROUNDING_FIELD] = grounding_ref
+
+        plan = {
+            "root": {"type": "Action", "skill": skill, "args": args},
+            "goal_spec": {
+                "type": "structured", "predicate": goal.predicate,
+                "args": goal_spec_args, "verification": {"mode": "world_state"},
+            },
+        }
+        policy = self._policy_guard.check(plan)
+        if not policy.ok:
+            return PlanningResult(
+                False, "policy", "; ".join(policy.errors), context_json=context_json,
+            )
+        return PlanningResult(
+            True, "done", "planned",
+            context_json=context_json,
+            bt_json=json.dumps(plan["root"], sort_keys=True, separators=(",", ":")),
+            goal_spec_json=json.dumps(plan["goal_spec"], sort_keys=True, separators=(",", ":")),
+        )
 
     def plan(
         self,
@@ -1010,6 +1290,39 @@ class PlanningPipeline:
         missions: tuple[Mission, ...],
     ) -> PlanningResult:
         context_json = self._context_builder.build_json(mission, missions)
+
+        # B (MissionGoalContract V1, GPT-approved architecture amendment):
+        # checked BEFORE ever calling the LLM planner. A VALID single-goal
+        # contract is deterministically synthesized end to end without the
+        # LLM's own candidate action list ever being consulted for
+        # authorization -- see _synthesize_mission_goal's own comment on
+        # why that is the actual trust boundary, not merely a stripping
+        # step applied after the fact. ABSENT falls straight through to
+        # every existing stage below (Change A and everything before it),
+        # completely unchanged. PRESENT_BUT_INVALID and >1 goals (V1 scope:
+        # GoalCheck has no conjunction semantics yet) both REJECT outright
+        # -- never a silent downgrade to legacy execution, per the
+        # explicit fail-closed distinction GPT's review required.
+        goal_state, goals, targets = _parse_mission_goal_contract(context_json)
+        if goal_state == "PRESENT_BUT_INVALID":
+            return PlanningResult(
+                False, "mission_goal_contract",
+                "mission_goal_contract is present but invalid (malformed shape, unknown "
+                "predicate/relation/entity_class, or a goal references an undeclared target_id) "
+                "-- rejecting outright, not falling back to legacy candidate-plan execution",
+                context_json=context_json,
+            )
+        if goal_state == "VALID":
+            if len(goals) > 1:
+                return PlanningResult(
+                    False, "mission_goal_contract",
+                    f"UNSUPPORTED_V1: contract declares {len(goals)} required goals; "
+                    "GoalCheck does not yet support conjunction semantics -- fail closed rather "
+                    "than execute a partial mission or silently drop a goal",
+                    context_json=context_json,
+                )
+            return self._synthesize_mission_goal(goals[0], targets, context_json=context_json)
+
         try:
             plan_json = self._planner.plan(mission.intent_text, context_json)
         except Exception as exc:  # noqa: BLE001
@@ -1040,6 +1353,8 @@ class PlanningPipeline:
                 context_json=context_json,
                 plan_json=plan_json,
             )
+
+        _strip_internal_grounding_field(plan)
 
         _append_missing_required_producers(
             plan, context_json=context_json, intent_text=mission.intent_text)
