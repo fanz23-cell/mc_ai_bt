@@ -335,13 +335,26 @@ def _validate_reference_constraint(
     own narrow-grammar design). Still checked, in case context_json ever
     carries a stale or hand-crafted entry: reference_frame must be "robot"
     (ResolveEntityReference's geometry has only ever understood
-    robot-relative bearings), entity_class must be "person" (the only
-    class the extractor produces today -- remember_person AND
-    remember_entity both require it, since there is currently no
-    legitimate reason for either to reference a non-person constraint; a
-    prior round left remember_entity with NO class check at all here,
-    flagged as a real gap by GPT's review), and source_span must be a
-    real, near-verbatim substring of this mission's own intent_text.
+    robot-relative bearings), entity_class must be non-empty, and
+    source_span must be a real, near-verbatim substring of this mission's
+    own intent_text.
+
+    CHANGE APPROVAL 1 (this run): entity_class used to be required to be
+    exactly "person" -- the only class reference_extraction.py produced at
+    the time, per an explicit prior decision that there was "no legitimate
+    reason" for a non-person constraint. That round's own real, live
+    evidence (two simultaneously visible potted plants, a real "the
+    nearest plant" utterance remember_entity correctly refused to guess
+    at) directly contradicted that rationale, so reference_extraction.py
+    now also produces a bounded, tight-adjacency-matched OBJECT noun as
+    entity_class (see its own _OBJECT_RELATION_PATTERNS). Accepting any
+    non-empty entity_class here is still safe: this field is validate-time
+    only (never propagated into the actual bind -- remember_entity/
+    remember_person each independently re-derive entity_class from a real,
+    freshly-observed perception fact before ever calling
+    ResolveEntityReference), and source_span below still independently
+    re-verifies the words came from the user's own real intent_text either
+    way.
     """
     relation = str(constraint.get("relation") or "").strip().lower()
     if relation not in _VALID_RELATIONS:
@@ -353,8 +366,8 @@ def _validate_reference_constraint(
             "only understands robot-relative bearings, never a relation to some other entity"
         )
     entity_class = str(constraint.get("entity_class") or "").strip().lower()
-    if entity_class != "person":
-        return "", f"entity_class {entity_class!r} is not \"person\" -- the only class reference_extraction.py produces"
+    if not entity_class or len(entity_class) > 64:
+        return "", f"entity_class {entity_class!r} must be non-empty and <= 64 chars"
     source_span = str(constraint.get("source_span") or "").strip()
     if not source_span or _normalize_alias(source_span) not in _normalize_alias(intent_text):
         return "", (

@@ -775,14 +775,28 @@ def test_reference_constraint_guard_rejects_a_constraint_relative_to_a_different
     assert "robot" in error
 
 
-def test_reference_constraint_guard_rejects_a_constraint_describing_a_different_entity_class():
+def test_reference_constraint_guard_rejects_a_constraint_not_owned_by_this_binding():
     # Direct unit test. GPT's chair counter-example: source_span is
     # genuinely present -- but it describes the CHAIR's position, not the
     # person being bound. FOUND (2026-09-03, GPT re-review): a prior round
     # left remember_entity with NO entity_class check at all here -- any
     # constraint, regardless of declared class, would be accepted for it.
-    # reference_extraction.py only ever produces "person" constraints
-    # today; entity_class must equal "person" for EITHER skill now.
+    #
+    # CHANGE APPROVAL 1 (2026-09-08, this run): entity_class no longer has
+    # to equal "person" -- reference_extraction.py now also produces
+    # object-noun constraints (real counter-example: two co-visible potted
+    # plants, "the nearest plant", remember_entity correctly refusing to
+    # guess). The safety property this test actually cares about --
+    # "a constraint that isn't genuinely about THIS binding must never be
+    # used for it" -- was never enforced by the entity_class check alone;
+    # it is (and was) enforced independently by the bind_alias/ownership
+    # check below, which this test still exercises unchanged: the fixture
+    # constraint carries no bind_alias, so it is still unconditionally
+    # rejected, just via that check now instead of a since-widened
+    # entity_class check. See the companion test right below this one for
+    # the new, previously-impossible acceptance case this change enables,
+    # and the one after that for confirmation the ownership check still
+    # closes the door even when entity_class alone would now pass.
     plan = {"root": {"type": "Action", "skill": "remember_entity", "args": {
         "target": "the person", "alias": "44", "reference_constraint_id": "ref_1",
     }}}
@@ -795,7 +809,55 @@ def test_reference_constraint_guard_rejects_a_constraint_describing_a_different_
         plan, context_json=context_json, intent_text="The chair is on your left. Remember this person as 44.")
 
     assert error is not None
-    assert "person" in error
+    assert "not deterministically associated" in error
+
+
+def test_reference_constraint_guard_now_accepts_a_genuine_object_class_constraint():
+    # CHANGE APPROVAL 1 (2026-09-08): the new, intended capability this
+    # change adds -- binding an OBJECT via a real, ownership-matched
+    # reference_constraint, exactly like remember_person already could for
+    # people. Real utterance shape: "Remember the plant on your left as
+    # Greenie." -- entity_class="plant" (not "person"), and bind_alias
+    # correctly names THIS action's own alias.
+    plan = {"root": {"type": "Action", "skill": "remember_entity", "args": {
+        "target": "the plant", "alias": "Greenie", "reference_constraint_id": "ref_1",
+    }}}
+    context_json = _context_json_with_reference_constraints({
+        "constraint_id": "ref_1", "entity_class": "plant", "relation": "left",
+        "reference_frame": "robot", "source_span": "the plant on your left",
+        "bind_alias": "Greenie",
+    })
+
+    error = _apply_reference_constraint_guard(
+        plan, context_json=context_json,
+        intent_text="Remember the plant on your left as Greenie.")
+
+    assert error is None
+    assert plan["root"]["args"]["relation"] == "left"
+
+
+def test_reference_constraint_guard_still_rejects_wrong_owner_even_with_a_valid_object_class():
+    # Confirms entity_class no longer being restricted to "person" did not
+    # quietly widen WHICH binding a real object constraint can be used
+    # for: same constraint as above (a real, validly-shaped plant/left
+    # constraint with its own bind_alias="Greenie"), but this action binds
+    # a DIFFERENT alias ("Fern") -- must still be rejected on ownership
+    # grounds, entity_class validity alone is never sufficient.
+    plan = {"root": {"type": "Action", "skill": "remember_entity", "args": {
+        "target": "the plant", "alias": "Fern", "reference_constraint_id": "ref_1",
+    }}}
+    context_json = _context_json_with_reference_constraints({
+        "constraint_id": "ref_1", "entity_class": "plant", "relation": "left",
+        "reference_frame": "robot", "source_span": "the plant on your left",
+        "bind_alias": "Greenie",
+    })
+
+    error = _apply_reference_constraint_guard(
+        plan, context_json=context_json,
+        intent_text="Remember the plant on your left as Greenie.")
+
+    assert error is not None
+    assert "Greenie" in error and "Fern" in error
 
 
 def test_reference_constraint_guard_accepts_a_valid_constraint_and_fills_in_relation():

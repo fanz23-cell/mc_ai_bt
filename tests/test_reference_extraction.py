@@ -164,10 +164,12 @@ def test_bind_alias_is_empty_with_no_naming_continuation_at_all():
 
 
 def test_bind_alias_is_never_captured_from_the_word_is():
-    # GPT's own worked counter-example: "is <word>" is deliberately NOT a
-    # naming marker in either language -- "is waving" must never be
-    # captured as if "waving" were an alias. Only "as" (English) and "叫"
-    # (Chinese) are specific enough naming constructions to trust.
+    # GPT's own worked counter-example: a BARE "is <word>" is deliberately
+    # NOT a naming marker in either language -- "is waving" must never be
+    # captured as if "waving" were an alias. "as"/"叫" (and, added this
+    # run, "is called"/"is named"/叫做/名叫 -- see the tests right below)
+    # are specific enough naming constructions to trust; a bare copula is
+    # not.
     result = extract_reference_constraints(
         "The person on your left is waving. Remember the person on your right as 44.")
 
@@ -175,6 +177,92 @@ def test_bind_alias_is_never_captured_from_the_word_is():
     left, right = result
     assert left["bind_alias"] == ""  # "is waving" -- never mistaken for a name
     assert right["bind_alias"] == "44"  # "as 44" -- a real, adjacent naming marker
+
+
+def test_bind_alias_captured_from_is_called_or_is_named():
+    # CHANGE APPROVAL 1 follow-on (2026-09-08): live-tested while
+    # deploying the object-class widening -- real Omega-authored mission
+    # text consistently used "is called"/"is named" rather than "as".
+    # Unlike a bare "is <word>", these are specific naming verbs, so the
+    # same ambiguity concern the module's own docstring raises for a bare
+    # "is" does not apply.
+    for phrase in ("is called", "is named"):
+        result = extract_reference_constraints(f"The plant on your left {phrase} Greenie.")
+        assert result[0]["bind_alias"] == "Greenie", phrase
+
+
+def test_bind_alias_still_not_captured_from_a_bare_is_even_with_called_named_supported():
+    # Confirms adding "is called"/"is named" did not loosen the bare-"is"
+    # exclusion itself -- "is waving" must still never be treated as a name.
+    result = extract_reference_constraints("The plant on your left is waving.")
+    assert result[0]["bind_alias"] == ""
+
+
+def test_bind_alias_captured_from_the_chinese_jiaozuo_and_mingjiao_markers():
+    # CHANGE APPROVAL 1 follow-on (2026-09-08): Chinese siblings of
+    # "is called"/"is named", same rationale.
+    result = extract_reference_constraints("记住你左边的人叫做44")
+    assert result[0]["bind_alias"] == "44"
+    result = extract_reference_constraints("记住你左边的人名叫44")
+    assert result[0]["bind_alias"] == "44"
+
+
+# --- CHANGE APPROVAL 1 (2026-09-08): object-class relation constraints --
+
+def test_extracts_object_relation_for_nearest_front_left_right():
+    for text, relation in (
+        ("Remember the nearest plant as Greenie.", "nearest"),
+        ("Remember the plant in front of you as Greenie.", "front"),
+        ("Remember the plant on your left as Greenie.", "left"),
+        ("Remember the plant on your right as Greenie.", "right"),
+    ):
+        result = extract_reference_constraints(text)
+        assert len(result) == 1, text
+        assert result[0]["entity_class"] == "plant"
+        assert result[0]["relation"] == relation
+        assert result[0]["bind_alias"] == "Greenie"
+
+
+def test_extracts_object_relation_for_a_different_noun_not_just_plant():
+    # Proves this is general, not a "plant"/"Greenie" special case.
+    result = extract_reference_constraints("Remember the chair in front of you as MyChair.")
+    assert result[0]["entity_class"] == "chair"
+    assert result[0]["bind_alias"] == "MyChair"
+
+
+def test_object_relation_does_not_shadow_the_person_pattern():
+    result = extract_reference_constraints("Remember the person on your left as Alice.")
+    assert len(result) == 1
+    assert result[0]["entity_class"] == "person"
+
+
+def test_object_relation_excludes_generic_pronouns_as_the_class():
+    # "the nearest one" -- a real, natural anaphoric reference back to an
+    # earlier-mentioned class -- must produce no constraint at all rather
+    # than a bogus entity_class="one" that could never match any real
+    # perception class.
+    result = extract_reference_constraints(
+        "There are two plants here - please remember the nearest one as Greenie.")
+    assert result == []
+
+
+def test_object_relation_does_not_capture_a_bare_copula_as_the_noun():
+    # Regression for a real bug caught while writing this fix: an optional
+    # leading determiner plus an open noun-capture class let the regex
+    # engine start matching at "is" itself ("The chair IS on your left").
+    # Determiner is now mandatory for object patterns specifically.
+    result = extract_reference_constraints("The chair is on your left. Remember this person as 44.")
+    assert result == []
+
+
+def test_nearest_object_pattern_tolerates_a_trailing_to_you():
+    # Live-tested this run: real Omega-authored mission text consistently
+    # added "to you" after "nearest <noun>" -- must not become an
+    # alias-lookahead gap.
+    result = extract_reference_constraints("the nearest plant to you is called Greenie.")
+    assert result[0]["relation"] == "nearest"
+    assert result[0]["entity_class"] == "plant"
+    assert result[0]["bind_alias"] == "Greenie"
 
 
 def test_bind_alias_is_never_captured_across_a_clause_break():
