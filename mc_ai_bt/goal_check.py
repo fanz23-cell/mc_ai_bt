@@ -129,9 +129,11 @@ PREDICATE_REGISTRY: dict[str, PredicateSpec] = {
     # as entity_located et al. above. observed_track_count/frames_checked (renamed
     # 2026-09-03 from min_people_count -- see node.py's own comment: the count can
     # be an OVERcount from track-ID churn, not just an undercount, so it is not a
-    # lower bound) are the skill's own evidence fields, read directly by whoever
-    # consumes the goal_spec args (e.g. query_world.py), not by this generic
-    # predicate check itself.
+    # lower bound) get a dedicated branch in _check_execution_facts below (2026-09-08,
+    # produced-data-closure round) that folds a hedged summary of them into this
+    # predicate's own CheckResult.message -- CORRECTED comment: query_world.py does
+    # NOT consume this data (confirmed by direct read, zero hits for
+    # observed_track_count/room_scanned in that file); before this round nothing did.
     "room_scanned": PredicateSpec("room_scanned", ("people",), "people", execution_only=True),
     # remember_entity (mc_embodied_skills, C.2) -- bespoke handler below (not the
     # generic PREDICATE_REGISTRY path): the evidence/world-state shape is
@@ -314,6 +316,27 @@ class GoalChecker:
         if predicate == "entity_alias_bound":
             return _entity_alias_bound_result(args, facts.get("entity_alias_bound"), source="execution facts")
 
+        if predicate == "room_scanned":
+            # 2026-09-08, produced-data-closure round: observed_track_count is
+            # confirmed (this session, direct hop-by-hop trace) to survive intact
+            # all the way to this exact point (facts["room_scanned"]) and then be
+            # discarded here -- _direct_predicate_result's own generic message
+            # ("execution facts confirms room_scanned") never interpolates it, and
+            # CheckResult's own frozen 2-field shape has nowhere else to carry it.
+            # This wraps that SAME verdict (never recomputes TRUE/FALSE/UNKNOWN)
+            # with a hedged summary when the count is present and the sweep
+            # succeeded -- see _room_scanned_result's own docstring for why this
+            # is a room_scanned-specific branch rather than a change to
+            # _direct_predicate_result itself (which many other predicates share
+            # unmodified).
+            direct = _direct_predicate_result(
+                predicate,
+                args,
+                facts.get(predicate),
+                source="execution facts",
+            )
+            return _room_scanned_result(direct, facts.get(predicate))
+
         if predicate in PREDICATE_REGISTRY:
             return _direct_predicate_result(
                 predicate,
@@ -489,6 +512,49 @@ def _direct_predicate_result(
     if state is False:
         return CheckResult(TriState.FALSE, f"{source} contradicts {predicate}")
     return CheckResult(TriState.UNKNOWN, f"{source} {predicate} fact is inconclusive")
+
+
+def _room_scanned_result(direct: CheckResult, entry: Any) -> CheckResult:
+    """room_scanned-specific message enrichment (2026-09-08, produced-data-closure
+    round). _direct_predicate_result's own generic message ("execution facts
+    confirms room_scanned") is correct but discards observed_track_count -- the
+    one piece of this skill's own evidence a person actually asked for; CheckResult
+    is a frozen 2-field (state, message) shape with nowhere else to carry it, and
+    mission.py's mark_terminal/_build_mission_outcome_envelope never receive
+    execution.facts at all, so this is the last point in the whole pipeline where
+    the count still exists in memory (confirmed this session by direct hop-by-hop
+    trace). This wraps the ALREADY-COMPUTED verdict from _direct_predicate_result
+    with a hedged summary -- it never recomputes TRUE/FALSE/UNKNOWN, and it never
+    invents a number where none exists. Deliberately scoped to room_scanned only:
+    _direct_predicate_result itself is shared by many other predicates
+    (entity_located, pose_available, contact_detected, ...) and is left untouched,
+    so none of them are affected by this change.
+
+    Hedging is deliberate, not incidental: observed_track_count is a live
+    camera-tracking count of distinct identities seen during one bounded sweep,
+    not a verified exact headcount of the room -- it can OVERcount (track-ID
+    churn re-minting a new id for someone already counted) or UNDERcount (someone
+    briefly out of every camera angle during the sweep). Never phrase this as a
+    ground-truth number of people in the room.
+    """
+    if direct.state is not TriState.TRUE:
+        return direct
+    if not isinstance(entry, dict):
+        return direct
+    count = entry.get("observed_track_count")
+    if not isinstance(count, int) or isinstance(count, bool):
+        return direct
+    identities = "distinct tracked identity" if count == 1 else "distinct tracked identities"
+    if entry.get("count_exact") is True:
+        hedge = f"counted {count} {identities} during the sweep"
+    else:
+        hedge = (
+            f"observed {count} {identities} during the sweep -- a live "
+            "camera-tracking count, not a verified exact headcount; it can "
+            "overcount (track-ID churn) or undercount (someone briefly out of "
+            "view)"
+        )
+    return CheckResult(direct.state, f"{direct.message} ({hedge})")
 
 
 def _place_predicate_check_result(

@@ -953,3 +953,96 @@ def test_human_confirmation_goal_can_use_world_state_snapshot():
     result = checker.check(goal_spec, ExecutionResult(True, "done", {}))
 
     assert result.state is TriState.TRUE
+
+
+# --- room_scanned message enrichment (2026-09-08, produced-data-closure round):
+# observed_track_count is confirmed (direct hop-by-hop trace) to survive intact
+# all the way to this predicate's own execution-facts check and then be silently
+# discarded by _direct_predicate_result's generic message -- a real, live,
+# user-facing gap ("how many people are in the room?" got a truthful "I can't
+# tell you a number" even after a real, successful physical sweep). These tests
+# assert on real CheckResult content, not just TriState, since a startswith-only
+# assertion would not have caught this exact class of bug (see this same
+# session's own CHANGE APPROVAL G postmortem for precedent).
+
+def _room_scanned_check(evidence_entry):
+    goal_spec = {"type": "structured", "predicate": "room_scanned", "args": {}}
+    execution = ExecutionResult(True, "scan_room succeeded", {"room_scanned": evidence_entry})
+    return GoalChecker().check(goal_spec, execution)
+
+
+def test_room_scanned_true_hedges_the_observed_count():
+    result = _room_scanned_check(
+        {"matched": True, "observed_track_count": 3, "frames_checked": 12, "count_exact": False}
+    )
+    assert result.state is TriState.TRUE
+    assert "execution facts confirms room_scanned" in result.message
+    assert "observed 3 distinct tracked identities" in result.message
+    assert "not a verified exact headcount" in result.message
+    assert "overcount" in result.message and "undercount" in result.message
+
+
+def test_room_scanned_true_singular_identity_grammar():
+    result = _room_scanned_check(
+        {"matched": True, "observed_track_count": 1, "frames_checked": 4, "count_exact": False}
+    )
+    assert result.state is TriState.TRUE
+    assert "observed 1 distinct tracked identity " in result.message
+    assert "identities" not in result.message
+
+
+def test_room_scanned_true_count_exact_skips_the_hedge():
+    # Forward-compatibility: count_exact is hardcoded False in every current
+    # scan_room evidence dict (per this session's own source trace), but this
+    # predicate-check code must not assume that forever -- if a future mature
+    # tracker legitimately earns an exact count, the message should say so
+    # plainly rather than hedging language that would then be misleading.
+    result = _room_scanned_check(
+        {"matched": True, "observed_track_count": 5, "frames_checked": 20, "count_exact": True}
+    )
+    assert result.state is TriState.TRUE
+    assert result.message == "execution facts confirms room_scanned (counted 5 distinct tracked identities during the sweep)"
+
+
+def test_room_scanned_true_without_count_falls_back_unchanged():
+    # Malformed/missing observed_track_count must never crash or fabricate a
+    # number -- fall back to _direct_predicate_result's own original message.
+    result = _room_scanned_check({"matched": True})
+    assert result.state is TriState.TRUE
+    assert result.message == "execution facts confirms room_scanned"
+
+
+def test_room_scanned_true_with_non_int_count_falls_back_unchanged():
+    result = _room_scanned_check({"matched": True, "observed_track_count": "three"})
+    assert result.state is TriState.TRUE
+    assert result.message == "execution facts confirms room_scanned"
+
+
+def test_room_scanned_false_is_not_enriched():
+    result = _room_scanned_check({"matched": False, "observed_track_count": 3})
+    assert result.state is TriState.FALSE
+    assert "observed" not in result.message
+    assert "distinct tracked" not in result.message
+
+
+def test_room_scanned_unknown_when_fact_missing():
+    goal_spec = {"type": "structured", "predicate": "room_scanned", "args": {}}
+    execution = ExecutionResult(True, "scan_room succeeded", {})
+    result = GoalChecker().check(goal_spec, execution)
+    assert result.state is TriState.UNKNOWN
+    assert "distinct tracked" not in result.message
+
+
+def test_other_predicates_sharing_direct_predicate_result_are_unaffected():
+    # entity_located shares _direct_predicate_result's generic path with
+    # room_scanned -- confirm the new room_scanned-only branch does not leak
+    # into it, even when its own evidence dict happens to contain a key named
+    # observed_track_count (defends against a too-broad future refactor).
+    goal_spec = {"type": "structured", "predicate": "entity_located", "args": {}}
+    execution = ExecutionResult(
+        True, "located",
+        {"entity_located": {"matched": True, "target": "33", "observed_track_count": 3}},
+    )
+    result = GoalChecker().check(goal_spec, execution)
+    assert result.state is TriState.TRUE
+    assert result.message == "execution facts confirms entity_located"
