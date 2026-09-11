@@ -448,6 +448,110 @@ def test_planning_pipeline_does_not_guess_with_two_physical_actions():
     assert result.stage == "policy"
 
 
+def _find_x_plan(goal_spec: dict) -> str:
+    return json.dumps({
+        "schema": "mc_ai_bt.plan.v1",
+        "root": {
+            "type": "Sequence",
+            "children": [
+                {"type": "Action", "skill": "search_for_entity", "args": {"target": "the water bottle"}},
+                {"type": "Condition", "predicate": "search_for_entity_completed", "args": {"target": "the water bottle"}},
+                {"type": "Action", "skill": "approach_entity", "args": {"target": "the water bottle"}},
+            ],
+        },
+        "goal_spec": goal_spec,
+    })
+
+
+def test_planning_pipeline_autofills_goal_spec_for_an_implicit_search_then_approach_plan():
+    # FOUND LIVE 2026-09-09: the exact live bug -- "find the water bottle" (search_for_entity
+    # then approach_entity, no bound alias) planned with a human-type goal_spec instead of a
+    # structured one, which used to fall straight through to PolicyGuard's rejection (same
+    # root cause as two_physical_actions above -- the ORIGINAL deterministic auto-fill
+    # deliberately never covered 2 physical actions). A prompt-only fix (teaching the model to
+    # write the correct structured goal_spec itself) was tried first and was NOT reliably
+    # followed live, so this exact shape now gets a second, deterministic enforcement layer:
+    # _fill_search_then_approach_goal_spec recognizes it and auto-fills entity_approached, the
+    # one unambiguous predicate this shape can mean, exactly like the single-physical-action
+    # auto-fill already does for its own narrower case.
+    mission, missions = _mission("find the water bottle")
+    plan_json = _find_x_plan({"type": "human", "verification": {"mode": "implicit_conversation"}})
+
+    result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
+
+    assert result.ok
+    assert json.loads(result.goal_spec_json)["predicate"] == "entity_approached"
+    assert json.loads(result.goal_spec_json)["args"]["target"] == "the water bottle"
+
+
+def test_planning_pipeline_accepts_a_structured_entity_approached_goal_spec_for_find_x():
+    # The fix: planner.py's prompt now teaches the model to write exactly this structured
+    # goal_spec for a search_for_entity + approach_entity plan targeting an unbound object --
+    # entity_approached, args={"target": <same label>}, no entity_id needed. Confirms the full
+    # pipeline (validator, grounding normalizer, PolicyGuard) actually accepts this shape
+    # end-to-end, not just that the prompt text asks for it.
+    mission, missions = _mission("find the water bottle")
+    plan_json = _find_x_plan({
+        "type": "structured",
+        "predicate": "entity_approached",
+        "args": {"target": "the water bottle"},
+        "verification": {"mode": "world_state"},
+    })
+
+    result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
+
+    assert result.ok
+    assert json.loads(result.goal_spec_json)["predicate"] == "entity_approached"
+
+
+def test_planning_pipeline_does_not_autofill_search_then_approach_for_mismatched_targets():
+    # Genuinely ambiguous -- searched for one thing, tried to approach a different one -- must
+    # still fall through to PolicyGuard's rejection, not guess which target the mission meant.
+    mission, missions = _mission("find the mug then go to the bottle")
+    plan_json = json.dumps({
+        "schema": "mc_ai_bt.plan.v1",
+        "root": {
+            "type": "Sequence",
+            "children": [
+                {"type": "Action", "skill": "search_for_entity", "args": {"target": "the mug"}},
+                {"type": "Action", "skill": "approach_entity", "args": {"target": "the bottle"}},
+            ],
+        },
+        "goal_spec": {"type": "human", "verification": {"mode": "implicit_conversation"}},
+    })
+
+    result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
+
+    assert not result.ok
+    assert result.stage == "policy"
+
+
+def test_planning_pipeline_does_not_autofill_search_then_approach_when_entity_id_already_set():
+    # An approach_entity that already carries its own entity_id is _apply_grounding_
+    # normalizer's job to validate (against context_json.caller_context.grounded_entities),
+    # not this deterministic fill's -- must decline and leave the plan for that stage instead
+    # of silently overwriting a goal_spec that might need to reject the entity_id itself.
+    mission, missions = _mission("go to 33")
+    plan_json = json.dumps({
+        "schema": "mc_ai_bt.plan.v1",
+        "root": {
+            "type": "Sequence",
+            "children": [
+                {"type": "Action", "skill": "search_for_entity", "args": {"target": "the person"}},
+                {"type": "Action", "skill": "approach_entity", "args": {"target": "the person", "entity_id": "not_a_real_id"}},
+            ],
+        },
+        "goal_spec": {"type": "human", "verification": {"mode": "implicit_conversation"}},
+    })
+
+    result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
+
+    # Rejected -- but by the grounding normalizer (a hallucinated entity_id), confirming this
+    # fill correctly stayed out of the way rather than papering over it with a goal_spec.
+    assert not result.ok
+    assert result.stage == "grounding"
+
+
 def test_planning_pipeline_does_not_guess_when_the_skill_has_multiple_result_predicates():
     mission, missions = _mission("look left")
     # look_at declares TWO result_predicates (look_at_static_completed,

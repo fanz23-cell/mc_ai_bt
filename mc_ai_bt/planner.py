@@ -601,21 +601,44 @@ def build_planner_messages(
                 # alias -> entity_id identity ONLY -- never current visibility,
                 # position, distance, or task success, all of which still require
                 # real, execution-time WorldState evidence.
-                "An `entity_id` is an opaque machine-owned identifier. It has exactly two legitimate "
-                "sources: an entry of context_json.caller_context.grounded_entities, or the result of an "
-                "earlier locate-type Action in this same plan. A name or alias the user SPOKE is never an "
-                "entity_id -- least of all one the current request is asking you to create ('remember this "
-                "person as X' makes X a NEW name: it goes in remember_person's `name` / remember_entity's "
-                "`alias`, and there is nothing yet to approach). This holds unconditionally, including when "
-                "grounded_entities is absent or empty. When grounded_entities IS present and one of its "
-                "`alias` values matches something the user said, use that entry's exact "
-                "`entity_id` value as the `entity_id` arg on approach_entity (alongside `target` as a plain "
-                "human-readable label) instead of inventing a bare class/description search. Never invent an "
-                "entity_id yourself, never copy one from a different alias than the one actually mentioned, "
-                "and never fall back to a class-based target search just because entity_id resolution might "
-                "fail at execution time -- entity_id, once supplied, is never dropped or substituted; a "
-                "genuinely unresolvable one correctly pauses the mission rather than silently approaching "
-                "the nearest same-class instance instead."
+                #
+                # FOUND LIVE 2026-09-09: full-session log analysis of a batch of "find X"
+                # missions (X = plant/bottle/mug, none a bound alias) showed the planner
+                # invariably invented a plausible-looking entity_id (e.g. "bottle_entity_id")
+                # on the approach_entity step that follows a same-plan search_for_entity --
+                # every one rejected by _apply_grounding_normalizer in planning_pipeline.py,
+                # which validates entity_id ONLY against context_json.caller_context.
+                # grounded_entities and has no other source it will ever accept for
+                # approach_entity. The wording below used to claim a second legitimate source
+                # -- "the result of an earlier locate-type Action in this same plan" -- for
+                # this exact skill; that source does not exist for approach_entity at
+                # plan-authoring time (the search has not run yet, so there is no real id to
+                # read) and the validator never special-cased it, so any entity_id reached
+                # this way was rejected 100% of the time. Removed; replaced with the actual
+                # working alternative (omit entity_id, rely on target alone).
+                "An `entity_id` is an opaque machine-owned identifier. Its only legitimate source is an "
+                "entry of context_json.caller_context.grounded_entities -- never invent one, and never copy "
+                "one from a different alias than the one actually mentioned. A name or alias the user SPOKE "
+                "is never an entity_id -- least of all one the current request is asking you to create "
+                "('remember this person as X' makes X a NEW name: it goes in remember_person's `name` / "
+                "remember_entity's `alias`, and there is nothing yet to approach). This holds "
+                "unconditionally, including when grounded_entities is absent or empty, and including when "
+                "THIS SAME plan already contains an earlier search_for_entity/locate_entity Action for the "
+                "same target: that search has not executed yet at the time you are writing this plan, so it "
+                "cannot have produced a real id for you to read -- there is no such thing as \"the id my own "
+                "not-yet-run search step will find\". In that situation the correct, fully-functional plan "
+                "OMITS entity_id entirely on the approach_entity Action that follows and supplies only "
+                "`target`, the same plain human-readable label already used in the search step; a bare "
+                "`target` (no entity_id) resolves at execution time against whatever was most recently "
+                "perceived matching that description -- exactly the just-completed search's own result, "
+                "with no id-guessing required. When grounded_entities IS present and one of its `alias` "
+                "values matches something the user said, use that entry's exact `entity_id` value as the "
+                "`entity_id` arg on approach_entity (alongside `target` as a plain human-readable label) "
+                "instead of inventing a bare class/description search. Never fall back to a class-based "
+                "target search just because a LEGITIMATE, grounded_entities-sourced entity_id's resolution "
+                "might fail at execution time -- an entity_id supplied this way is never dropped or "
+                "substituted; a genuinely unresolvable one correctly pauses the mission rather than "
+                "silently approaching the nearest same-class instance instead."
             ),
             (
                 # Identity/Grounding foundation finalization (2026-09-03, GPT re-review):
@@ -703,6 +726,40 @@ def build_planner_messages(
             ),
             (
                 _execution_only_predicate_rule()
+            ),
+            (
+                # FOUND LIVE 2026-09-09: full-session log analysis of "find X"/"go to X"
+                # missions for an object with no bound alias (search_for_entity followed by
+                # approach_entity -- exactly TWO physical actions) showed the planner
+                # consistently wrote a human-type goal_spec (verification mode
+                # implicit_conversation) instead of a structured one -- PolicyGuard
+                # correctly rejected every one of them the same way E.1's remember_* case
+                # above was rejected, and for the identical reason: _apply_deterministic_
+                # goal_spec only auto-fills the unambiguous single-physical-action case,
+                # deliberately never a two-physical-action one, so nothing rescues this
+                # shape automatically. Unlike the remember_* case, though, a correct
+                # structured goal_spec for search_for_entity + approach_entity is NOT
+                # ambiguous -- it is always the final approach_entity step's own result:
+                # entity_approached. And entity_approached's own execution-time check
+                # (decision_broker.py's _check_entity_approached) works from `target` alone,
+                # no entity_id required, resolving against whatever was most recently
+                # perceived matching that label -- exactly the just-completed search's
+                # result, the same target-only path the entity_id-sourcing rule above
+                # already established for approach_entity itself.
+                "When a plan's only physical Actions are exactly one search_for_entity/locate_entity "
+                "followed by one approach_entity for the SAME target (the ordinary shape of \"find X\"/"
+                "\"go to X\" for an object or person with no bound alias), do not default to a human-type "
+                "goal_spec. Write a structured one instead: "
+                '{"type": "structured", "predicate": "entity_approached", '
+                '"args": {"target": "<the same target label approach_entity uses>"}, '
+                '"verification": {"mode": "world_state"}}. '
+                "This is not a guess: entity_approached is exactly the outcome that plan's own final "
+                "physical Action produces, and its execution-time check works from `target` alone (no "
+                "entity_id needed) by looking at whatever was most recently perceived matching that "
+                "label -- precisely the just-completed search's own result. Only fall back to a "
+                "human-type goal_spec (verification mode implicit_conversation) when the request "
+                "genuinely has no structured predicate to anchor to, as already covered above for a "
+                "free-text description with no matching class name."
             ),
             (
                 "Never write a say node whose text states the outcome of a Condition/GoalCheck/"
@@ -818,10 +875,94 @@ def _extract_json_object(raw: str) -> dict[str, Any]:
         if start < 0:
             raise
         decoder = json.JSONDecoder()
-        value, _end = decoder.raw_decode(text[start:])
+        candidate = text[start:]
+        try:
+            value, _end = decoder.raw_decode(candidate)
+        except json.JSONDecodeError as exc2:
+            value = _recover_malformed_plan(decoder, candidate, exc2)
     if not isinstance(value, dict):
         raise ValueError("planner output must be a JSON object")
     return value
+
+
+def _strip_json_line_comments(text: str) -> str:
+    """Strip JavaScript-style "// ..." line comments from `text`, leaving a
+    literal "//" that appears inside a JSON string (e.g. a URL) untouched.
+    Walks the text once, tracking whether the scan is currently inside a
+    string literal (respecting backslash escapes), so a comment marker is
+    only recognized outside of string content.
+    """
+    out: list[str] = []
+    in_string = False
+    escape = False
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if in_string:
+            out.append(ch)
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            i += 1
+            continue
+        if ch == '"':
+            in_string = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "/" and i + 1 < n and text[i + 1] == "/":
+            while i < n and text[i] not in "\r\n":
+                i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _recover_malformed_plan(
+    decoder: json.JSONDecoder, text: str, exc: json.JSONDecodeError
+) -> dict[str, Any]:
+    """FOUND LIVE 2026-09-09: full-session log analysis showed 175/531 (~33%)
+    of ALL mission submissions that session failed with an "Expecting ','
+    delimiter" JSONDecodeError, always at the same relative position in the
+    plan. Root-caused by capturing the actual raw text around the failure:
+    the planner LLM sometimes appends a JavaScript-style "// ..." comment
+    after a value -- observed hedging about a placeholder entity_id it
+    wasn't fully sure of (e.g. `"entity_id": "bottle_entity_id"  // This
+    should be replaced with the actual entity ID found in the previous
+    step`) -- which is not legal JSON and breaks the very next delimiter the
+    parser expects. Stripping such comments (outside of string content) and
+    retrying recovers the plan without weakening validation: the stripped
+    text still has to parse as complete, valid JSON, so a plan that is
+    malformed or wrong for any OTHER reason still fails exactly as it did
+    before this function existed. A missing-comma repair at the reported
+    error position is kept as a second-line fallback for any case that
+    turns out to be a genuine single dropped comma rather than a comment.
+    """
+    stripped = _strip_json_line_comments(text)
+    if stripped != text:
+        try:
+            value, _end = decoder.raw_decode(stripped)
+            return value
+        except json.JSONDecodeError:
+            pass
+    if "Expecting ',' delimiter" in exc.msg:
+        repaired = text[: exc.pos] + "," + text[exc.pos :]
+        try:
+            value, _end = decoder.raw_decode(repaired)
+            return value
+        except json.JSONDecodeError:
+            pass
+    window_start = max(0, exc.pos - 80)
+    window_end = min(len(text), exc.pos + 80)
+    snippet = text[window_start:window_end]
+    raise ValueError(
+        f"planner produced unparseable JSON: {exc} [near: {snippet!r}]"
+    ) from exc
 
 
 def _strip_markdown_fence(text: str) -> str:

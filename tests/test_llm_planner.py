@@ -32,6 +32,113 @@ def test_llm_json_planner_extracts_json_from_model_response():
     assert model.messages[0][0] == "system"
 
 
+def test_llm_json_planner_recovers_from_a_trailing_line_comment():
+    # FOUND LIVE 2026-09-09: root-caused via full-session log analysis plus a
+    # captured raw sample -- 175/531 (~33%) of all mission submissions that
+    # session failed with an "Expecting ',' delimiter" JSONDecodeError. The
+    # actual cause: the planner LLM sometimes appends a JavaScript-style
+    # "// ..." comment after a value, hedging about a placeholder entity_id
+    # it wasn't fully sure of. This reproduces that exact shape.
+    model = FakeModel(
+        """
+        {"root":{"type":"Sequence","children":[
+         {"type":"Action","skill":"search_for_entity","args":{"target":"bottle"},"timeout_sec":30},
+         {"type":"Action","skill":"approach_entity","args":{
+           "target":"the bottle",
+           "entity_id":"bottle_entity_id"  // placeholder, replace with the real grounded id
+         },"timeout_sec":30}
+        ]},
+         "goal_spec":{"type":"human","verification":{"mode":"implicit_conversation"}}}
+        """
+    )
+
+    plan = json.loads(LlmJsonPlanner(model).plan("find the bottle", "{}"))
+
+    assert plan["root"]["type"] == "Sequence"
+    assert [child["skill"] for child in plan["root"]["children"]] == [
+        "search_for_entity",
+        "approach_entity",
+    ]
+    assert plan["root"]["children"][1]["args"]["entity_id"] == "bottle_entity_id"
+
+
+def test_llm_json_planner_comment_stripping_ignores_urls_in_strings():
+    # A literal "//" inside a real string value (e.g. a URL) must survive --
+    # the comment stripper only fires outside of string content.
+    model = FakeModel(
+        '{"root":{"type":"Action","skill":"say",'
+        '"args":{"text":"see https://example.com/path for details"}}}'
+    )
+
+    plan = json.loads(LlmJsonPlanner(model).plan("say the url", "{}"))
+
+    assert plan["root"]["args"]["text"] == "see https://example.com/path for details"
+
+
+def test_llm_json_planner_recovers_from_a_missing_comma():
+    # A genuinely dropped comma (no comment involved) is kept as a second-line
+    # fallback repair, distinct from the comment-stripping path above.
+    model = FakeModel(
+        """
+        {"root":{"type":"Sequence","children":[
+         {"type":"Action","skill":"say","args":{"text":"hi"},"timeout_sec":30}
+         {"type":"Action","skill":"approach_entity","args":{"entity_id":"x"},"timeout_sec":30}
+        ]},
+         "goal_spec":{"type":"human","verification":{"mode":"implicit_conversation"}}}
+        """
+    )
+
+    plan = json.loads(LlmJsonPlanner(model).plan("say hi then approach x", "{}"))
+
+    assert plan["root"]["type"] == "Sequence"
+    assert [child["skill"] for child in plan["root"]["children"]] == [
+        "say",
+        "approach_entity",
+    ]
+
+
+def test_llm_json_planner_still_rejects_json_broken_for_another_reason():
+    # The comma-repair path must not mask a genuinely different malformation --
+    # confirm an unrelated syntax error still raises instead of being swallowed.
+    model = FakeModel('{"root": {"type": }}')
+
+    try:
+        LlmJsonPlanner(model).plan("say hi", "{}")
+    except ValueError as exc:
+        assert "unparseable JSON" in str(exc)
+    else:
+        raise AssertionError("expected a ValueError for genuinely broken JSON")
+
+
+def test_planner_prompt_no_longer_claims_a_same_plan_locate_as_an_entity_id_source():
+    # FOUND LIVE 2026-09-09: this claim taught the model to invent a plausible-looking
+    # entity_id (e.g. "bottle_entity_id") for a same-plan search_for_entity target with no
+    # bound alias -- _apply_grounding_normalizer in planning_pipeline.py never accepts an
+    # entity_id from any source but context_json.caller_context.grounded_entities, so every
+    # such plan was rejected. The prompt must no longer claim that second source exists, and
+    # must instead say to omit entity_id and rely on target alone in that situation.
+    messages = build_planner_messages("find the water bottle", "{}")
+    system = messages[0][1]
+
+    assert "earlier locate-type Action in this same plan" not in system
+    assert "exactly two legitimate" not in system
+    assert "OMITS entity_id entirely" in system
+    assert "only legitimate source is an entry of context_json.caller_context.grounded_entities" in system
+
+
+def test_planner_prompt_teaches_a_structured_goal_spec_for_search_then_approach():
+    # FOUND LIVE 2026-09-09: companion to the entity_id fix above -- once the model stops
+    # inventing an entity_id, it still defaulted to a human-type goal_spec for a
+    # search_for_entity + approach_entity plan, which PolicyGuard correctly rejects (the
+    # deterministic auto-fill never covers a 2-physical-action plan). The prompt must now
+    # teach the one, non-ambiguous correct structured goal_spec for this exact shape.
+    messages = build_planner_messages("find the water bottle", "{}")
+    system = messages[0][1]
+
+    assert '"predicate": "entity_approached"' in system
+    assert "do not default to a human-type" in system
+
+
 def test_planner_prompt_names_allowed_skills_and_constraints():
     messages = build_planner_messages("go to test_place", "{}")
     system = messages[0][1]

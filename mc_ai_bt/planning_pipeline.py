@@ -48,6 +48,95 @@ def _physical_actions_in(node: Any) -> list[dict[str, Any]]:
     return found
 
 
+_SEARCH_THEN_APPROACH_LOCATE_SKILLS = ("search_for_entity", "locate_entity")
+
+
+def _sequential_physical_actions_in(node: Any) -> list[dict[str, Any]]:
+    """Like _physical_actions_in, but does NOT recurse into Fallback/Parallel
+    children -- those represent alternative or concurrent branches, not an
+    unconditional "this happens, then that happens" sequence. Used only by
+    _fill_search_then_approach_goal_spec below to confirm its two physical
+    actions are genuinely, unconditionally sequenced before treating the
+    second action's success as depending on the first having just run --
+    if either action turns out to live inside a Fallback/Parallel instead,
+    this collector simply will not find it, and the fill is correctly
+    skipped (falls through to PolicyGuard's existing rejection)."""
+    found: list[dict[str, Any]] = []
+    if not isinstance(node, dict):
+        return found
+    node_type = node.get("type")
+    if node_type == "Sequence":
+        for child in node.get("children", []) or []:
+            found.extend(_sequential_physical_actions_in(child))
+        return found
+    if node_type in {"Retry", "Timeout"}:
+        return _sequential_physical_actions_in(node.get("child"))
+    if node_type == "Action":
+        skill = str(node.get("skill") or "")
+        if skill in PHYSICAL_SKILLS:
+            found.append(node)
+    return found
+
+
+def _fill_search_then_approach_goal_spec(plan: dict[str, Any]) -> bool:
+    """FOUND LIVE 2026-09-09: full-session log analysis of "find X"/"go to X"
+    missions for an object or person with no bound alias -- exactly the
+    search_for_entity/locate_entity + approach_entity shape
+    _apply_deterministic_goal_spec's own docstring already names as one it
+    deliberately leaves alone (2 physical actions) -- showed the planner
+    consistently failed to supply a structured goal_spec on its own, and a
+    prompt-only fix (teaching the model the correct structured goal_spec to
+    write) was NOT reliably followed live. This is the SAME "instruction
+    compliance is not a guarantee" lesson _apply_grounding_normalizer's own
+    docstring already drew from an analogous case -- the fix is a second
+    deterministic enforcement/fill layer, not a stronger prompt.
+
+    Unlike the general 2+-physical-actions case, THIS specific shape is not
+    a guess: when the plan's only two physical actions are (1) a locate-type
+    search for a target and (2) approach_entity for the SAME target (by
+    exact normalized label match) with no entity_id of its own, the mission
+    succeeds if and only if that approach actually happened -- there is
+    exactly one correct predicate, entity_approached, and its own
+    execution-time check (decision_broker.py's _check_entity_approached)
+    already works from `target` alone, no entity_id required, resolving
+    against whatever was most recently perceived matching that label --
+    precisely the just-completed search's own result. Declines (returns
+    False, changes nothing) for anything less clean: not exactly two
+    physical actions, either skill name wrong, targets missing or not an
+    exact match, an entity_id already present on the approach (that path is
+    _apply_grounding_normalizer's job, not this one's), or the two actions
+    not genuinely, unconditionally sequenced (see
+    _sequential_physical_actions_in above) -- every one of those falls
+    through to PolicyGuard's existing rejection, exactly as before this
+    function existed."""
+    sequential = _sequential_physical_actions_in(plan.get("root"))
+    if len(sequential) != 2:
+        return False
+    first, second = sequential
+    if str(first.get("skill") or "") not in _SEARCH_THEN_APPROACH_LOCATE_SKILLS:
+        return False
+    if str(second.get("skill") or "") != "approach_entity":
+        return False
+    second_args = second.get("args") if isinstance(second.get("args"), dict) else {}
+    if str(second_args.get("entity_id") or "").strip():
+        return False
+    first_args = first.get("args") if isinstance(first.get("args"), dict) else {}
+    first_target = str(first_args.get("target") or "").strip()
+    second_target = str(second_args.get("target") or "").strip()
+    if not first_target or not second_target:
+        return False
+    if _normalize_alias(first_target) != _normalize_alias(second_target):
+        return False
+
+    plan["goal_spec"] = {
+        "type": "structured",
+        "predicate": "entity_approached",
+        "args": {"target": second_target},
+        "verification": {"mode": "world_state"},
+    }
+    return True
+
+
 def _all_actions_in(node: Any) -> list[dict[str, Any]]:
     """Every {"type": "Action"} node anywhere in the tree, regardless of
     skill -- broader than _physical_actions_in above, since entity_id
@@ -1157,13 +1246,26 @@ def _apply_deterministic_goal_spec(plan: dict[str, Any]) -> None:
     _canonicalize_redundant_locate_prefix, called earlier in plan(), which
     actually strips those actions from the tree -- so by the time this
     function runs, a matching plan already has exactly one physical Action
-    and needs no special case here at all.)"""
+    and needs no special case here at all.)
+
+    FOUND LIVE 2026-09-09: "2+ physical actions -> always left alone" above
+    turned out to have exactly one more genuinely unambiguous exception:
+    search_for_entity/locate_entity immediately followed by approach_entity
+    for the same target (the ordinary "find X"/"go to X" shape for an
+    object/person with no bound alias) -- see
+    _fill_search_then_approach_goal_spec's own docstring for why this
+    specific 2-action case is not a guess either. Tried first, since it only
+    ever fires on a real 2-physical-action plan the code below would
+    otherwise leave untouched."""
     goal_spec = plan.get("goal_spec")
     if not isinstance(goal_spec, dict):
         return
     verification = goal_spec.get("verification") if isinstance(goal_spec.get("verification"), dict) else {}
     is_implicit = goal_spec.get("type") == "human" or str(verification.get("mode") or "") == "implicit_conversation"
     if not is_implicit:
+        return
+
+    if _fill_search_then_approach_goal_spec(plan):
         return
 
     actions = _physical_actions_in(plan.get("root"))
