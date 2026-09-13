@@ -92,6 +92,7 @@ PREDICATE_REGISTRY: dict[str, PredicateSpec] = {
     "pose_held": PredicateSpec("pose_held", ("robot", "objects", "people", "interactions"), "robot", execution_only=True),
     "oscillation_completed": PredicateSpec("oscillation_completed", ("robot", "objects", "people", "interactions"), "robot", execution_only=True),
     "retracted": PredicateSpec("retracted", ("robot",), "robot", execution_only=True),
+    "touch_completed": PredicateSpec("touch_completed", ("robot", "objects", "people", "interactions"), "robot", execution_only=True),
     "human_confirmation": PredicateSpec("human_confirmation", ("tasks",), "tasks", execution_only=True),
     # locate_entity/get_pose/search_for_entity/check_relation (mc_embodied_skills,
     # RosActionSkillProvider) populate these via the generic PREDICATE_REGISTRY path

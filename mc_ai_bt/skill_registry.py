@@ -273,6 +273,16 @@ DEFAULT_SKILLS: dict[str, SkillSpec] = {
         ("retracted",),
         realtime=True,
     ),
+    "touch_entity": SkillSpec(
+        "touch_entity",
+        ("right_arm",),
+        "Composed interaction: reach to an entity/object's live position, then retract. "
+        "No force/contact sensor exists on this robot -- completion means the arm reached "
+        "the target's commanded position, never a verified physical touch.",
+        {"target": "entity|object|person", "arm": "left|right"},
+        ("touch_completed",),
+        realtime=True,
+    ),
     "go_to_place": SkillSpec(
         "go_to_place",
         ("base",),
