@@ -439,6 +439,69 @@ def test_world_snapshot_can_confirm_person_named_when_execution_fact_missing():
     assert result.state is TriState.TRUE
 
 
+# --- Section 7 physical verification producer (2026-09-13, doc 61/70) -------
+#
+# The consumption side (this same generic PREDICATE_REGISTRY fallthrough
+# above) was already built and tested; the missing piece was a real
+# PRODUCER writing scope="robot", key="reach_completed" (and siblings) --
+# now built in mc_embodied_skills' RosActionSkillProvider.
+# _write_skill_evidence_facts. This proves the two sides actually connect:
+# a snapshot shaped exactly the way that producer writes it (semantic_
+# verified forced True, same field names the skill's own evidence carried)
+# resolves reach_completed to TRUE through the real GoalChecker, with NO
+# execution fact present at all -- exactly the "world state, not self-
+# report" path this predicate was always supposed to have.
+
+def test_world_snapshot_can_confirm_reach_completed_via_the_new_physical_verification_producer():
+    world_json = json.dumps(
+        {
+            "facts": {
+                "robot": {
+                    "reach_completed": {
+                        "value": {
+                            "arm": "right", "target": "alice", "matched": True,
+                            "provider": "ros_action", "semantic_verified": True,
+                        }
+                    }
+                }
+            }
+        }
+    )
+    checker = GoalChecker(lambda _scopes, _max_age: world_json)
+    goal_spec = {"type": "structured", "predicate": "reach_completed", "args": {"target": "alice"}}
+
+    result = checker.check(goal_spec, ExecutionResult(True, "reach_to: reached", {}))
+
+    assert result.state is TriState.TRUE
+
+
+def test_world_snapshot_reach_completed_stays_unknown_without_semantic_verified():
+    # The self-report shape (semantic_verified always False) must still
+    # resolve to UNKNOWN even when it reaches world state some other way --
+    # proving _direct_predicate_result's own semantic_verified gate, not just
+    # the producer's own honesty, is what is actually doing the work here.
+    world_json = json.dumps(
+        {
+            "facts": {
+                "robot": {
+                    "reach_completed": {
+                        "value": {
+                            "arm": "right", "target": "alice", "matched": True,
+                            "semantic_verified": False,
+                        }
+                    }
+                }
+            }
+        }
+    )
+    checker = GoalChecker(lambda _scopes, _max_age: world_json)
+    goal_spec = {"type": "structured", "predicate": "reach_completed", "args": {"target": "alice"}}
+
+    result = checker.check(goal_spec, ExecutionResult(True, "reach_to: reached", {}))
+
+    assert result.state is TriState.UNKNOWN
+
+
 def test_search_for_entity_completed_confirmed_by_execution_fact():
     goal_spec = {"type": "structured", "predicate": "search_for_entity_completed", "args": {"target": "widget"}}
     execution = ExecutionResult(

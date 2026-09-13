@@ -83,16 +83,31 @@ def world_fact_updates_for_execution(facts: dict[str, Any]) -> tuple[WorldFactUp
             )
         )
 
+    # Section 7 physical verification producer (2026-09-13, doc 61/70):
+    # reach_completed/retracted/pose_held/axis_aligned/axis_motion_completed/
+    # oscillation_completed are now written AUTHORITATIVELY, straight to this
+    # exact same (scope="robot", key=<predicate>) address, by
+    # mc_embodied_skills itself (RosActionSkillProvider._write_skill_evidence_
+    # facts) the instant the underlying ROS action genuinely succeeds -- with
+    # semantic_verified forced True, a real claim, not the skill's own
+    # self-report. `facts` here is that SAME skill's own returned evidence
+    # dict, which still (honestly) carries semantic_verified=False for these
+    # keys (see _reach_to and friends' own hardcoded False) -- echoing it
+    # here, AFTER mc_embodied_skills' own producer already ran, with
+    # merge=False, would silently CLOBBER the real, verified fact back to an
+    # unverified one on every single successful call. These six are
+    # deliberately EXCLUDED from this echo loop for that reason.
+    #
+    # contact_detected/target_state_changed/distance_maintained have no
+    # independent producer (no force/torque/contact sensor on this robot;
+    # target-state and distance-maintained claims are unimplemented) -- for
+    # those three, echoing the skill's own self-report here is still the only
+    # source there is, unchanged from before this fix, and still correctly
+    # stays semantic_verified=False (UNKNOWN downstream), never a regression.
     for key in (
-        "reach_completed",
         "contact_detected",
         "target_state_changed",
-        "axis_aligned",
-        "axis_motion_completed",
         "distance_maintained",
-        "pose_held",
-        "oscillation_completed",
-        "retracted",
     ):
         value = facts.get(key)
         if isinstance(value, dict) and value:

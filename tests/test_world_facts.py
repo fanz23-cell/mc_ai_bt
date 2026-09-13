@@ -64,12 +64,38 @@ def test_world_fact_updates_map_embodied_skill_evidence():
     )
 
     addresses = {(update.scope, update.key) for update in updates}
+    # reach_completed is deliberately NOT echoed here (Section 7, doc 61/70):
+    # mc_embodied_skills' own RosActionSkillProvider._write_skill_evidence_
+    # facts now writes it AUTHORITATIVELY, straight to this exact address,
+    # with semantic_verified forced True the instant the real ROS action
+    # succeeds -- echoing the skill's own still-False self-report here too
+    # would clobber that real fact right back to unverified on every call.
+    # contact_detected has no independent producer (no contact sensor), so
+    # it's still echoed here unchanged, still correctly semantic_verified=False.
     assert addresses == {
-        ("robot", "reach_completed"),
         ("robot", "contact_detected"),
         ("entities", "following"),
         ("entities", "entity_at_place"),
     }
+
+
+def test_world_fact_updates_does_not_echo_the_position_only_verifiable_predicates():
+    # The full family mc_embodied_skills' own producer now covers directly
+    # (doc 61/70's _POSITION_ONLY_VERIFIABLE_PREDICATES) -- none of them
+    # should come back out of this function at all, regardless of what a
+    # skill's own (still-unverified) self-report says.
+    updates = world_fact_updates_for_execution(
+        {
+            "reach_completed": {"arm": "right", "matched": True},
+            "retracted": {"arm": "left", "matched": True},
+            "pose_held": {"arm": "right", "matched": True},
+            "axis_aligned": {"arm": "right", "axis": "x", "matched": True},
+            "axis_motion_completed": {"arm": "right", "axis": "x", "matched": True},
+            "oscillation_completed": {"arm": "right", "axis": "z", "matched": True},
+        }
+    )
+
+    assert updates == ()
 
 
 def test_world_fact_updates_map_person_named_to_a_separate_scope():
