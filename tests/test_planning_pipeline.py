@@ -255,8 +255,21 @@ def test_planning_pipeline_still_drops_a_redundant_look_at_when_a_constraint_sup
 
 def test_planning_pipeline_does_not_drop_a_look_at_before_a_terminal_with_an_already_specific_entity_id():
     # remember_entity already specifies its own entity_id (a MORE specific
-    # disambiguation than anything look_at could add) -- left completely
-    # untouched (still 2 physical actions, still policy-rejected).
+    # disambiguation than anything look_at could add) -- _canonicalize_
+    # redundant_locate_prefix correctly leaves look_at in the tree (still 2
+    # physical actions after that step, proving this test's own original
+    # concern -- did NOT get silently dropped).
+    #
+    # UPDATED 2026-09-13 (see 62_CHANGE_APPROVAL_PLANNER_GOALSPEC_ENABLING_
+    # SEQUENCE.md): this used to assert the mission then fell through to
+    # policy rejection, back when nothing existed to fill a goal_spec for a
+    # 2-physical-action plan at all. _fill_enabling_sequence_goal_spec now
+    # correctly recognizes look_at (no target of its own to conflict with
+    # anything) followed by one terminal action with exactly one result
+    # predicate (remember_entity -> entity_alias_bound) as unambiguous --
+    # the entity_id here is already grounding-normalizer-approved by the
+    # time this fill runs (context_json's own grounded_entities carries it),
+    # so there is nothing left for this fill to guess about.
     mission, missions = _mission(
         "go check on 33",
         context_json=_grounded_context({"alias": "33", "entity_id": "person_A"}),
@@ -269,8 +282,9 @@ def test_planning_pipeline_does_not_drop_a_look_at_before_a_terminal_with_an_alr
 
     result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
 
-    assert not result.ok
-    assert result.stage == "policy"
+    assert result.ok, result.message
+    goal_spec = json.loads(result.goal_spec_json)
+    assert goal_spec["predicate"] == "entity_alias_bound"
 
 
 def test_planning_pipeline_preserves_an_explicit_look_instruction_as_a_real_action():
@@ -279,12 +293,19 @@ def test_planning_pipeline_preserves_an_explicit_look_instruction_as_a_real_acti
     # two real, distinct user intentions -- turn left, THEN remember
     # whoever you then see. The look_at here is an EXPLICIT physical
     # action the user asked for, not planner filler -- has_explicit_look_
-    # instruction recognizes "Look to your left" and keeps it in the tree.
-    # With 2 real physical actions and only an implicit goal_spec, this
-    # correctly reaches PolicyGuard's rejection rather than a bare
-    # look_at(left) x1 -- proving look_at survived canonicalization intact
+    # instruction recognizes "Look to your left" and keeps it in the tree
     # (a silently-dropped look_at would instead leave exactly 1 physical
-    # action, and this plan would succeed).
+    # action -- this plan's bt_json below proves it survived).
+    #
+    # UPDATED 2026-09-13 (see 62_CHANGE_APPROVAL_PLANNER_GOALSPEC_ENABLING_
+    # SEQUENCE.md): this used to assert the mission then fell through to
+    # policy rejection, back when nothing existed to fill a goal_spec for a
+    # 2-physical-action plan at all -- exactly the real, live-reproduced gap
+    # (see z——doc/FINAL_100_PERCENT_DELIVERY_2026-09-12/48_..., a real
+    # "look_at, remember_person" rejection from the production mission
+    # journal) this fix closes. Both physical actions survive into the BT
+    # (proving look_at was never dropped), and the mission now succeeds on
+    # remember_entity's own predicate.
     mission, missions = _mission("Look to your left, then remember this person as 44.")
     plan_json = _implicit_plan_with_actions([
         {"type": "Action", "skill": "look_at", "args": {"direction": "left"}},
@@ -293,9 +314,11 @@ def test_planning_pipeline_preserves_an_explicit_look_instruction_as_a_real_acti
 
     result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
 
-    assert not result.ok
-    assert result.stage == "policy"
-    assert "physical skill" in result.message
+    assert result.ok, result.message
+    bt = json.loads(result.bt_json)
+    assert [child["skill"] for child in bt["children"]] == ["look_at", "remember_entity"]
+    goal_spec = json.loads(result.goal_spec_json)
+    assert goal_spec["predicate"] == "entity_alias_bound"
 
 
 def test_planning_pipeline_still_drops_a_look_at_with_no_explicit_instruction_of_its_own():
@@ -558,6 +581,136 @@ def test_planning_pipeline_does_not_guess_when_the_skill_has_multiple_result_pre
     # animation_played, see skill_registry.py) -- genuinely ambiguous which
     # one a mission meant, must not guess either one.
     plan_json = _implicit_plan_with_single_action("look_at", {"direction": "left"})
+
+    result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
+
+    assert not result.ok
+    assert result.stage == "policy"
+
+
+# --- _fill_enabling_sequence_goal_spec (2026-09-13, see z——doc/
+# FINAL_100_PERCENT_DELIVERY_2026-09-12/
+# 62_CHANGE_APPROVAL_PLANNER_GOALSPEC_ENABLING_SEQUENCE.md): real cases pulled
+# directly from the production mission journal (context/ai_bt_missions.jsonl),
+# not invented -- see that CHANGE APPROVAL for the exact historical counts.
+
+def test_planning_pipeline_fills_goal_spec_for_look_at_then_reach_to():
+    # THE real, live-reproduced P1 blocker (doc 48): "Reach your hand toward
+    # the person in front of you" planned as look_at + reach_to and got
+    # rejected for exactly this reason, twice, through the real Chat entry
+    # point. look_at has no `target` of its own (direction-only) so there is
+    # nothing to conflict with reach_to's target.
+    mission, missions = _mission("Reach your hand toward the person in front of you.")
+    plan_json = _implicit_plan_with_actions([
+        {"type": "Action", "skill": "look_at", "args": {"direction": "front"}},
+        {"type": "Action", "skill": "reach_to", "args": {"target": "the person", "arm": "right"}},
+    ])
+
+    result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
+
+    assert result.ok, result.message
+    goal_spec = json.loads(result.goal_spec_json)
+    assert goal_spec["predicate"] == "reach_completed"
+    assert goal_spec["args"]["target"] == "the person"
+
+
+def test_planning_pipeline_fills_goal_spec_for_approach_entity_then_reach_to():
+    # directive-required benchmark case: approach -> reach, same target.
+    mission, missions = _mission("Walk up to the person and reach toward them.")
+    plan_json = _implicit_plan_with_actions([
+        {"type": "Action", "skill": "approach_entity", "args": {"target": "the person"}},
+        {"type": "Action", "skill": "reach_to", "args": {"target": "the person", "arm": "right"}},
+    ])
+
+    result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
+
+    assert result.ok, result.message
+    assert json.loads(result.goal_spec_json)["predicate"] == "reach_completed"
+
+
+def test_planning_pipeline_fills_goal_spec_for_search_then_point_at():
+    # Real, 5x-recurring historical shape (search_for_entity, point_at) --
+    # NOT the approach_entity-specific narrow fill above. Depends on
+    # point_at's own result_predicates having been trimmed to exactly one
+    # (animation_played) in the same CHANGE APPROVAL -- with the old, dead
+    # "point_at" entry still present this would still correctly decline
+    # (2 result_predicates), proving the two fixes are genuinely
+    # complementary, not redundant.
+    mission, missions = _mission("Find a person in the room and point at them.")
+    plan_json = _implicit_plan_with_actions([
+        {"type": "Action", "skill": "search_for_entity", "args": {"target": "a person"}},
+        {"type": "Action", "skill": "point_at", "args": {"target": "a person"}},
+    ])
+
+    result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
+
+    assert result.ok, result.message
+    assert json.loads(result.goal_spec_json)["predicate"] == "animation_played"
+
+
+def test_planning_pipeline_fills_goal_spec_for_a_three_step_enabling_chain():
+    # Real historical shape: 3 physical actions, all enabling-type except
+    # the last -- generalizes beyond the search_then_approach fill's
+    # hardcoded 2-action shape.
+    mission, missions = _mission("Go to the person known as 33, face them, and locate them precisely.")
+    plan_json = _implicit_plan_with_actions([
+        {"type": "Action", "skill": "approach_entity", "args": {"target": "33"}},
+        {"type": "Action", "skill": "face_entity", "args": {"target": "33"}},
+        {"type": "Action", "skill": "locate_entity", "args": {"target": "33"}},
+    ])
+
+    result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
+
+    assert result.ok, result.message
+    assert json.loads(result.goal_spec_json)["predicate"] == "entity_located"
+
+
+def test_planning_pipeline_does_not_guess_reach_to_then_retract():
+    # Directive-required negative case: retract has its OWN real predicate
+    # ("retracted"), so it is deliberately NOT in _ENABLING_SEQUENCE_SKILLS
+    # -- reach_to preceding it is a substantive action, not merely enabling,
+    # and there are genuinely two plausible terminal candidates
+    # (reach_completed vs retracted). Must fall through to rejection
+    # unchanged, exactly like before this fix existed.
+    mission, missions = _mission("Reach toward the object, then retract your arm.")
+    plan_json = _implicit_plan_with_actions([
+        {"type": "Action", "skill": "reach_to", "args": {"target": "the object", "arm": "right"}},
+        {"type": "Action", "skill": "retract", "args": {"arm": "right"}},
+    ])
+
+    result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
+
+    assert not result.ok
+    assert result.stage == "policy"
+
+
+def test_planning_pipeline_does_not_guess_enabling_sequence_with_mismatched_targets():
+    # Same safety property as the search_then_approach fill: an enabling
+    # action with its OWN target that disagrees with the terminal's target
+    # is genuinely suspicious, not merely enabling -- must not guess which
+    # one the mission meant.
+    mission, missions = _mission("Find the mug, then reach toward the cup.")
+    plan_json = _implicit_plan_with_actions([
+        {"type": "Action", "skill": "search_for_entity", "args": {"target": "the mug"}},
+        {"type": "Action", "skill": "reach_to", "args": {"target": "the cup", "arm": "right"}},
+    ])
+
+    result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
+
+    assert not result.ok
+    assert result.stage == "policy"
+
+
+def test_planning_pipeline_does_not_guess_when_an_enabling_candidate_precedes_an_ambiguous_terminal():
+    # An enabling prefix ahead of a terminal with 2+ result_predicates is
+    # still exactly as ambiguous as the bare single-action case -- must not
+    # guess which of look_at's own two predicates a trailing look_at means
+    # either, just because something enabling-shaped came before it.
+    mission, missions = _mission("Turn toward the person, then look left.")
+    plan_json = _implicit_plan_with_actions([
+        {"type": "Action", "skill": "face_entity", "args": {"target": "the person"}},
+        {"type": "Action", "skill": "look_at", "args": {"direction": "left"}},
+    ])
 
     result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
 

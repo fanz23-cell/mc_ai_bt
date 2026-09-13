@@ -237,22 +237,36 @@ def test_policy_accepts_look_at_and_point_at_skills():
     assert PolicyGuard().check(point).ok
 
 
-def test_policy_rejects_look_at_paired_with_point_at_predicate():
+def test_policy_rejects_look_at_paired_with_reach_completed_predicate():
     # The specific class of bug the derive-from-registry fix catches: a
     # non-voice skill's result predicate must actually be one of ITS OWN
     # declared predicates, not another physical skill's.
+    #
+    # UPDATED 2026-09-13 (see 62_CHANGE_APPROVAL_PLANNER_GOALSPEC_ENABLING_
+    # SEQUENCE.md): this used to pair look_at with "point_at" -- point_at's
+    # own result_predicates has since been trimmed to just
+    # ("animation_played",) (the bare "point_at" predicate had zero real
+    # evaluator anywhere in this codebase, confirmed by direct grep, and
+    # was silently blocking the deterministic goal_spec fill from ever
+    # firing for a bare point_at plan). "point_at" is therefore no longer
+    # claimed by ANY skill's result_predicates, so PREDICATE_TO_SKILLS no
+    # longer has anything to align it against -- this specific test's own
+    # mechanism (a predicate claimed by a DIFFERENT physical skill) needs a
+    # predicate that is still actually claimed by some other skill;
+    # "reach_completed" (reach_to's own, untouched) preserves the exact
+    # same test intent.
     mismatched = _plan(
         {"type": "Action", "skill": "look_at", "args": {"direction": "left_up"}},
         {
             "type": "structured",
-            "predicate": "point_at",
+            "predicate": "reach_completed",
             "args": {"target": "test_object"},
             "verification": {"mode": "action_result"},
         },
     )
     result = PolicyGuard().check(mismatched)
     assert not result.ok
-    assert any("point_at" in error and "does not match" in error for error in result.errors)
+    assert any("reach_completed" in error and "does not match" in error for error in result.errors)
 
 
 def test_policy_rejects_invalid_look_at_direction():

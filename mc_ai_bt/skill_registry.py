@@ -508,9 +508,25 @@ DEFAULT_SKILLS: dict[str, SkillSpec] = {
         ("body",),
         "Compatibility wrapper that points at an arbitrary target.",
         {"target": "object|place|x/y/z"},
-        # Same reasoning as look_at above -- skill_adapters.py's point_at
-        # dispatch also writes evidence["animation_played"]="point_at".
-        ("point_at", "animation_played"),
+        # CORRECTED 2026-09-13 (see z——doc/FINAL_100_PERCENT_DELIVERY_2026-09-12/
+        # 62_CHANGE_APPROVAL_PLANNER_GOALSPEC_ENABLING_SEQUENCE.md): this used to
+        # list "point_at" alongside "animation_played", on the same reasoning as
+        # look_at above (skill_adapters.py's point_at dispatch does write
+        # evidence["point_at"]=... in addition to animation_played -- that write
+        # is unaffected by this change and stays). But unlike animation_played
+        # (two real evaluators in goal_check.py), a bare "point_at" predicate has
+        # ZERO evaluator anywhere in this codebase -- confirmed by direct grep,
+        # not assumed -- so a goal_spec using it could never resolve past
+        # UNKNOWN, and its presence here also made point_at's own
+        # result_predicates length 2, which silently blocked the single-physical-
+        # action deterministic goal_spec fill (planning_pipeline.py) from ever
+        # firing for a plan whose only physical action is a bare point_at, since
+        # that fill requires exactly one result_predicate to avoid guessing.
+        # Removing the dead entry does not change any CURRENT behavior for a
+        # mission that already declared "point_at" as its goal_spec predicate
+        # (it always resolved UNKNOWN before too) -- it only unblocks the
+        # deterministic fill onto the one predicate that is actually checkable.
+        ("animation_played",),
         dispatch="dedicated",
     ),
     "come_to_me": SkillSpec(

@@ -137,6 +137,97 @@ def _fill_search_then_approach_goal_spec(plan: dict[str, Any]) -> bool:
     return True
 
 
+# 2026-09-13 (see z——doc/FINAL_100_PERCENT_DELIVERY_2026-09-12/
+# 62_CHANGE_APPROVAL_PLANNER_GOALSPEC_ENABLING_SEQUENCE.md): every skill safe to
+# treat as a purely preparatory step ahead of a plan's real terminal action --
+# orientation/gaze or perception acquisition, neither of which has any
+# independent "mission accomplished" meaning of its own once something else
+# follows. Deliberately excludes any skill with its own substantive,
+# independently-plausible-as-the-whole-mission completion meaning (reach_to,
+# retract, hold_pose, touch_entity, oscillate, remember_*, scan_room,
+# simple_move, point_at, play_animation, ...) -- those are never safe to
+# demote to "merely enabling" just because something happens to follow them in
+# the same plan. `go_to_place` is deliberately NOT here despite one real
+# historical "go there, then scan the room" case this would have covered:
+# unlike approach_entity (only ever a means to reach an entity the mission
+# already names), a bare go_to_place is itself frequently the ENTIRE point of
+# a real mission ("go to the kitchen") -- two pre-existing tests
+# (test_planning_pipeline_does_not_guess_with_two_physical_actions,
+# test_planning_pipeline_does_not_guess_when_remember_entity_follows_a_non_locate_action)
+# already encode this exact design decision deliberately, predating this
+# change; respecting it here rather than quietly overriding it for one
+# historical occurrence. A sequence containing go_to_place (or any other
+# excluded skill) anywhere but last still falls through to PolicyGuard's
+# existing rejection, unchanged.
+_ENABLING_SEQUENCE_SKILLS = frozenset({
+    "look_at", "look_at_static", "track_with_gaze",
+    "face_entity", "track_entity", "track_frame",
+    "search_for_entity", "locate_entity", "get_pose",
+    "approach_entity",
+})
+
+
+def _fill_enabling_sequence_goal_spec(plan: dict[str, Any]) -> bool:
+    """Real, live-confirmed gap beyond _fill_search_then_approach_goal_spec's
+    own narrow shape (see this doc's own CHANGE APPROVAL for the historical
+    evidence, drawn directly from context/ai_bt_missions.jsonl's real rejected-
+    mission journal, not invented cases): a real "look_at" then "reach_to" plan
+    ("Reach your hand toward the person in front of you") and a real "look_at"
+    then "remember_person" plan ("Find the person in front of you and remember
+    them as 33") both got the identical implicit-verification rejection this
+    whole deterministic-fill mechanism exists to close, and neither is the
+    2-action approach_entity-specific shape the function above covers.
+
+    Generalizes the same "not a guess" reasoning to an UNCONDITIONAL sequence
+    of any length whose LAST physical action has exactly one result_predicate
+    (the ORIGINAL single-action fill's own criterion, just no longer requiring
+    every OTHER action to be absent) and every action BEFORE it is drawn from
+    _ENABLING_SEQUENCE_SKILLS above -- skills with no competing claim to being
+    the mission's real point. The terminal action's own predicate is the one
+    unambiguous success criterion in exactly the same sense the single-action
+    fill already established: there is only one physical action whose result
+    the mission could sensibly be judged by, the others are there to put the
+    robot/camera in the right place/orientation first.
+
+    Same-target safety check as the function above, generalized: for each
+    enabling action that itself declares a non-empty `args.target`, it must
+    normalized-match the terminal action's own `args.target` (empty-target
+    enabling actions, e.g. go_to_place's `place`-only args or look_at's
+    `direction`-only args, have nothing to compare and are unaffected). This
+    is what keeps a genuinely suspicious plan -- e.g. searching for one thing
+    and then approaching an unrelated other one -- falling through to
+    PolicyGuard's existing rejection exactly as before, not silently guessing
+    which target the mission actually meant."""
+    sequential = _sequential_physical_actions_in(plan.get("root"))
+    if len(sequential) < 2:
+        return False
+    enabling, terminal = sequential[:-1], sequential[-1]
+    for action in enabling:
+        if str(action.get("skill") or "") not in _ENABLING_SEQUENCE_SKILLS:
+            return False
+
+    terminal_skill = str(terminal.get("skill") or "")
+    spec = DEFAULT_SKILLS.get(terminal_skill)
+    if spec is None or len(spec.result_predicates) != 1:
+        return False
+
+    terminal_args = terminal.get("args") if isinstance(terminal.get("args"), dict) else {}
+    terminal_target = str(terminal_args.get("target") or "").strip()
+    for action in enabling:
+        action_args = action.get("args") if isinstance(action.get("args"), dict) else {}
+        enabling_target = str(action_args.get("target") or "").strip()
+        if enabling_target and _normalize_alias(enabling_target) != _normalize_alias(terminal_target):
+            return False
+
+    plan["goal_spec"] = {
+        "type": "structured",
+        "predicate": spec.result_predicates[0],
+        "args": dict(terminal_args),
+        "verification": {"mode": "world_state"},
+    }
+    return True
+
+
 def _all_actions_in(node: Any) -> list[dict[str, Any]]:
     """Every {"type": "Action"} node anywhere in the tree, regardless of
     skill -- broader than _physical_actions_in above, since entity_id
@@ -1256,7 +1347,23 @@ def _apply_deterministic_goal_spec(plan: dict[str, Any]) -> None:
     _fill_search_then_approach_goal_spec's own docstring for why this
     specific 2-action case is not a guess either. Tried first, since it only
     ever fires on a real 2-physical-action plan the code below would
-    otherwise leave untouched."""
+    otherwise leave untouched.
+
+    FOUND LIVE 2026-09-13 (real mission-journal evidence, not a synthetic
+    case): the above still left a large real class of common, unambiguous
+    multi-action plans falling through to rejection -- "look_at, reach_to"
+    ("Reach your hand toward the person in front of you"), "look_at,
+    remember_person" ("Find the person in front of you and remember them as
+    33"), and reordered/longer chains of the same shape the narrow fill above
+    does not cover (any order/count of pure target-acquisition/orientation
+    steps ahead of one terminal action). _fill_enabling_sequence_goal_spec
+    generalizes the same "exactly one action's result could sensibly be the
+    mission's success criterion" reasoning to any length of leading
+    ENABLING-only steps -- see its own docstring for the exact allowlist and
+    the same-target safety check that keeps a genuinely suspicious plan (e.g.
+    searching for one thing then approaching an unrelated other one) falling
+    through unchanged. Tried after the narrower, longer-established fill
+    above (never overrides it), before the single-action case below."""
     goal_spec = plan.get("goal_spec")
     if not isinstance(goal_spec, dict):
         return
@@ -1266,6 +1373,8 @@ def _apply_deterministic_goal_spec(plan: dict[str, Any]) -> None:
         return
 
     if _fill_search_then_approach_goal_spec(plan):
+        return
+    if _fill_enabling_sequence_goal_spec(plan):
         return
 
     actions = _physical_actions_in(plan.get("root"))
