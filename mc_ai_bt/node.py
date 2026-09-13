@@ -143,7 +143,6 @@ class AiBtNode(Node):
         self._query_world = QueryWorldEngine()
         self._policy_state = self._default_policy_state()
         self._mission_lock = threading.RLock()
-        self._runner_threads: list[threading.Thread] = []
         self._cancel_events: dict[str, threading.Event] = {}
         self._mission_cancel_keys: dict[str, str] = {}
         self._status_pub = self.create_publisher(TaskStatus, "/mc_ai_bt/task_status", 10)
@@ -399,7 +398,6 @@ class AiBtNode(Node):
             name=f"mission-{mission.identity.mission_id[:8]}",
             daemon=True,
         )
-        self._runner_threads.append(thread)
         thread.start()
 
     def _run_mission(
