@@ -83,6 +83,7 @@ PREDICATE_REGISTRY: dict[str, PredicateSpec] = {
     "person_following": PredicateSpec("person_following", ("people",), "people"),
     "entity_at_place": PredicateSpec("entity_at_place", ("entities", "people", "places", "place_regions"), "entities", execution_only=True),
     "reach_completed": PredicateSpec("reach_completed", ("robot", "objects", "people", "interactions"), "robot", execution_only=True),
+    "track_entity_arm_completed": PredicateSpec("track_entity_arm_completed", ("robot", "objects", "people", "entities"), "robot", execution_only=True),
     "contact_detected": PredicateSpec("contact_detected", ("robot", "objects", "people", "interactions"), "robot", execution_only=True),
     "target_state_changed": PredicateSpec("target_state_changed", ("robot", "objects", "interactions"), "robot", execution_only=True),
     "axis_aligned": PredicateSpec("axis_aligned", ("robot", "objects", "interactions"), "robot", execution_only=True),

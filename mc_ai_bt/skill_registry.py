@@ -193,6 +193,17 @@ DEFAULT_SKILLS: dict[str, SkillSpec] = {
         ("reach_completed",),
         realtime=True,
     ),
+    "track_entity_arm": SkillSpec(
+        "track_entity_arm",
+        ("right_arm",),
+        "Continuously re-aims the ARM TCP (not the head/gaze) at a moving entity's live "
+        "position -- a deliberately different skill from the gaze-only track_frame/"
+        "track_entity/track_with_gaze above. Runs until timeout_sec elapses (normal "
+        "completion for this continuous primitive) or the target goes stale/leaves view.",
+        {"target": "entity|object|person", "arm": "left|right", "timeout_sec": "number"},
+        ("track_entity_arm_completed",),
+        realtime=True,
+    ),
     "align_axis": SkillSpec(
         "align_axis",
         ("right_arm",),
