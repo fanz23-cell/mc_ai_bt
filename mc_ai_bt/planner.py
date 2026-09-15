@@ -523,11 +523,41 @@ def build_planner_messages(
             "Return only one JSON object. Do not include markdown.",
             "The JSON object must use schema mc_ai_bt.plan.v1.",
             (
-                "Top-level keys: schema, root, goal_spec. Do not include a context_json key in "
-                "your own output -- the caller attaches the real one automatically after parsing; "
-                "writing your own would just be discarded, and copying the input context_json back "
-                "out wastes output tokens for no purpose. Do not include a reference_constraints key "
-                "either -- see its own section below for why that is never your data to write."
+                "Top-level keys: schema, root, goal_spec, goal_node_id. Do not include a "
+                "context_json key in your own output -- the caller attaches the real one "
+                "automatically after parsing; writing your own would just be discarded, and "
+                "copying the input context_json back out wastes output tokens for no purpose. "
+                "Do not include a reference_constraints key either -- see its own section below "
+                "for why that is never your data to write."
+            ),
+            (
+                # P0.7 (z-doc 94-97, Candidate D): goal_spec.predicate is no longer trusted as a
+                # free-form string for deciding mission success -- a deterministic step compiles
+                # the real predicate from whichever node goal_node_id names, reading that node's
+                # own already-known skill/check contract. Still write goal_spec as usual (type,
+                # verification, args) for every other purpose it already serves; just do not treat
+                # getting predicate exactly right as what determines success anymore.
+                "Every Action node and every VisualCheck node must also carry a unique string "
+                '"node_id" field (your own choice, e.g. "n1", "n2", ... -- just distinct per '
+                'node). At the top level, alongside goal_spec, include a "goal_node_id" field '
+                "naming the single node_id whose own result is this mission's real terminal "
+                "obligation -- the one outcome that actually has to happen or be answered for the "
+                "request to count as done. goal_spec.predicate is no longer trusted as a "
+                "free-form string for deciding mission success -- a deterministic step compiles "
+                "the real predicate from whichever node goal_node_id names, reading that node's "
+                "own already-known skill/check contract, instead. Still write goal_spec as usual "
+                "(type, verification, args) for every other purpose it already serves; just do "
+                "not treat getting predicate exactly right as what determines success anymore. "
+                "Pick goal_node_id honestly: it is normally the LAST node whose own completion is "
+                "what was actually asked for, never a say node (speaking the answer is not the "
+                "same thing as the obligation the answer is about -- a say node essentially "
+                "always succeeds regardless of whether anything real was verified or accomplished "
+                "first), and never an earlier enabling/orientation step if something else follows "
+                "it in the plan. If the request genuinely asks for more than one independent, "
+                "substantive outcome and no single node can honestly represent \"the mission is "
+                "done\", or you are not sure, set goal_node_id to null -- a null goal_node_id is a "
+                "correct, safe answer for a genuinely ambiguous request; naming the wrong node is "
+                "not."
             ),
             "root must be a Behavior Tree made only from executable node types.",
             (
@@ -772,8 +802,146 @@ def build_planner_messages(
                 "terminal-event channel, not a pre-written guess baked into this plan."
             ),
             (
-                "VisualCheck must be a concise true/false visual query. It may use structured world-state "
-                "evidence or the configured visual checker; UNKNOWN blocks instead of being guessed."
+                # FOUND LIVE 2026-09-14: a cross-entity visual condition ("is <subject>
+                # standing near <a fixed-class object>") was repeatedly planned as unrelated
+                # physical skills (e.g. come_to_me + search_for_entity) carrying an implicit/
+                # human goal_spec, which PolicyGuard correctly rejected outright -- VisualCheck
+                # was under-documented relative to search_for_entity's own heavily-emphasized
+                # guidance above, and lost out to it by default.
+                "VisualCheck shape (flat object): "
+                '{"type": "VisualCheck", "check": {"query": "<a concise yes/no question about '
+                'the CURRENT camera view>"}, "mode": "<condition|observe, optional, default '
+                'condition>"}. It sends that exact question, with the live camera frame, to a '
+                "real vision-language model and gets back TRUE, FALSE, or UNKNOWN -- UNKNOWN "
+                "blocks rather than being guessed. Reach for VisualCheck whenever the real "
+                "condition is a visually-judged state or relation, especially '<subject> is "
+                "near/next to/on/holding/wearing <object>', 'the door is open', 'the room is "
+                "tidy' -- anything search_for_entity's fixed-class presence check and "
+                "check_relation's already-tracked-entity check cannot answer. Do NOT substitute "
+                "search_for_entity just because the query happens to name a class search_for_"
+                "entity would otherwise recognize (e.g. 'a chair', 'a backpack') -- naming a "
+                "class is not the same question as a relation to it: search_for_entity only "
+                "confirms a class is present somewhere in view, never a relation to another "
+                "subject, and come_to_me only navigates to the caller -- neither one asks or "
+                "answers a relation/state question."
+            ),
+            (
+                # P0.5 (z-doc 91/92): VisualCheck has two distinct uses, and `mode` is what
+                # tells the executor which one -- picking the right one is not optional. This
+                # was CONFIRMED LIVE (z-doc 90) to matter: before mode="observe" existed, a
+                # definitive FALSE answer to an observation request was indistinguishable from
+                # the mission itself failing, because the only thing available was condition
+                # semantics (FALSE = branch fails) even for a request that was never actually a
+                # branch condition in the first place.
+                "VisualCheck's `mode` distinguishes two genuinely different jobs:\n"
+                "1) CONDITION (mode absent, or mode=\"condition\" -- the default): the check "
+                "gates whether a branch/action should proceed. TRUE lets that branch succeed, "
+                "FALSE fails it, UNKNOWN blocks/escalates -- exactly like a Condition/GoalCheck "
+                "node. Use this when the request is really about what to do NEXT depending on "
+                "the answer -- e.g. 'if the door is open, go through it' becomes a Sequence "
+                "whose first child is "
+                '{"type": "VisualCheck", "check": {"query": "is the door open?"}} '
+                "(mode omitted) followed by the action that should only run when that is true; "
+                "FALSE there correctly stops the plan, because there genuinely is no "
+                "'go through a closed door' outcome to report.\n"
+                "2) OBSERVE (mode=\"observe\"): the request IS the observation -- 'check "
+                "whether X', 'determine whether X', 'look and tell me whether X', 'verify "
+                "whether X and report the answer'. Both a TRUE and a FALSE answer are equally "
+                "legitimate, COMPLETED outcomes here. Use "
+                '{"type": "VisualCheck", "mode": "observe", "check": {"query": "..."}}. '
+                "Whether this node is the LAST one in the plan -- and therefore whether goal_"
+                "spec is visual_check_completed -- depends on whether the request ALSO asks "
+                "for a physical action AFTER the answer, not just a spoken reply:\n"
+                "2a) OBSERVATION-TERMINAL -- nothing physical is asked for after the answer (a "
+                "plain 'tell me'/'report', no named physical destination to deliver it at): "
+                "enabling actions, if any (e.g. approaching the subject so the camera can see "
+                "them), go BEFORE the VisualCheck, which stays the LAST node. goal_spec is "
+                'EXACTLY {"type": "structured", "predicate": "visual_check_completed", "args": '
+                '{}, "verification": {"mode": "world_state"}}. visual_check_completed means '
+                "the observation was definitively answered -- it does NOT mean the answer was "
+                "TRUE. Never use the query's own truth value as the mission's success "
+                "criterion, and never fall back to a human-type/implicit goal_spec either: a "
+                "definitive FALSE is still a fully successful, completed mission. Never "
+                "substitute an enabling action's own predicate (entity_approached, search_for_"
+                "entity_completed, ...) as the goal_spec here -- that reports the wrong thing "
+                "as mission success.\n"
+                "2b) OBSERVATION FOLLOWED BY A REQUIRED PHYSICAL POST-ACTION -- the request "
+                "also names a physical destination/person to return to and report AT, e.g. "
+                "'check whether X, then go back to Y and tell Y the result' / 'check X, then "
+                "return to Y and report'. Here the VisualCheck is NOT the last node: the plan "
+                "is enabling actions -> VisualCheck(mode=\"observe\") -> the physical action(s) "
+                "needed to reach Y (e.g. approach_entity(target=Y)), and goal_spec matches "
+                "THAT FINAL physical action's own predicate instead (e.g. entity_approached "
+                "for an approach_entity(target=Y) ending) -- never visual_check_completed "
+                "here, since reaching Y, not merely answering the question, is what the "
+                "request asked to complete. The observation's own result is not lost: it is "
+                "already preserved as structured data in the mission's own execution facts for "
+                "the rest of the plan and the final mission outcome, the exact same mechanism "
+                "every other skill's own evidence already uses -- nothing extra needs to be "
+                "authored to carry it forward. Do NOT pre-author the report as BT speech: "
+                "never add a say node (or a Fallback of say nodes) reading 'if TRUE say ...' / "
+                "'if FALSE say ...' -- this is exactly the pre-written-conclusion mistake "
+                "already forbidden below for a plain Condition/GoalCheck/VisualCheck, and it "
+                "produces a broken plan here too (a bare say Action essentially always "
+                "succeeds, so a Fallback built from two say nodes never actually branches on "
+                "the real answer at all). The correct order is: observe, THEN physically "
+                "return, THEN the mission terminates on the return succeeding, and ONLY THEN "
+                "does the real, verified answer reach the person through the existing "
+                "terminal-outcome channel -- never sooner, never guessed. If the observation "
+                "completes but the required return itself fails, the mission correctly is NOT "
+                "successful merely because a visual answer already exists -- goal_spec targets "
+                "the return's own predicate precisely so a failed return still fails the "
+                "mission, exactly as it should. A say node is still fine here for genuinely "
+                "fixed speech that does not depend on the not-yet-executed observation (e.g. "
+                "an initial acknowledgement) -- only a TRUE/FALSE-dependent conclusion is "
+                "forbidden.\n"
+                "Both 2a and 2b: UNKNOWN is unchanged -- it blocks/escalates exactly like "
+                "condition mode, never treated as though a definitive answer existed, and "
+                "never allowed to trigger the physical return as if the observation had "
+                "already succeeded."
+            ),
+            (
+                # FOUND LIVE 2026-09-15 (real user request, confirmed safe, generalized --
+                # z-doc 92's own requirement that this contract never hardcode the
+                # specific acceptance scenario it was motivated by still applies here):
+                # in 2b, the report you were asked to eventually deliver is frequently
+                # worded differently than a literal physical description of what the
+                # camera can directly assess. The terminal-outcome renderer
+                # (channels/robot.py, P0 truthfulness fix) echoes check.query VERBATIM
+                # alongside the verified TRUE/FALSE answer -- it never paraphrases or
+                # infers a different conclusion from it, by design.
+                "In 2b, phrase VisualCheck's check.query using the SAME words as the "
+                "report you were asked to eventually deliver, framed as a direct yes/no "
+                "question the camera can actually answer, rather than a differently-"
+                "worded literal-physical-state proxy question for the same underlying "
+                "fact -- this is what gets the correct, natural-sounding, already-"
+                "verified answer spoken back through the existing terminal-outcome "
+                "channel, with no new inference machinery and no risk of claiming "
+                "something not actually checked. Never invent a query the camera cannot "
+                "directly assess just to match the report's wording -- that violates the "
+                "no-hidden-state-inference rule below. When the report's own phrasing "
+                "genuinely cannot be checked directly by sight, keep the literal, "
+                "directly-visible question instead and accept that the spoken answer "
+                "will use that literal wording, not the report's."
+            ),
+            (
+                # FOUND LIVE 2026-09-14 (live acceptance retest): the model correctly chose
+                # goal_spec.predicate=visual_check_completed for an approach-then-observe plan,
+                # but omitted mode="observe" on the VisualCheck node itself -- mode="observe" is
+                # not tied to visual_check_completed alone (2b above needs it too, for a
+                # DIFFERENT reason): a VisualCheck node with no mode defaults to
+                # mode="condition", which never writes the fact visual_check_completed depends
+                # on AND fails the whole Sequence outright on a real FALSE answer -- in 2b that
+                # would silently cancel the return trip before it ever starts, exactly as
+                # wrongly as it starves visual_check_completed in 2a.
+                "mode=\"observe\" is required whenever EITHER: (a) goal_spec.predicate is "
+                "visual_check_completed (2a), OR (b) anything else in the plan -- most often a "
+                "required physical return (2b) -- must still run regardless of whether the "
+                "answer is TRUE or FALSE. A VisualCheck left in condition mode (absent, or "
+                "mode=\"condition\") can never satisfy (a) -- condition mode never records the "
+                "fact that predicate reads -- and actively breaks (b): a real FALSE answer "
+                "would fail the whole Sequence right there, silently preventing the physical "
+                "return (and the report) from ever being attempted at all."
             ),
             "Do not use VisualCheck for unrestricted scene description or hidden-state inference.",
             (
@@ -794,7 +962,16 @@ def build_planner_messages(
             (
                 "check_relation takes exactly one arg, relation: two entity/object names joined "
                 "by one of near/at/by/next to/close to, e.g. relation='the mug near the sink'. "
-                "It only checks entity-to-entity proximity, not containment in a named place."
+                "It only checks entity-to-entity proximity, not containment in a named place. "
+                "Both sides must already be named, tracked world-state entities (e.g. each was "
+                "already search_for_entity'd, remember_entity'd, or is otherwise already known by "
+                "that name) -- check_relation does not perceive anything itself, it only reads "
+                "already-tracked positions. For a relation involving a bare, never-registered "
+                "description (e.g. 'a backpack' with no prior remember_entity/search_for_entity "
+                "establishing it as a specific tracked instance), check_relation cannot resolve it "
+                "-- use VisualCheck instead, with a query phrased as the relation itself (e.g. "
+                '"is <name> standing next to a backpack?"), which perceives and judges the '
+                "relation directly instead of requiring both sides to already be tracked entities."
             ),
             (
                 "go_to_place ONLY works for a place already configured by name -- if there is no "
@@ -810,6 +987,20 @@ def build_planner_messages(
                 "themselves. An intent phrased as '...and stop right next to it' or '...then stop' "
                 "is satisfied entirely by the navigation skill alone; do not add a separate step "
                 "for the word 'stop' in the intent text."
+            ),
+            (
+                # Found live 2026-09-15: a real mission (a longer compound observe-then-return
+                # request with an embedded if/else branch) produced {"type": "Action", "skill":
+                # "VisualCheck"} -- a real BT node TYPE typed into an Action's own skill field.
+                # Same general confusion as the historical "stop"/"NoAction"-as-skill rejections
+                # above (5 occurrences total across the real mission journal) -- a node type name
+                # is never a valid skill string, regardless of which specific type it is.
+                "Sequence, Fallback, Parallel, Timeout, Action, Wait, Retry, Condition, GoalCheck, "
+                "VisualCheck, NoAction, and WaitForEvent are BT node TYPES, never skill names -- "
+                "none of them may ever appear as an Action node's own \"skill\" value "
+                '(e.g. {"type": "Action", "skill": "VisualCheck", ...} is always wrong). If the '
+                "plan needs one of these node types, write it as its own node "
+                '(e.g. {"type": "VisualCheck", ...}), never nested inside an Action.'
             ),
             "Do not invent ROS topics, action names, Python code, frames, joint commands or expressions.",
             "For physical actions, use only skills from the skill catalog.",
@@ -850,12 +1041,14 @@ def build_planner_messages(
                     "skill": "say",
                     "args": {"text": "I will do that."},
                     "timeout_sec": 30,
+                    "node_id": "n1",
                 },
                 "goal_spec": {
                     "type": "human",
                     "verification": {"mode": "implicit_conversation"},
                     "summary": intent_text,
                 },
+                "goal_node_id": None,
             },
         },
         sort_keys=True,

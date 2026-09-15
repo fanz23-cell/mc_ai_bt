@@ -150,14 +150,72 @@ def _mission_grounding_refs(mission: "Mission") -> tuple[str, ...]:
     return (ref,) if ref else ()
 
 
-def _build_mission_outcome_envelope(mission: "Mission") -> str:
+# P0.4 (z-doc 91): the ONLY key _bounded_result_facts will ever forward, and
+# the ONLY shape it trusts under that key -- see executor.py's own
+# VISUAL_CHECK_RESULT_FACT/_record_visual_check_result, the single writer of
+# a fact under this name. Activated now because doc 90's audit confirmed a
+# real product blocker requires it (VisualCheck FALSE indistinguishable from
+# mission failure) -- not a speculative "might need this later" field.
+_RESULT_FACTS_ALLOWLIST = ("visual_check_result",)
+_VISUAL_CHECK_RESULT_FIELDS = (
+    "completed", "value", "query", "observed_at", "confidence",
+    "provider_name", "model_name", "stale",
+)
+
+
+def _bounded_result_facts(result_facts: dict[str, Any] | None) -> dict[str, Any]:
+    """A bounded, allowlisted RE-PROJECTION of this SAME mission's own
+    terminal ExecutionResult.facts -- never the raw, unbounded dict itself
+    (deliberately: an execution_only predicate's own facts entry, an
+    internal grounding_ref, or anything else a future skill might one day
+    stash in `facts` must never reach Omega just because it happened to be
+    present at terminal time). Re-validates shape independently rather than
+    trusting the caller already got it right (same defense-in-depth posture
+    _mission_semantic_entity_ids/_mission_grounding_refs already use above).
+    Empty dict (never None) when nothing here qualifies -- the caller only
+    adds the "result_facts" key at all when this is non-empty, so an
+    unaffected mission's envelope is BYTE-FOR-BYTE unchanged from before this
+    field existed."""
+    out: dict[str, Any] = {}
+    if not isinstance(result_facts, dict):
+        return out
+    for key in _RESULT_FACTS_ALLOWLIST:
+        entry = result_facts.get(key)
+        if key == "visual_check_result":
+            if (
+                isinstance(entry, dict)
+                and entry.get("completed") is True
+                and isinstance(entry.get("value"), bool)
+            ):
+                out[key] = {
+                    field_name: entry[field_name]
+                    for field_name in _VISUAL_CHECK_RESULT_FIELDS
+                    if field_name in entry
+                }
+    return out
+
+
+def _build_mission_outcome_envelope(
+    mission: "Mission", result_facts: dict[str, Any] | None = None,
+) -> str:
     """Returns a compact-JSON MISSION_OUTCOME_SCHEMA envelope for this
     mission's CURRENT (already-terminal) state, or "" if mission.state
     is not one of the states this schema covers (see
     _TERMINAL_STATE_NAMES). Never raises -- envelope construction must
     never be allowed to block a terminal event from being published, so
     every field here is best-effort and independently fail-safe; the
-    caller does not need its own try/except."""
+    caller does not need its own try/except.
+
+    result_facts (P0.4, z-doc 91): OPTIONAL, additive -- the mission's OWN
+    just-completed ExecutionResult.facts (the SAME dict node.py's _run_mission
+    already has in hand at mark_terminal time; never a fresh post-hoc
+    WorldState query -- see mission.py's own mark_terminal). Absent or
+    carrying nothing allowlisted (_bounded_result_facts) leaves the envelope
+    completely unchanged from before this field existed -- every existing
+    consumer (Bridge's _mission_outcome_trailer, mission_memory's tick(),
+    doc-88's Omega renderer) already tolerates an unrecognized additive key,
+    confirmed by direct read of each (z-doc 91's own audit note) -- no schema
+    version bump needed."""
     terminal_state = _TERMINAL_STATE_NAMES.get(mission.state)
     if terminal_state is None:
         return ""
@@ -180,6 +238,9 @@ def _build_mission_outcome_envelope(mission: "Mission") -> str:
         envelope["grounding_refs"] = list(_mission_grounding_refs(mission))
         if mission.error_code:
             envelope["error_code"] = mission.error_code
+        bounded = _bounded_result_facts(result_facts)
+        if bounded:
+            envelope["result_facts"] = bounded
         return json.dumps(envelope, sort_keys=True, separators=(",", ":"))
     except Exception:  # noqa: BLE001 -- see docstring: must never block the terminal event itself
         return ""
@@ -499,6 +560,7 @@ class MissionManager:
         state: int,
         message: str,
         expected_identity: Identity | None = None,
+        result_facts: dict[str, Any] | None = None,
     ) -> MissionEvent:
         if state not in {STATE_SUCCEEDED, STATE_FAILED, STATE_BLOCKED}:
             raise ValueError("terminal state must be succeeded, failed or blocked")
@@ -519,9 +581,18 @@ class MissionManager:
             STATE_FAILED: EVENT_FAILED,
             STATE_BLOCKED: EVENT_BLOCKED,
         }[state]
+        # P0.4 (z-doc 91): result_facts is this SAME terminal call's own
+        # already-computed ExecutionResult.facts, passed straight through by
+        # the ONE caller that has it (node.py's _run_mission) -- never
+        # re-derived here, per the directive's own "terminal snapshot must
+        # use the actual terminal execution result, not a fresh post-hoc
+        # world query." Every other caller (planning failure, resource-
+        # authority trigger block) has no execution facts to give and
+        # correctly omits this kwarg -- _build_mission_outcome_envelope's own
+        # default (None) already produces today's exact envelope shape.
         return MissionEvent(
             event, done, message,
-            payload_json=_build_mission_outcome_envelope(done),
+            payload_json=_build_mission_outcome_envelope(done, result_facts),
         )
 
     def accepts_async_result(self, identity: Identity) -> bool:

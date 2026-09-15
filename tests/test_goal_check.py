@@ -1,7 +1,7 @@
 import json
 
 from mc_ai_bt.executor import ExecutionResult
-from mc_ai_bt.goal_check import GoalChecker, TriState
+from mc_ai_bt.goal_check import PREDICATE_REGISTRY, GoalChecker, TriState
 
 
 # --- C.2 (2026-09-02): entity_alias_bound -- FOUND by GPT's review, confirmed
@@ -1109,3 +1109,78 @@ def test_other_predicates_sharing_direct_predicate_result_are_unaffected():
     result = GoalChecker().check(goal_spec, execution)
     assert result.state is TriState.TRUE
     assert result.message == "execution facts confirms entity_located"
+
+
+# --- P0.4 (z-doc 91): visual_check_completed ---------------------------
+# CONFIRMED gap (z-doc 90): FALSE was indistinguishable from mission
+# failure. This predicate answers a DIFFERENT question than the checked
+# value itself -- "was the observation performed at all" -- and is TRUE
+# regardless of whether facts["visual_check_result"]["value"] is True or
+# False (only executor.py's mode="observe" ever writes this fact; see
+# test_executor.py's own observe-mode coverage for that half).
+
+def test_visual_check_completed_true_when_value_is_true():
+    goal_spec = {"type": "structured", "predicate": "visual_check_completed", "args": {}}
+    execution = ExecutionResult(
+        True, "observed", {"visual_check_result": {"completed": True, "value": True}})
+    result = GoalChecker().check(goal_spec, execution)
+    assert result.state is TriState.TRUE
+
+
+def test_visual_check_completed_true_even_when_value_is_false():
+    # The whole point: a definitively-false observation is a SUCCESSFULLY
+    # completed one, not a failure -- this predicate must not fold the two
+    # together in either direction.
+    goal_spec = {"type": "structured", "predicate": "visual_check_completed", "args": {}}
+    execution = ExecutionResult(
+        True, "observed", {"visual_check_result": {"completed": True, "value": False}})
+    result = GoalChecker().check(goal_spec, execution)
+    assert result.state is TriState.TRUE
+    assert "False" in result.message or "false" in result.message.lower()
+
+
+def test_visual_check_completed_unknown_when_fact_missing():
+    goal_spec = {"type": "structured", "predicate": "visual_check_completed", "args": {}}
+    execution = ExecutionResult(True, "nothing observed yet", {})
+    result = GoalChecker().check(goal_spec, execution)
+    assert result.state is TriState.UNKNOWN
+
+
+def test_visual_check_completed_unknown_when_fact_present_but_not_completed():
+    goal_spec = {"type": "structured", "predicate": "visual_check_completed", "args": {}}
+    execution = ExecutionResult(
+        True, "still running", {"visual_check_result": {"completed": False}})
+    result = GoalChecker().check(goal_spec, execution)
+    assert result.state is TriState.UNKNOWN
+
+
+def test_visual_check_completed_never_resolves_false():
+    # No real code path ever writes completed=False -- confirm this
+    # predicate does not invent a FALSE branch that nothing can produce.
+    goal_spec = {"type": "structured", "predicate": "visual_check_completed", "args": {}}
+    for facts in ({}, {"visual_check_result": None}, {"visual_check_result": "not a dict"}):
+        execution = ExecutionResult(True, "x", facts)
+        result = GoalChecker().check(goal_spec, execution)
+        assert result.state is TriState.UNKNOWN
+
+
+def test_visual_check_completed_metadata_marks_never_resolves_false():
+    # P0 safety fix (2026-09-15, GPT-approved CHANGE APPROVAL, z-doc 107/108):
+    # the property the two tests above already prove behaviourally is now
+    # also named in the registry itself, so PolicyGuard can act on it without
+    # a predicate-name literal. This is metadata only -- GoalCheck's own
+    # semantics for this predicate (asserted above) are unchanged.
+    spec = PREDICATE_REGISTRY["visual_check_completed"]
+    assert spec.never_resolves_false is True
+    assert spec.execution_only is True  # unchanged by this fix
+
+
+def test_most_execution_only_predicates_are_not_never_resolves_false():
+    # The fix is narrowly scoped to the one predicate whose own handler
+    # structurally has no FALSE branch -- not a blanket property of
+    # execution_only. entity_located/entity_approached/search_for_entity_
+    # completed/person_named etc. all resolve via the generic, genuinely
+    # TRUE/FALSE/UNKNOWN-capable _direct_predicate_result path and must stay
+    # usable as real Fallback-branch gates.
+    never_false = {name for name, spec in PREDICATE_REGISTRY.items() if spec.never_resolves_false}
+    assert never_false == {"visual_check_completed"}

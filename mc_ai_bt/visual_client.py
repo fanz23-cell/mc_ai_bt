@@ -21,7 +21,13 @@ from .ros_identity import identity_to_msg
 @dataclass(frozen=True)
 class VisualCheckSettings:
     action_name: str = "/mc_multimodal/visual_check"
-    camera_source: str = "head"
+    # FOUND LIVE 2026-09-12 (doc 91), left unfixed until 2026-09-15: the live
+    # /mc_multimodal/visual_check node's own configured camera_source param
+    # is "codey_head", not "head" -- every VisualCheck query using this
+    # default got zero frames back ("no fresh camera frame available",
+    # confidence=0.00), regardless of how correct the rest of the plan was.
+    # User-authorized live fix once this was confirmed still live tonight.
+    camera_source: str = "codey_head"
     max_age_sec: float = 2.0
     timeout_sec: float = 15.0
     expected_schema_version: str = "mc_multimodal.visual_check.v1"
@@ -172,15 +178,49 @@ def _allows_visual_fallback(goal_spec: dict[str, Any]) -> bool:
     return "visual_check" in mode
 
 
+def _stamp_to_unix(stamp: Any) -> float | None:
+    """builtin_interfaces/Time (sec, nanosec) -> a plain float unix timestamp,
+    or None for anything not shaped like one. P0.4 (z-doc 91): this is the
+    real image-capture time -- the field z-doc 90 confirmed already exists on
+    the wire (VisualCheckResult.image_stamp) and was simply never read before
+    this round, not a new evidence source."""
+    sec = getattr(stamp, "sec", None)
+    nanosec = getattr(stamp, "nanosec", None)
+    if sec is None or nanosec is None:
+        return None
+    try:
+        return float(sec) + float(nanosec) / 1e9
+    except (TypeError, ValueError):
+        return None
+
+
 def _check_result_from_msg(result: VisualCheckResult) -> CheckResult:
     state = int(getattr(result, "state", VisualCheckResult.STATE_UNKNOWN))
     reason = str(getattr(result, "reason", "") or "")
     confidence = float(getattr(result, "confidence", 0.0) or 0.0)
+    # P0.4 (z-doc 91): bounded provenance mode="observe" needs -- confirmed
+    # (z-doc 90) already present on this SAME real ROS message, just
+    # discarded before this round. Populated unconditionally (cheap plain
+    # reads); mode="condition" callers simply never look at these fields, so
+    # this has zero effect on existing condition-mode behavior.
+    observed_at = _stamp_to_unix(getattr(result, "image_stamp", None))
+    provider_name = str(getattr(result, "provider_name", "") or "")
+    model_name = str(getattr(result, "model_name", "") or "")
+    stale = bool(getattr(result, "stale", False))
     if state == VisualCheckResult.STATE_TRUE:
-        return CheckResult(TriState.TRUE, f"{reason} (confidence={confidence:.2f})")
+        return CheckResult(
+            TriState.TRUE, f"{reason} (confidence={confidence:.2f})",
+            confidence=confidence, observed_at=observed_at,
+            provider_name=provider_name, model_name=model_name, stale=stale)
     if state == VisualCheckResult.STATE_FALSE:
-        return CheckResult(TriState.FALSE, f"{reason} (confidence={confidence:.2f})")
-    return CheckResult(TriState.UNKNOWN, f"{reason or 'unknown'} (confidence={confidence:.2f})")
+        return CheckResult(
+            TriState.FALSE, f"{reason} (confidence={confidence:.2f})",
+            confidence=confidence, observed_at=observed_at,
+            provider_name=provider_name, model_name=model_name, stale=stale)
+    return CheckResult(
+        TriState.UNKNOWN, f"{reason or 'unknown'} (confidence={confidence:.2f})",
+        confidence=confidence, observed_at=observed_at,
+        provider_name=provider_name, model_name=model_name, stale=stale)
 
 
 def _context_json(check: dict[str, Any], facts: dict[str, Any]) -> str:

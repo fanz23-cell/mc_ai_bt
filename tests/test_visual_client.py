@@ -14,11 +14,17 @@ suite.
 
 from __future__ import annotations
 
+import types
 from dataclasses import dataclass, field
 from typing import Any
 
 from mc_ai_bt.goal_check import CheckResult, TriState
-from mc_ai_bt.visual_client import MissionCheckExecutor, _allows_visual_fallback
+from mc_ai_bt.visual_client import (
+    MissionCheckExecutor,
+    _allows_visual_fallback,
+    _check_result_from_msg,
+    _stamp_to_unix,
+)
 
 
 @dataclass
@@ -126,3 +132,90 @@ def test_visual_type_goal_spec_unknown_from_goal_checker_does_call_visual_client
     result = executor.check(goal_spec, _FakeExecution())
     assert result.state is TriState.TRUE
     assert len(visual_client.calls) == 1
+
+
+# --- P0.4 (z-doc 91): _check_result_from_msg provenance extraction ---------
+# CONFIRMED gap (z-doc 90): the real VisualCheckResult ROS message
+# (mc_one/msg/VisualCheckResult.msg) already carries confidence, image_stamp,
+# provider_name, model_name, and stale -- this function used to discard all
+# of it except confidence (folded into a free-text string, never a
+# structured field). Fixed to carry it through as real CheckResult fields.
+#
+# A lightweight duck-typed fake (types.SimpleNamespace), not the real
+# mc_one.msg.VisualCheckResult class, deliberately -- that class requires the
+# built mc_one ROS package, unavailable in this bare sandbox (this whole test
+# FILE already cannot be collected here for that same reason -- see
+# mc_ai_bt/visual_client.py's own `from mc_one.action import VisualCheck`
+# module-level import; verified inside the live bison_client-mc_ai_bt-1
+# container instead, same as every other mc_one-dependent suite in this
+# project). _check_result_from_msg itself only ever reads attributes via
+# getattr(), so a duck-typed fake exercises the real function correctly.
+# STATE_TRUE=1/STATE_FALSE=2/STATE_UNKNOWN=0 are the real, frozen integer
+# values from that .msg file.
+
+def _fake_visual_check_result(
+    *, state, reason="", confidence=0.0, image_stamp=None,
+    provider_name="", model_name="", stale=False,
+):
+    return types.SimpleNamespace(
+        state=state, reason=reason, confidence=confidence, image_stamp=image_stamp,
+        provider_name=provider_name, model_name=model_name, stale=stale,
+    )
+
+
+def test_check_result_from_msg_true_carries_provenance_through():
+    stamp = types.SimpleNamespace(sec=1700000000, nanosec=500000000)
+    msg = _fake_visual_check_result(
+        state=1, reason="yes, clearly visible", confidence=0.93, image_stamp=stamp,
+        provider_name="langchain_openai", model_name="gpt-4o-mini", stale=False,
+    )
+
+    result = _check_result_from_msg(msg)
+
+    assert result.state is TriState.TRUE
+    assert result.confidence == 0.93
+    assert result.observed_at == 1700000000.5
+    assert result.provider_name == "langchain_openai"
+    assert result.model_name == "gpt-4o-mini"
+    assert result.stale is False
+
+
+def test_check_result_from_msg_false_also_carries_provenance_through():
+    # FALSE must not be treated as "no evidence" -- its provenance is just as
+    # real and worth preserving as TRUE's.
+    msg = _fake_visual_check_result(state=2, reason="no, not present", confidence=0.81)
+
+    result = _check_result_from_msg(msg)
+
+    assert result.state is TriState.FALSE
+    assert result.confidence == 0.81
+
+
+def test_check_result_from_msg_unknown_still_carries_confidence():
+    msg = _fake_visual_check_result(state=0, reason="insufficient coverage", confidence=0.1)
+
+    result = _check_result_from_msg(msg)
+
+    assert result.state is TriState.UNKNOWN
+    assert result.confidence == 0.1
+
+
+def test_check_result_from_msg_stale_flag_is_preserved():
+    msg = _fake_visual_check_result(state=1, stale=True)
+
+    result = _check_result_from_msg(msg)
+
+    assert result.stale is True
+
+
+def test_stamp_to_unix_converts_sec_and_nanosec():
+    stamp = types.SimpleNamespace(sec=100, nanosec=250000000)
+    assert _stamp_to_unix(stamp) == 100.25
+
+
+def test_stamp_to_unix_none_for_missing_stamp():
+    assert _stamp_to_unix(None) is None
+
+
+def test_stamp_to_unix_none_for_malformed_stamp():
+    assert _stamp_to_unix(types.SimpleNamespace(sec="not a number", nanosec=0)) is None

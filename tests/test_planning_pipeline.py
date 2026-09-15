@@ -1,11 +1,15 @@
+import copy
 import json
 
 from mc_ai_bt.context_builder import ContextBuilder
 from mc_ai_bt.mission import MissionManager
 from mc_ai_bt.planner import BootstrapPlanner
 from mc_ai_bt.planning_pipeline import (
-    PlanningPipeline, _all_actions_in, _apply_reference_constraint_guard,
-    _append_missing_required_producers, _INTERNAL_GROUNDING_FIELD,
+    PlanningPipeline, _all_actions_in, _apply_deterministic_goal_spec,
+    _apply_reference_constraint_guard,
+    _append_missing_required_producers, _canonicalize_visualcheck_fallback,
+    _compile_goal_spec_from_goal_node,
+    _INTERNAL_GROUNDING_FIELD,
     _parse_mission_goal_contract, _strip_internal_grounding_field,
 )
 from mc_ai_bt.policy_guard import PolicyGuard
@@ -1643,10 +1647,29 @@ def test_mission_goal_contract_turn1_naming_is_synthesized_without_calling_the_p
     bt = json.loads(result.bt_json)
     assert bt["skill"] == "remember_person"
     assert bt["args"]["name"] == "33"
-    assert bt["args"]["entity_id"] == "person_x1"
-    assert bt["args"][_INTERNAL_GROUNDING_FIELD] == "gnd_test1"
+    # FOUND LIVE 2026-09-14 (TOCTOU fix): remember_person/remember_entity
+    # must never receive this planning-time-resolved id as if it were
+    # identity authority -- a real, non-zero gap (mission acceptance +
+    # journaling + BT dispatch) separates this call from when the Action
+    # actually executes, and entity_tracks' own live id for the SAME
+    # physical instance can (and, live-confirmed, does) churn in that
+    # window. Only the VALIDATED CONSTRAINT (entity_class/relation) is
+    # handed to execution; execution re-resolves fresh, immediately before
+    # binding (see seattle_lab/mc_embodied_skills/node.py's
+    # _resolve_and_bind_entity). This resolver call above still runs, and
+    # still gates whether a physical BT is authorized at all (fail-closed
+    # early stays exactly as before) -- only its entity_id/grounding_ref
+    # output is no longer threaded through to the Action.
+    assert "entity_id" not in bt["args"]
+    assert _INTERNAL_GROUNDING_FIELD not in bt["args"]
+    assert bt["args"]["entity_class"] == "person"
+    assert bt["args"]["relation"] == "nearest"
     goal_spec = json.loads(result.goal_spec_json)
     assert goal_spec["predicate"] == "person_named"
+    assert "entity_id" not in goal_spec["args"], (
+        "a stale planning-time entity_id in goal_spec.args would make a correct, "
+        "freshly-resolved-and-bound alias read back as a mismatch (FALSE) -- see "
+        "goal_check.py's own _entity_alias_bound_result")
     assert _INTERNAL_GROUNDING_FIELD not in goal_spec["args"], (
         "the internal grounding field must never leak into goal_spec.args")
     assert resolver.calls == [("person", "nearest", "robot")]
@@ -1670,7 +1693,34 @@ def test_mission_goal_contract_turn2_alias_reference_uses_existing_grounded_enti
         "alias-reference targets carry no grounding_ref -- no new identity decision is made")
 
 
-def test_mission_goal_contract_turn2_unresolved_alias_fails_closed_no_nearest_fallback():
+def test_mission_goal_contract_turn2_never_registered_alias_fails_closed_no_nearest_fallback():
+    # "33" does not appear in grounded_entities AT ALL -- a genuinely
+    # never-registered alias, NOT_FOUND, must still fail closed immediately
+    # even for approach_entity (which DOES support alias-scan, see the test
+    # below): scanning cannot find an identity that was never registered.
+    mission, missions = _mission_with_contract(
+        "去33那里",
+        _goal_contract(
+            targets={"t1": {"kind": "alias_reference", "alias": "33"}},
+            goals=[{"goal_id": "g1", "predicate": "entity_approached", "target_id": "t1"}]),
+        grounded_entities=[])
+
+    result = _pipeline(_RaisingPlanner()).plan(mission, missions)
+
+    assert not result.ok
+    assert result.stage == "target_resolution"
+    assert "NOT_FOUND" in result.message
+    assert not result.bt_json
+
+
+def test_mission_goal_contract_turn2_unresolved_alias_authorizes_alias_scan_bt_for_approach_entity():
+    # FOUND LIVE 2026-09-14: a REAL, previously-bound alias that is simply
+    # not currently confirmed (e.g. temporarily out of view) is a genuinely
+    # different case from "33" never having been registered at all (see the
+    # NOT_FOUND test above) -- approach_entity declares resolves_alias_
+    # with_scan (skill_registry.py), so this now authorizes a physical BT
+    # carrying the ALIAS (never an entity_id -- there isn't one yet, and a
+    # stale one must never be handed to execution as if it were current).
     mission, missions = _mission_with_contract(
         "去33那里",
         _goal_contract(
@@ -1680,8 +1730,34 @@ def test_mission_goal_contract_turn2_unresolved_alias_fails_closed_no_nearest_fa
 
     result = _pipeline(_RaisingPlanner()).plan(mission, missions)
 
+    assert result.ok, result.message
+    bt = json.loads(result.bt_json)
+    assert bt["skill"] == "approach_entity"
+    assert bt["args"]["alias"] == "33"
+    assert "entity_id" not in bt["args"], (
+        "no real entity_id exists yet for an UNRESOLVED alias -- a stale one must "
+        "never be forged or carried through")
+    goal_spec = json.loads(result.goal_spec_json)
+    assert goal_spec["args"]["alias"] == "33"
+
+
+def test_mission_goal_contract_turn2_unresolved_alias_still_fails_closed_for_a_skill_without_alias_scan():
+    # face_entity (entity_faced) does NOT declare resolves_alias_with_scan --
+    # an UNRESOLVED alias for THIS skill must still fail closed exactly as
+    # before, proving the new authorization is opt-in per skill, not a
+    # blanket relaxation of "no physical BT for an unresolved alias".
+    mission, missions = _mission_with_contract(
+        "转向33",
+        _goal_contract(
+            targets={"t1": {"kind": "alias_reference", "alias": "33"}},
+            goals=[{"goal_id": "g1", "predicate": "entity_faced", "target_id": "t1"}]),
+        grounded_entities=[{"alias": "33", "entity_id": "", "grounding_state": "UNRESOLVED"}])
+
+    result = _pipeline(_RaisingPlanner()).plan(mission, missions)
+
     assert not result.ok
     assert result.stage == "target_resolution"
+    assert "UNRESOLVED" in result.message
     assert not result.bt_json
 
 
@@ -1843,3 +1919,701 @@ def test_parse_mission_goal_contract_reads_caller_context_same_place_as_grounded
     assert state == "VALID"
     assert len(goals) == 1
     assert "t1" in targets
+
+
+# --- P0.7 (z-doc 94-97, Candidate D, GPT-approved CHANGE APPROVAL):
+# _compile_goal_spec_from_goal_node -- goal_node_id is compiled into the
+# authoritative goal_spec, never the model's own free-typed predicate string.
+# Direct unit tests first (converted from doc 96's TEMP synthetic checks,
+# same 10 structural shapes, now exercising the real production function),
+# then full-pipeline integration tests via StaticPlanner below.
+
+def _node(node_type: str, node_id: str, **fields) -> dict:
+    return {"type": node_type, "node_id": node_id, **fields}
+
+
+def test_compile_goal_node_resolves_a_plain_non_voice_action():
+    plan = {
+        "root": {"type": "Sequence", "children": [
+            _node("Action", "n1", skill="approach_entity", args={"target": "Alice"}),
+        ]},
+        "goal_spec": {"type": "human", "verification": {"mode": "implicit_conversation"}},
+        "goal_node_id": "n1",
+    }
+    _compile_goal_spec_from_goal_node(plan)
+    assert "goal_node_id" not in plan
+    assert plan["goal_spec"]["predicate"] == "entity_approached"
+    assert plan["goal_spec"]["args"] == {"target": "Alice"}
+
+
+def test_compile_goal_node_overrides_the_models_own_wrong_predicate():
+    # The whole point of Candidate D: even when the model ALSO wrote a
+    # structured (but wrong) goal_spec.predicate, the compiled result from
+    # goal_node_id wins.
+    plan = {
+        "root": {"type": "Sequence", "children": [
+            _node("Action", "n1", skill="approach_entity", args={"target": "Alice"}),
+        ]},
+        "goal_spec": {"type": "structured", "predicate": "robot_at_place",
+                       "args": {"place": "wrong"}, "verification": {"mode": "world_state"}},
+        "goal_node_id": "n1",
+    }
+    _compile_goal_spec_from_goal_node(plan)
+    assert plan["goal_spec"]["predicate"] == "entity_approached"
+
+
+def test_compile_goal_node_observation_terminal_with_nothing_after():
+    plan = {
+        "root": _node("VisualCheck", "n1", mode="observe", check={"query": "is anyone there?"}),
+        "goal_spec": {"type": "human", "verification": {"mode": "implicit_conversation"}},
+        "goal_node_id": "n1",
+    }
+    _compile_goal_spec_from_goal_node(plan)
+    assert plan["goal_spec"]["predicate"] == "visual_check_completed"
+
+
+def test_compile_goal_node_rejects_premature_visualcheck_before_a_later_action():
+    # Exact doc95/96 obsret_05 shape: a fully correct BT where the model
+    # marked the observation itself as done, one step before the required
+    # physical return -- must NOT compile visual_check_completed here.
+    plan = {
+        "root": {"type": "Sequence", "children": [
+            _node("Action", "n1", skill="search_for_entity", args={"target": "X"}),
+            _node("Action", "n2", skill="approach_entity", args={"target": "X"}),
+            _node("VisualCheck", "n3", mode="observe", check={"query": "is X holding a ball?"}),
+            _node("Action", "n4", skill="approach_entity", args={"target": "W"}),
+            _node("Action", "n5", skill="say", args={"text": "result"}),
+        ]},
+        "goal_spec": {"type": "human", "verification": {"mode": "implicit_conversation"}},
+        "goal_node_id": "n3",
+    }
+    was_gated = _compile_goal_spec_from_goal_node(plan)
+    assert was_gated is True
+    assert "goal_node_id" not in plan
+    # P0.9: forced to a canonical implicit shape, not left as whatever the
+    # model originally wrote -- never silently trusted.
+    assert plan["goal_spec"]["type"] == "human"
+    assert plan["goal_spec"]["verification"] == {"mode": "implicit_conversation"}
+    assert "predicate" not in plan["goal_spec"]
+
+
+def test_compile_goal_node_rejects_premature_visualcheck_inside_nested_sequence():
+    plan = {
+        "root": {"type": "Sequence", "children": [
+            _node("VisualCheck", "n1", mode="observe", check={"query": "is it open?"}),
+            {"type": "Sequence", "children": [
+                _node("Action", "n2", skill="approach_entity", args={"target": "Nora"}),
+                _node("Action", "n3", skill="say", args={"text": "done"}),
+            ]},
+        ]},
+        "goal_spec": {"type": "human", "verification": {"mode": "implicit_conversation"}},
+        "goal_node_id": "n1",
+    }
+    _compile_goal_spec_from_goal_node(plan)
+    assert "predicate" not in plan["goal_spec"]
+
+
+def test_compile_goal_node_rejects_premature_visualcheck_inside_fallback_branch():
+    # Conservative by design: a later eligible action inside EITHER Fallback
+    # branch still disqualifies an earlier VisualCheck, erring toward
+    # fail-closed rather than a perfectly branch-scoped analysis.
+    plan = {
+        "root": {"type": "Sequence", "children": [
+            _node("VisualCheck", "n1", mode="observe", check={"query": "is it locked?"}),
+            {"type": "Fallback", "children": [
+                {"type": "Sequence", "children": [
+                    _node("Action", "n2", skill="approach_entity", args={"target": "A"}),
+                    _node("Action", "n3", skill="say", args={"text": "x"}),
+                ]},
+                {"type": "Sequence", "children": [
+                    _node("Action", "n4", skill="go_to_place", args={"place": "B"}),
+                    _node("Action", "n5", skill="say", args={"text": "y"}),
+                ]},
+            ]},
+        ]},
+        "goal_spec": {"type": "human", "verification": {"mode": "implicit_conversation"}},
+        "goal_node_id": "n1",
+    }
+    _compile_goal_spec_from_goal_node(plan)
+    assert "predicate" not in plan["goal_spec"]
+
+
+def test_compile_goal_node_visualcheck_stays_eligible_before_only_bookkeeping_and_say():
+    plan = {
+        "root": {"type": "Sequence", "children": [
+            _node("VisualCheck", "n1", mode="observe", check={"query": "is it on?"}),
+            _node("Condition", "n2", predicate="some_bookkeeping_fact"),
+            _node("Action", "n3", skill="say", args={"text": "it is on"}),
+        ]},
+        "goal_spec": {"type": "human", "verification": {"mode": "implicit_conversation"}},
+        "goal_node_id": "n1",
+    }
+    _compile_goal_spec_from_goal_node(plan)
+    assert plan["goal_spec"]["predicate"] == "visual_check_completed"
+
+
+def test_compile_goal_node_visualcheck_stays_eligible_before_a_later_retry_wrapped_action():
+    # Retry/Timeout wrap a single child and are still "unconditional" --
+    # a later action inside one still disqualifies the earlier VisualCheck.
+    plan = {
+        "root": {"type": "Sequence", "children": [
+            _node("VisualCheck", "n1", mode="observe", check={"query": "is it there?"}),
+            {"type": "Retry", "child": _node("Action", "n2", skill="approach_entity", args={"target": "A"})},
+        ]},
+        "goal_spec": {"type": "human", "verification": {"mode": "implicit_conversation"}},
+        "goal_node_id": "n1",
+    }
+    _compile_goal_spec_from_goal_node(plan)
+    assert "predicate" not in plan["goal_spec"]
+
+
+def test_compile_goal_node_condition_mode_visualcheck_is_ineligible():
+    plan = {
+        "root": {"type": "Sequence", "children": [
+            _node("VisualCheck", "n1", mode="condition", check={"query": "is it open?"}),
+            _node("Action", "n2", skill="approach_entity", args={"target": "A"}),
+        ]},
+        "goal_spec": {"type": "human", "verification": {"mode": "implicit_conversation"}},
+        "goal_node_id": "n1",
+    }
+    _compile_goal_spec_from_goal_node(plan)
+    assert "predicate" not in plan["goal_spec"]
+
+
+def test_compile_goal_node_prior_action_does_not_disqualify_a_later_visualcheck():
+    plan = {
+        "root": {"type": "Sequence", "children": [
+            _node("Action", "n1", skill="approach_entity", args={"target": "A"}),
+            _node("VisualCheck", "n2", mode="observe", check={"query": "is it there?"}),
+        ]},
+        "goal_spec": {"type": "human", "verification": {"mode": "implicit_conversation"}},
+        "goal_node_id": "n2",
+    }
+    _compile_goal_spec_from_goal_node(plan)
+    assert plan["goal_spec"]["predicate"] == "visual_check_completed"
+
+
+def test_compile_goal_node_say_node_recovers_when_exactly_one_candidate_remains():
+    # P0.7 doc 97: the model marking the trailing say node as goal_node_id
+    # (reading "tell me the result" as "the goal is that I speak") is
+    # recovered when excluding it leaves exactly one safe eligible node.
+    plan = {
+        "root": {"type": "Sequence", "children": [
+            _node("VisualCheck", "n1", mode="observe", check={"query": "is the door locked?"}),
+            _node("Action", "n2", skill="say", args={"text": "it is locked"}),
+        ]},
+        "goal_spec": {"type": "human", "verification": {"mode": "implicit_conversation"}},
+        "goal_node_id": "n2",
+    }
+    _compile_goal_spec_from_goal_node(plan)
+    assert plan["goal_spec"]["predicate"] == "visual_check_completed"
+
+
+def test_compile_goal_node_say_node_does_not_recover_when_ambiguous():
+    # Excluding the say node leaves 2 eligible candidates (approach A and
+    # approach B) -- must stay unresolved, never guess which one.
+    plan = {
+        "root": {"type": "Sequence", "children": [
+            _node("Action", "n1", skill="approach_entity", args={"target": "A"}),
+            _node("Action", "n2", skill="go_to_place", args={"place": "B"}),
+            _node("Action", "n3", skill="say", args={"text": "done"}),
+        ]},
+        "goal_spec": {"type": "human", "verification": {"mode": "implicit_conversation"}},
+        "goal_node_id": "n3",
+    }
+    _compile_goal_spec_from_goal_node(plan)
+    assert "predicate" not in plan["goal_spec"]
+
+
+def test_compile_goal_node_say_node_does_not_recover_when_zero_candidates_remain():
+    plan = {
+        "root": {"type": "Sequence", "children": [
+            _node("Action", "n1", skill="say", args={"text": "hello"}),
+        ]},
+        "goal_spec": {"type": "human", "verification": {"mode": "implicit_conversation"}},
+        "goal_node_id": "n1",
+    }
+    _compile_goal_spec_from_goal_node(plan)
+    assert "predicate" not in plan["goal_spec"]
+
+
+def test_compile_goal_node_missing_goal_node_id_is_a_no_op():
+    plan = {
+        "root": {"type": "Action", "node_id": "n1", "skill": "approach_entity", "args": {"target": "A"}},
+        "goal_spec": {"type": "human", "verification": {"mode": "implicit_conversation"}},
+    }
+    before = dict(plan["goal_spec"])
+    _compile_goal_spec_from_goal_node(plan)
+    assert plan["goal_spec"] == before
+
+
+def test_compile_goal_node_unresolvable_id_is_popped_and_left_alone():
+    plan = {
+        "root": {"type": "Action", "node_id": "n1", "skill": "approach_entity", "args": {"target": "A"}},
+        "goal_spec": {"type": "human", "verification": {"mode": "implicit_conversation"}},
+        "goal_node_id": "does-not-exist",
+    }
+    _compile_goal_spec_from_goal_node(plan)
+    assert "goal_node_id" not in plan
+    assert "predicate" not in plan["goal_spec"]
+
+
+def test_compile_goal_node_no_static_enabling_only_field_needed():
+    # Doc 94/95's own live-benchmark finding: the identical skill
+    # (approach_entity) is correctly terminal in one plan and correctly
+    # enabling in another purely from tree POSITION, with no per-skill flag
+    # anywhere in SkillSpec -- proven here by running the same skill through
+    # both roles and getting the right answer both times.
+    terminal_plan = {
+        "root": {"type": "Action", "node_id": "n1", "skill": "approach_entity", "args": {"target": "Alice"}},
+        "goal_spec": {"type": "human", "verification": {"mode": "implicit_conversation"}},
+        "goal_node_id": "n1",
+    }
+    _compile_goal_spec_from_goal_node(terminal_plan)
+    assert terminal_plan["goal_spec"]["predicate"] == "entity_approached"
+
+    enabling_plan = {
+        "root": {"type": "Sequence", "children": [
+            _node("Action", "n1", skill="approach_entity", args={"target": "Alice"}),
+            _node("VisualCheck", "n2", mode="observe", check={"query": "is she holding a cup?"}),
+        ]},
+        "goal_spec": {"type": "human", "verification": {"mode": "implicit_conversation"}},
+        "goal_node_id": "n2",
+    }
+    _compile_goal_spec_from_goal_node(enabling_plan)
+    assert enabling_plan["goal_spec"]["predicate"] == "visual_check_completed"
+
+
+# --- Full-pipeline integration (StaticPlanner) -- confirms goal_node_id
+# never leaks to PolicyGuard, and that the compiled result actually reaches
+# result.goal_spec_json / drives real accept/reject outcomes end to end.
+
+def _plan_with_goal_node(root: dict, goal_node_id, goal_spec: dict | None = None) -> str:
+    return json.dumps({
+        "schema": "mc_ai_bt.plan.v1",
+        "root": root,
+        "goal_spec": goal_spec or {"type": "human", "verification": {"mode": "implicit_conversation"}},
+        "goal_node_id": goal_node_id,
+    })
+
+
+def test_pipeline_compiles_goal_spec_from_goal_node_id_end_to_end():
+    mission, missions = _mission("Go to Alice.")
+    plan_json = _plan_with_goal_node(
+        {"type": "Action", "node_id": "n1", "skill": "approach_entity", "args": {"target": "Alice"}},
+        "n1",
+    )
+
+    result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
+
+    assert result.ok, result.message
+    assert json.loads(result.goal_spec_json)["predicate"] == "entity_approached"
+
+
+def test_pipeline_never_leaks_goal_node_id_to_policy_guard():
+    # Even when goal_node_id fails to resolve, PolicyGuard must never see an
+    # "unknown top-level keys" error for it -- _compile_goal_spec_from_goal_
+    # node pops it unconditionally.
+    mission, missions = _mission("Say hello and also do something ambiguous.")
+    plan_json = _plan_with_goal_node(
+        {"type": "Sequence", "children": [
+            {"type": "Action", "node_id": "n1", "skill": "approach_entity", "args": {"target": "A"}},
+            {"type": "Action", "node_id": "n2", "skill": "go_to_place", "args": {"place": "B"}},
+            {"type": "Action", "node_id": "n3", "skill": "say", "args": {"text": "done"}},
+        ]},
+        "n3",  # say node, and excluding it leaves 2 candidates -> unresolved
+    )
+
+    result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
+
+    assert not result.ok
+    assert "unknown top-level keys" not in result.message
+
+
+def test_pipeline_recovers_say_node_selection_when_unambiguous_end_to_end():
+    mission, missions = _mission("Check whether the door is locked and tell me.")
+    plan_json = _plan_with_goal_node(
+        {"type": "Sequence", "children": [
+            {"type": "VisualCheck", "node_id": "n1", "mode": "observe",
+             "check": {"query": "is the door locked?"}},
+            {"type": "Action", "node_id": "n2", "skill": "say", "args": {"text": "it is locked"}},
+        ]},
+        "n2",
+    )
+
+    result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
+
+    assert result.ok, result.message
+    assert json.loads(result.goal_spec_json)["predicate"] == "visual_check_completed"
+
+
+def test_pipeline_rejects_the_obsret_05_shape_instead_of_false_succeeding():
+    # Doc 95/96's one confirmed dangerous live case, reproduced exactly: a
+    # fully correct BT where goal_node_id names the VisualCheck one step
+    # before the required physical return -- must be REJECTED (fail closed),
+    # never SUCCEED merely because the observation node was marked as done.
+    mission, missions = _mission(
+        "Find zzz_fresh_alias_9 in the room, go to her and check whether she is holding a red ball; "
+        "then come back to 小W and report whether zzz_fresh_alias_9 is holding a red ball."
+    )
+    plan_json = _plan_with_goal_node(
+        {"type": "Sequence", "children": [
+            {"type": "Action", "node_id": "n1", "skill": "search_for_entity",
+             "args": {"target": "zzz_fresh_alias_9"}},
+            {"type": "Action", "node_id": "n2", "skill": "approach_entity",
+             "args": {"target": "zzz_fresh_alias_9"}},
+            {"type": "VisualCheck", "node_id": "n3", "mode": "observe",
+             "check": {"query": "is zzz_fresh_alias_9 holding a red ball?"}},
+            {"type": "Action", "node_id": "n4", "skill": "approach_entity", "args": {"target": "小W"}},
+            {"type": "Action", "node_id": "n5", "skill": "say", "args": {"text": "result"}},
+        ]},
+        "n3",
+    )
+
+    result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
+
+    assert not result.ok
+    assert result.stage == "policy"
+
+
+# --- P0.9 (2026-09-15, GPT-approved CHANGE APPROVAL): goal_node_id is now the
+# SOLE, strict authority for any plan that carries the key at all -- an
+# unresolved goal_node_id must fail closed, never fall through to the older
+# deterministic fills (which never had the chance to see goal_node_id and
+# would otherwise take an uninvited second guess) and never leave the
+# model's own raw goal_spec.predicate in place. A plan with NO goal_node_id
+# key (e.g. BootstrapPlanner) is untouched -- the old fills keep working
+# exactly as before P0.7 ever existed.
+
+def test_compile_goal_node_return_value_reflects_gating_not_success():
+    gated_unresolved = {
+        "root": {"type": "Action", "node_id": "n1", "skill": "say", "args": {"text": "hi"}},
+        "goal_spec": {"type": "human", "verification": {"mode": "implicit_conversation"}},
+        "goal_node_id": None,
+    }
+    assert _compile_goal_spec_from_goal_node(gated_unresolved) is True
+
+    gated_resolved = {
+        "root": {"type": "Action", "node_id": "n1", "skill": "approach_entity", "args": {"target": "A"}},
+        "goal_spec": {"type": "human", "verification": {"mode": "implicit_conversation"}},
+        "goal_node_id": "n1",
+    }
+    assert _compile_goal_spec_from_goal_node(gated_resolved) is True
+
+    not_gated = {
+        "root": {"type": "Action", "node_id": "n1", "skill": "approach_entity", "args": {"target": "A"}},
+        "goal_spec": {"type": "human", "verification": {"mode": "implicit_conversation"}},
+    }
+    assert _compile_goal_spec_from_goal_node(not_gated) is False
+
+
+def test_compile_goal_node_gate_discards_the_models_own_raw_predicate_when_unresolved():
+    # The model ALSO wrote a plausible-looking structured goal_spec directly
+    # -- but goal_node_id itself is unresolvable (points nowhere). The raw
+    # predicate must be discarded, never trusted, even though it looks fine.
+    plan = {
+        "root": {"type": "Sequence", "children": [
+            _node("Action", "n1", skill="search_for_entity", args={"target": "X"}),
+            _node("Action", "n2", skill="approach_entity", args={"target": "X"}),
+        ]},
+        "goal_spec": {"type": "structured", "predicate": "entity_approached",
+                       "args": {"target": "X"}, "verification": {"mode": "world_state"}},
+        "goal_node_id": "does-not-exist",
+    }
+    was_gated = _compile_goal_spec_from_goal_node(plan)
+    assert was_gated is True
+    assert "predicate" not in plan["goal_spec"]
+    assert plan["goal_spec"]["type"] == "human"
+
+
+def test_gated_unresolved_plan_never_gets_a_second_guess_from_the_old_fills():
+    # This EXACT shape (single physical action) is precisely what the old
+    # single-action fallback fill would normally compile on its own -- but
+    # since goal_node_id is present (even though unresolvable here), the old
+    # fill must never run at all. Simulates PlanningPipeline.plan()'s own
+    # call order directly.
+    plan = {
+        "root": {"type": "Action", "node_id": "n1", "skill": "approach_entity", "args": {"target": "A"}},
+        "goal_spec": {"type": "human", "verification": {"mode": "implicit_conversation"}},
+        "goal_node_id": "does-not-exist",
+    }
+    was_gated = _compile_goal_spec_from_goal_node(plan)
+    if not was_gated:
+        _apply_deterministic_goal_spec(plan)
+    assert was_gated is True
+    assert "predicate" not in plan["goal_spec"]  # NOT entity_approached -- old fill never ran
+
+
+def test_no_goal_node_id_key_still_lets_the_old_fills_run_unmodified():
+    # BootstrapPlanner-style contract: no goal_node_id key at all. The old
+    # fills must still work exactly as they did before P0.7/P0.9 existed.
+    plan = {
+        "root": {"type": "Action", "skill": "approach_entity", "args": {"target": "A"}},
+        "goal_spec": {"type": "human", "verification": {"mode": "implicit_conversation"}},
+    }
+    was_gated = _compile_goal_spec_from_goal_node(plan)
+    if not was_gated:
+        _apply_deterministic_goal_spec(plan)
+    assert was_gated is False
+    assert plan["goal_spec"]["predicate"] == "entity_approached"
+
+
+def test_pipeline_gate_prevents_false_success_even_when_shape_matches_an_old_fill():
+    # Full end-to-end: goal_node_id present but unresolvable (condition-mode
+    # VisualCheck marked as the goal), on a plan whose PHYSICAL actions alone
+    # (ignoring the VisualCheck, exactly like the old fills do) would have
+    # cleanly matched _fill_search_then_approach_goal_spec if the old fills
+    # had been allowed to run. Must be REJECTED, not silently filled in.
+    mission, missions = _mission("Find the mug and check whether it is full.")
+    plan_json = _plan_with_goal_node(
+        {"type": "Sequence", "children": [
+            {"type": "Action", "node_id": "n1", "skill": "search_for_entity", "args": {"target": "the mug"}},
+            {"type": "Action", "node_id": "n2", "skill": "approach_entity", "args": {"target": "the mug"}},
+            {"type": "VisualCheck", "node_id": "n3", "mode": "condition", "check": {"query": "is it full?"}},
+        ]},
+        "n3",
+    )
+
+    result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
+
+    assert not result.ok
+    assert result.stage == "policy"
+    assert "goal_spec uses implicit/human success verification" in result.message
+
+
+# --- P0.10 (2026-09-15, GPT-approved CHANGE APPROVAL, z-doc 92/102/103/104):
+# _canonicalize_visualcheck_fallback -- corrects doc 103's own remaining gap.
+# Two Fallback branches sharing the same compiled goal does not prove the BT
+# can actually reach the branch matching the real VisualCheck answer (a bare
+# say Action always succeeds, so Fallback[Seq[return,say(TRUE)],
+# Seq[return,say(FALSE)]] always completes via branch 1). This canonicalizer
+# removes the broken shape at its source instead of merely making its
+# goal_spec safe. Converted from doc 104's own 10 TEMP synthetic cases.
+
+def _fb_action(node_id, skill, args=None):
+    return {"type": "Action", "node_id": node_id, "skill": skill, "args": args or {}}
+
+
+def _fb_say(node_id, text):
+    return _fb_action(node_id, "say", {"text": text})
+
+
+def _fb_vc_observe(node_id, query):
+    return {"type": "VisualCheck", "node_id": node_id, "mode": "observe", "check": {"query": query}}
+
+
+def _fb_seq(*children):
+    return {"type": "Sequence", "children": list(children)}
+
+
+def _fb_fallback(*branches):
+    return {"type": "Fallback", "children": list(branches)}
+
+
+def _has_any_say(node):
+    if not isinstance(node, dict):
+        return False
+    if node.get("type") == "Action" and node.get("skill") == "say":
+        return True
+    return (any(_has_any_say(c) for c in node.get("children", []) or [])
+            or _has_any_say(node.get("child")))
+
+
+def test_canonicalize_vc_fallback_voice_differs_physical_identical():
+    plan = {"root": _fb_seq(
+        _fb_action("n1", "approach_entity", {"target": "bob"}),
+        _fb_vc_observe("n2", "is bob next to a potted plant?"),
+        _fb_fallback(
+            _fb_seq(_fb_action("n3", "approach_entity", {"target": "xiaow"}), _fb_say("n4", "bob is watering")),
+            _fb_seq(_fb_action("n5", "approach_entity", {"target": "xiaow"}), _fb_say("n6", "bob is not watering")),
+        ),
+    )}
+    _canonicalize_visualcheck_fallback(plan)
+    assert plan.get("goal_node_id") == "n3"
+    assert not _has_any_say(plan["root"])
+    tail = plan["root"]["children"][-1]
+    assert tail == {"type": "Action", "node_id": "n3", "skill": "approach_entity", "args": {"target": "xiaow"}}
+
+
+def test_canonicalize_vc_fallback_content_blind_unsupported_inference_say():
+    # A say claiming MORE than the query checked (proximity != watering)
+    # canonicalizes IDENTICALLY to a direct-restatement say -- content is
+    # never read, only structure.
+    plan = {"root": _fb_seq(
+        _fb_action("n1", "approach_entity", {"target": "bob"}),
+        _fb_vc_observe("n2", "is bob standing next to a potted plant?"),
+        _fb_fallback(
+            _fb_seq(_fb_action("n3", "approach_entity", {"target": "xiaow"}), _fb_say("n4", "bob is watering the plants")),
+            _fb_seq(_fb_action("n5", "approach_entity", {"target": "xiaow"}), _fb_say("n6", "bob is not watering the plants")),
+        ),
+    )}
+    _canonicalize_visualcheck_fallback(plan)
+    assert plan.get("goal_node_id") == "n3"
+    assert not _has_any_say(plan["root"])
+
+
+def test_canonicalize_vc_fallback_declines_different_targets():
+    plan = {"root": _fb_seq(
+        _fb_vc_observe("n1", "q?"),
+        _fb_fallback(
+            _fb_seq(_fb_action("n2", "approach_entity", {"target": "xiaow"}), _fb_say("n3", "a")),
+            _fb_seq(_fb_action("n4", "approach_entity", {"target": "someone_else"}), _fb_say("n5", "b")),
+        ),
+    )}
+    before = copy.deepcopy(plan)
+    _canonicalize_visualcheck_fallback(plan)
+    assert plan == before  # completely untouched, never guesses
+
+
+def test_canonicalize_vc_fallback_declines_extra_enabling_step_in_one_branch():
+    # branch 2's final action matches branch 1's, but the WHOLE sequence
+    # differs (an extra step first) -- stricter than terminal-predicate-only
+    # agreement, must still decline.
+    plan = {"root": _fb_seq(
+        _fb_vc_observe("n1", "q?"),
+        _fb_fallback(
+            _fb_seq(_fb_action("n2", "approach_entity", {"target": "xiaow"}), _fb_say("n3", "a")),
+            _fb_seq(_fb_action("n4", "go_to_place", {"place": "hallway"}),
+                    _fb_action("n5", "approach_entity", {"target": "xiaow"}), _fb_say("n6", "b")),
+        ),
+    )}
+    before = copy.deepcopy(plan)
+    _canonicalize_visualcheck_fallback(plan)
+    assert plan == before
+
+
+def test_canonicalize_vc_fallback_declines_branch_with_only_say():
+    plan = {"root": _fb_seq(
+        _fb_vc_observe("n1", "q?"),
+        _fb_fallback(
+            _fb_seq(_fb_action("n2", "approach_entity", {"target": "xiaow"}), _fb_say("n3", "a")),
+            _fb_seq(_fb_say("n4", "b")),
+        ),
+    )}
+    before = copy.deepcopy(plan)
+    _canonicalize_visualcheck_fallback(plan)
+    assert plan == before
+
+
+def test_canonicalize_vc_fallback_declines_nested_fallback_inside_branch():
+    plan = {"root": _fb_seq(
+        _fb_vc_observe("n1", "q?"),
+        _fb_fallback(
+            _fb_seq(_fb_fallback(_fb_seq(_fb_action("n2", "approach_entity", {"target": "xiaow"})),
+                                  _fb_seq(_fb_action("n3", "approach_entity", {"target": "someone_else"}))),
+                     _fb_say("n4", "a")),
+            _fb_seq(_fb_action("n5", "approach_entity", {"target": "xiaow"}), _fb_say("n6", "b")),
+        ),
+    )}
+    before = copy.deepcopy(plan)
+    _canonicalize_visualcheck_fallback(plan)
+    assert plan == before
+
+
+def test_canonicalize_vc_fallback_not_this_shape_observation_terminal():
+    # VisualCheck IS the last node, no Fallback follows -- correctly a no-op.
+    plan = {"root": _fb_seq(_fb_action("n1", "approach_entity", {"target": "bob"}), _fb_vc_observe("n2", "q?"))}
+    before = copy.deepcopy(plan)
+    _canonicalize_visualcheck_fallback(plan)
+    assert plan == before
+
+
+def test_canonicalize_vc_fallback_not_this_shape_condition_mode():
+    # condition-mode VisualCheck is doc 92's OTHER, still-valid use (a real
+    # branch gate) -- must not be touched by this canonicalizer.
+    plan = {"root": _fb_seq(
+        {"type": "VisualCheck", "node_id": "n1", "mode": "condition", "check": {"query": "q?"}},
+        _fb_fallback(
+            _fb_seq(_fb_action("n2", "approach_entity", {"target": "xiaow"}), _fb_say("n3", "a")),
+            _fb_seq(_fb_action("n4", "approach_entity", {"target": "xiaow"}), _fb_say("n5", "b")),
+        ),
+    )}
+    before = copy.deepcopy(plan)
+    _canonicalize_visualcheck_fallback(plan)
+    assert plan == before
+
+
+def test_canonicalize_vc_fallback_three_branches_all_identical():
+    plan = {"root": _fb_seq(
+        _fb_vc_observe("n1", "q?"),
+        _fb_fallback(
+            _fb_seq(_fb_action("n2", "approach_entity", {"target": "xiaow"}), _fb_say("n3", "a")),
+            _fb_seq(_fb_action("n4", "approach_entity", {"target": "xiaow"}), _fb_say("n5", "b")),
+            _fb_seq(_fb_action("n6", "approach_entity", {"target": "xiaow"}), _fb_say("n7", "c")),
+        ),
+    )}
+    _canonicalize_visualcheck_fallback(plan)
+    assert plan.get("goal_node_id") == "n2"
+    assert not _has_any_say(plan["root"])
+
+
+def test_canonicalize_vc_fallback_declines_when_something_follows_the_fallback():
+    plan = {"root": _fb_seq(
+        _fb_vc_observe("n1", "q?"),
+        _fb_fallback(
+            _fb_seq(_fb_action("n2", "approach_entity", {"target": "xiaow"}), _fb_say("n3", "a")),
+            _fb_seq(_fb_action("n4", "approach_entity", {"target": "xiaow"}), _fb_say("n5", "b")),
+        ),
+        _fb_action("n6", "say", {"text": "done"}),
+    )}
+    before = copy.deepcopy(plan)
+    _canonicalize_visualcheck_fallback(plan)
+    assert plan == before
+
+
+# --- Full-pipeline integration: the canonicalizer runs, THEN the existing,
+# unmodified P0.9 strict gate does the actual compile via the goal_node_id
+# the canonicalizer set -- no second compiler.
+
+def test_pipeline_canonicalizes_broken_fallback_and_reaches_real_success():
+    mission, missions = _mission(
+        "Go to bob_live_test and check whether she is standing next to a potted plant, "
+        "then come back to xiaow and report the result."
+    )
+    plan_json = json.dumps({
+        "schema": "mc_ai_bt.plan.v1",
+        "root": _fb_seq(
+            {"type": "Action", "node_id": "n1", "skill": "approach_entity", "args": {"target": "bob_live_test"}},
+            _fb_vc_observe("n2", "is bob_live_test standing next to a potted plant?"),
+            _fb_fallback(
+                _fb_seq({"type": "Action", "node_id": "n3", "skill": "approach_entity", "args": {"target": "xiaow"}},
+                        {"type": "Action", "node_id": "n4", "skill": "say", "args": {"text": "bob_live_test is watering the plants."}}),
+                _fb_seq({"type": "Action", "node_id": "n5", "skill": "approach_entity", "args": {"target": "xiaow"}},
+                        {"type": "Action", "node_id": "n6", "skill": "say", "args": {"text": "bob_live_test is not watering the plants."}}),
+            ),
+        ),
+        "goal_spec": {"type": "human", "verification": {"mode": "implicit_conversation"}},
+        "goal_node_id": None,
+    })
+
+    result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
+
+    assert result.ok, result.message
+    goal_spec = json.loads(result.goal_spec_json)
+    assert goal_spec["predicate"] == "entity_approached"
+    assert goal_spec["args"]["target"] == "xiaow"
+    bt = json.loads(result.bt_json)
+    assert not _has_any_say(bt)  # no pre-authored TRUE/FALSE-dependent speech survives
+
+
+def test_pipeline_leaves_mismatched_fallback_unresolved_not_false_success():
+    mission, missions = _mission("Go check X, then report to two different people depending on the answer.")
+    plan_json = json.dumps({
+        "schema": "mc_ai_bt.plan.v1",
+        "root": _fb_seq(
+            _fb_vc_observe("n1", "q?"),
+            _fb_fallback(
+                _fb_seq({"type": "Action", "node_id": "n2", "skill": "approach_entity", "args": {"target": "xiaow"}},
+                        {"type": "Action", "node_id": "n3", "skill": "say", "args": {"text": "a"}}),
+                _fb_seq({"type": "Action", "node_id": "n4", "skill": "approach_entity", "args": {"target": "someone_else"}},
+                        {"type": "Action", "node_id": "n5", "skill": "say", "args": {"text": "b"}}),
+            ),
+        ),
+        "goal_spec": {"type": "human", "verification": {"mode": "implicit_conversation"}},
+        "goal_node_id": None,
+    })
+
+    result = _pipeline(StaticPlanner(plan_json)).plan(mission, missions)
+
+    assert not result.ok
+    assert result.stage == "policy"

@@ -30,6 +30,18 @@ class TriState(str, Enum):
 class CheckResult:
     state: TriState
     message: str
+    # P0.4 observation-provenance fields (z-doc 91): OPTIONAL, additive, default
+    # empty/None -- every one of the 86 pre-existing CheckResult(state, message)
+    # call sites across this file is unaffected. Populated only by
+    # visual_client.py's _check_result_from_msg, from the real VisualCheckResult
+    # ROS message (mc_one/msg/VisualCheckResult.msg) -- confirmed by direct
+    # source read (z-doc 90) that these fields already exist on the wire and
+    # were simply being discarded before this round, not a new evidence source.
+    confidence: float | None = None
+    observed_at: float | None = None
+    provider_name: str = ""
+    model_name: str = ""
+    stale: bool = False
 
     @property
     def is_true(self) -> bool:
@@ -64,6 +76,26 @@ class PredicateSpec:
     # deliberately unchanged: the snapshot fetch still happens, it just could
     # never have helped.
     execution_only: bool = False
+    # P0 safety fix (2026-09-15, GPT-approved CHANGE APPROVAL, z-doc 107/108):
+    # orthogonal to execution_only above -- that one is about WHERE evidence
+    # comes from, this one is about whether this predicate's own check logic
+    # can ever produce TriState.FALSE at all. True only for a predicate whose
+    # dedicated handler in _check_execution_facts below has no FALSE branch
+    # by design (see visual_check_completed's own handler and its "never
+    # resolves FALSE" contract, already covered by
+    # test_visual_check_completed_never_resolves_false -- that test proves
+    # the property this flag now names, it does not change it).
+    #
+    # CONFIRMED live 2026-09-15 (z-doc 107): a real gpt-4o draw used
+    # visual_check_completed as a Condition gating one branch of a Fallback
+    # meant to distinguish a VisualCheck's real TRUE/FALSE answer. Since this
+    # predicate is TRUE the instant the check merely completes, that branch
+    # always won regardless of the real answer -- Validator/PolicyGuard/P0.9/
+    # P0.10 all correctly passed the plan, none of them were ever scoped to
+    # catch this (see policy_guard.py's own new Fallback-branch-gate check,
+    # the one place this flag is actually consumed). Does NOT change this
+    # predicate's own GoalCheck semantics in any way -- read-only metadata.
+    never_resolves_false: bool = False
 
 
 PREDICATE_REGISTRY: dict[str, PredicateSpec] = {
@@ -151,6 +183,21 @@ PREDICATE_REGISTRY: dict[str, PredicateSpec] = {
     # (the live test that round had to fall back to the unrelated person_named
     # predicate to get a real SUCCEEDED at all).
     "entity_alias_bound": PredicateSpec("entity_alias_bound", ("entity_aliases",), "entity_aliases"),
+    # P0.4 (z-doc 91): CONFIRMED gap (z-doc 90) -- TriState conflated "was this
+    # observation performed" with "what did it find": a VisualCheck answering
+    # FALSE was structurally identical to the mission itself failing. This
+    # predicate is the fix's other half from executor.py's VisualCheck
+    # mode="observe": TRUE means the requested visual observation obtained a
+    # definitive TRUE or FALSE result (facts["visual_check_result"]["completed"]
+    # is True) -- the actual value lives separately in that same fact's own
+    # "value" field, never folded into this predicate's own TRUE/FALSE. Never
+    # resolves FALSE (nothing ever writes visual_check_result with
+    # completed=False -- see executor.py's own _record_visual_check_result,
+    # which is only ever called on a definitive answer); missing/not-yet-run
+    # correctly reads UNKNOWN, same as every other execution_only predicate.
+    "visual_check_completed": PredicateSpec(
+        "visual_check_completed", ("objects", "people", "entities"), "objects",
+        execution_only=True, never_resolves_false=True),
 }
 
 
@@ -317,6 +364,13 @@ class GoalChecker:
 
         if predicate == "entity_alias_bound":
             return _entity_alias_bound_result(args, facts.get("entity_alias_bound"), source="execution facts")
+
+        if predicate == "visual_check_completed":
+            entry = facts.get("visual_check_result")
+            if not isinstance(entry, dict) or entry.get("completed") is not True:
+                return CheckResult(TriState.UNKNOWN, "visual_check_result fact missing")
+            return CheckResult(
+                TriState.TRUE, f"visual observation completed, value={entry.get('value')!r}")
 
         if predicate == "room_scanned":
             # 2026-09-08, produced-data-closure round: observed_track_count is

@@ -256,6 +256,54 @@ def test_accepts_visual_check_nodes():
     assert result.ok
 
 
+# --- P0.4 (z-doc 91): VisualCheck's optional "mode" field -------------------
+
+def test_visual_check_with_no_mode_key_is_accepted_as_condition_default():
+    plan = {
+        "root": {"type": "VisualCheck", "check": {"query": "is the test_object visible?"}},
+        "goal_spec": {"type": "human", "verification": {"mode": "implicit_conversation"}},
+    }
+    assert PlanValidator().validate(plan).ok
+
+
+def test_visual_check_with_explicit_condition_mode_is_accepted():
+    plan = {
+        "root": {
+            "type": "VisualCheck", "mode": "condition",
+            "check": {"query": "is the test_object visible?"},
+        },
+        "goal_spec": {"type": "human", "verification": {"mode": "implicit_conversation"}},
+    }
+    assert PlanValidator().validate(plan).ok
+
+
+def test_visual_check_with_observe_mode_is_accepted():
+    plan = {
+        "root": {
+            "type": "VisualCheck", "mode": "observe",
+            "check": {"query": "is bob_live_test standing next to a potted plant?"},
+        },
+        "goal_spec": {"type": "structured", "predicate": "visual_check_completed",
+                      "verification": {"mode": "world_state"}},
+    }
+    assert PlanValidator().validate(plan).ok
+
+
+def test_visual_check_with_unknown_mode_is_rejected():
+    plan = {
+        "root": {
+            "type": "VisualCheck", "mode": "something_else",
+            "check": {"query": "is the test_object visible?"},
+        },
+        "goal_spec": {"type": "human", "verification": {"mode": "implicit_conversation"}},
+    }
+
+    result = PlanValidator().validate(plan)
+
+    assert not result.ok
+    assert any("mode" in error for error in result.errors)
+
+
 def test_accepts_parallel_timeout_and_noaction_nodes():
     plan = {
         "root": {

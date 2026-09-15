@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 from dataclasses import dataclass
 from typing import Any
@@ -428,6 +429,13 @@ def _apply_grounding_normalizer(plan: dict[str, Any], context_json: str) -> str 
 # sets recompute automatically, the same pattern PHYSICAL_SKILLS uses.
 _SELF_LOCATING_TERMINAL_SKILLS = frozenset(
     name for name, spec in DEFAULT_SKILLS.items() if spec.subsumes_locate_skills
+)
+# FOUND LIVE 2026-09-14: derived from skill_registry.py's own
+# resolves_alias_with_scan field (see that field's own docstring) -- the
+# same "declare once in the registry, never a hand-written set here"
+# discipline _SELF_LOCATING_TERMINAL_SKILLS already follows above.
+_ALIAS_SCAN_CAPABLE_SKILLS = frozenset(
+    name for name, spec in DEFAULT_SKILLS.items() if spec.resolves_alias_with_scan
 )
 _REDUNDANT_LOCATE_SKILLS = frozenset(
     skill
@@ -1278,16 +1286,29 @@ def _resolve_mission_target(
     target: dict[str, str], *, context_json: str, reference_resolver: Any,
 ) -> tuple[str, str, str]:
     """(state, entity_id, grounding_ref). state is one of
-    RESOLVED/AMBIGUOUS/NOT_FOUND/UNKNOWN.
+    RESOLVED/AMBIGUOUS/NOT_FOUND/UNKNOWN/UNRESOLVED.
 
     alias_reference targets reuse the EXISTING, Bridge-materialized
     grounded_entities lookup (_grounded_entity_ids above) -- the identical
     data _apply_grounding_normalizer already trusts for navigating to an
     already-bound alias (E1 TURN2's own path); no grounding_ref concept
     applies here (no NEW identity decision is being made, only navigation
-    to one already on record), and an UNRESOLVED alias fails closed with
-    no nearest-same-class fallback, exactly like the existing negative-test
-    contract.
+    to one already on record).
+
+    FOUND LIVE 2026-09-14: NOT_FOUND used to also cover a real, previously-
+    bound alias whose live grounding has simply gone stale (e.g. the person
+    is temporarily out of the camera's current view) -- collapsing "this
+    name was never registered" and "this is someone real, just not
+    confirmed right now" into the identical outcome, even though
+    entity_identity.py's own resolve_alias (what _grounded_entity_ids
+    reads) already distinguishes them (`entry is None` vs a real entry
+    with `grounding_state != RESOLVED`). UNRESOLVED is that second case,
+    kept genuinely distinct from NOT_FOUND: only a skill that declares
+    resolves_alias_with_scan (skill_registry.py) may act on it (see
+    _synthesize_mission_goal), and even then only by re-resolving this
+    SAME alias, physically turning to look if needed -- never a
+    nearest-same-class fallback, exactly the existing negative-test
+    contract's own posture for a genuinely unregistered alias.
 
     spatial_reference targets go through reference_resolver -- the
     planning-time CALLER of the existing, unmodified
@@ -1299,8 +1320,10 @@ def _resolve_mission_target(
     if target["kind"] == "alias_reference":
         grounded = _grounded_entity_ids(context_json)
         entry = grounded.get(_normalize_alias(target["alias"]))
-        if entry is None or entry.get("grounding_state") != "RESOLVED" or not entry.get("entity_id"):
+        if entry is None:
             return "NOT_FOUND", "", ""
+        if entry.get("grounding_state") != "RESOLVED" or not entry.get("entity_id"):
+            return "UNRESOLVED", "", ""
         return "RESOLVED", entry["entity_id"], ""
     if reference_resolver is None:
         return "UNKNOWN", "", ""
@@ -1309,6 +1332,381 @@ def _resolve_mission_target(
         relation=target["relation"],
         reference_frame=target["reference_frame"],
     )
+
+
+def _goal_relevant_nodes_in_order(node: Any, out: list[dict[str, Any]]) -> None:
+    """Every Action and VisualCheck node, depth-first, in the same order
+    _physical_actions_in/_sequential_physical_actions_in already walk a tree
+    (Sequence/Fallback/Parallel children, Retry/Timeout child) -- but keeping
+    EVERY Action (not just PHYSICAL_SKILLS ones) and every VisualCheck,
+    regardless of mode, since goal_node_id may legitimately name any of them."""
+    if not isinstance(node, dict):
+        return
+    node_type = node.get("type")
+    if node_type in {"Action", "VisualCheck"}:
+        out.append(node)
+        return
+    if node_type in {"Sequence", "Fallback", "Parallel"}:
+        for child in node.get("children", []) or []:
+            _goal_relevant_nodes_in_order(child, out)
+        return
+    if node_type in {"Retry", "Timeout"}:
+        _goal_relevant_nodes_in_order(node.get("child"), out)
+
+
+def _find_node_by_goal_node_id(node: Any, node_id: str) -> dict[str, Any] | None:
+    if not isinstance(node, dict):
+        return None
+    if node.get("node_id") == node_id:
+        return node
+    for child in node.get("children", []) or []:
+        found = _find_node_by_goal_node_id(child, node_id)
+        if found is not None:
+            return found
+    child = node.get("child")
+    if isinstance(child, dict):
+        return _find_node_by_goal_node_id(child, node_id)
+    return None
+
+
+def _unique_result_predicate(skill: str) -> str | None:
+    """The one predicate a skill's execution produces, or None if the skill
+    is unknown, voice-dispatch (speaking is never itself the physical/
+    informational obligation a mission was asked to satisfy), or declares
+    zero or 2+ result predicates (no single unambiguous reading exists).
+    Reads DEFAULT_SKILLS.result_predicates directly -- the same source
+    PREDICATE_TO_SKILLS (policy_guard.py) and every fill above already treat
+    as authoritative; deliberately not a second, hand-maintained mapping."""
+    spec = DEFAULT_SKILLS.get(skill)
+    if spec is None or spec.dispatch == "voice" or len(spec.result_predicates) != 1:
+        return None
+    return spec.result_predicates[0]
+
+
+def _has_later_eligible_action(nodes_in_order: list[dict[str, Any]], index: int) -> bool:
+    for later in nodes_in_order[index + 1:]:
+        if later.get("type") == "Action" and _unique_result_predicate(later.get("skill")) is not None:
+            return True
+    return False
+
+
+def _eligible_goal_candidates(
+    nodes_in_order: list[dict[str, Any]],
+) -> list[tuple[dict[str, Any], str]]:
+    """Every node whose predicate is deterministically derivable AND eligible
+    to stand as a mission's own terminal obligation: a non-voice Action with
+    exactly one declared result_predicate, or an observe-mode VisualCheck with
+    nothing eligible after it in the same unconditional continuation (a later
+    physical action still needing to happen means the observation was not,
+    itself, the whole point)."""
+    candidates: list[tuple[dict[str, Any], str]] = []
+    for index, node in enumerate(nodes_in_order):
+        if node.get("type") == "Action":
+            predicate = _unique_result_predicate(node.get("skill"))
+            if predicate is not None:
+                candidates.append((node, predicate))
+        elif node.get("type") == "VisualCheck" and node.get("mode") == "observe":
+            if not _has_later_eligible_action(nodes_in_order, index):
+                candidates.append((node, "visual_check_completed"))
+    return candidates
+
+
+_UNRESOLVED_GOAL_SUMMARY = (
+    "UNRESOLVED_GOAL: goal_node_id did not compile to a single, safe, eligible "
+    "terminal predicate"
+)
+
+
+def _is_voice_dispatch_action(node: Any) -> bool:
+    if not isinstance(node, dict) or node.get("type") != "Action":
+        return False
+    spec = DEFAULT_SKILLS.get(node.get("skill"))
+    return spec is not None and spec.dispatch == "voice"
+
+
+def _structurally_equal_ignoring_node_id(a: Any, b: Any) -> bool:
+    """Deep-equal two node subtrees, ignoring only node_id (a label, never
+    semantic content) -- type, skill, args, mode, check, and children
+    structure must all match exactly. No content/text comparison happens
+    here for say nodes because say nodes never reach this function at all
+    (see _physical_residue_for_branch): this function only ever compares
+    the PHYSICAL residue already stripped of voice-dispatch nodes."""
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, dict):
+        keys = (set(a.keys()) | set(b.keys())) - {"node_id"}
+        return all(_structurally_equal_ignoring_node_id(a.get(k), b.get(k)) for k in keys)
+    if isinstance(a, list):
+        return len(a) == len(b) and all(
+            _structurally_equal_ignoring_node_id(x, y) for x, y in zip(a, b)
+        )
+    return a == b
+
+
+def _physical_residue_for_branch(branch_node: Any) -> list[dict[str, Any]] | None:
+    """A Fallback branch's own top-level children with every voice-dispatch
+    node removed, in order -- never inspects any node's text/args content,
+    only type/skill. A bare single Action/VisualCheck/Condition branch (not
+    wrapped in its own Sequence) is treated as a one-node sequence. Returns
+    None (never guessed) for anything this canonicalizer does not have a
+    safe, narrow answer for: a nested Fallback inside the branch, or any
+    other node shape."""
+    if isinstance(branch_node, dict) and branch_node.get("type") == "Sequence":
+        children = branch_node.get("children") or []
+    elif isinstance(branch_node, dict) and branch_node.get("type") in {"Action", "VisualCheck", "Condition"}:
+        children = [branch_node]
+    else:
+        return None
+    residue: list[dict[str, Any]] = []
+    for child in children:
+        if not isinstance(child, dict) or child.get("type") == "Fallback":
+            return None
+        if _is_voice_dispatch_action(child):
+            continue
+        residue.append(child)
+    return residue
+
+
+def _find_visualcheck_then_fallback(
+    node: Any,
+) -> tuple[dict[str, Any], int, dict[str, Any], dict[str, Any]] | None:
+    """Locates a Sequence containing a VisualCheck(mode="observe") node whose
+    VERY NEXT sibling in that SAME Sequence's children is exactly one
+    Fallback node, with nothing else after the Fallback in that Sequence --
+    narrowly scoped to precisely the doc 92/104-flagged shape. Returns
+    (parent_sequence, vc_index, vc_node, fallback_node) or None."""
+    if not isinstance(node, dict):
+        return None
+    if node.get("type") == "Sequence":
+        children = node.get("children") or []
+        for i, child in enumerate(children):
+            if (
+                isinstance(child, dict) and child.get("type") == "VisualCheck"
+                and child.get("mode") == "observe" and i + 1 < len(children)
+            ):
+                nxt = children[i + 1]
+                if isinstance(nxt, dict) and nxt.get("type") == "Fallback" and i + 2 == len(children):
+                    return (node, i, child, nxt)
+        for child in children:
+            found = _find_visualcheck_then_fallback(child)
+            if found is not None:
+                return found
+        return None
+    child = node.get("child")
+    if isinstance(child, dict):
+        return _find_visualcheck_then_fallback(child)
+    return None
+
+
+def _canonicalize_visualcheck_fallback(plan: dict[str, Any]) -> None:
+    """P0.10 (z-doc 92/102/103/104, GPT-approved CHANGE APPROVAL): doc 103's
+    branch-invariant goal_spec fix proved two Fallback branches compile to
+    the SAME physical predicate, but never fixed the underlying BT execution
+    bug doc 92 originally flagged: a bare say Action inside a Sequence
+    essentially always succeeds, so
+    Fallback[Sequence[<return>, say(TRUE text)], Sequence[<return>, say(FALSE
+    text)]] always completes via branch 1 the instant <return> itself
+    succeeds -- REGARDLESS of the real VisualCheck answer. Doc 103 made the
+    goal_spec safe; it never made the FALSE branch reachable.
+
+    This function removes the bug at its source instead: when a
+    VisualCheck(mode="observe") is immediately followed by exactly one
+    Fallback (nothing else after it in the same Sequence), and every one of
+    that Fallback's branches -- with voice-dispatch nodes stripped -- reduces
+    to a NON-EMPTY, STRUCTURALLY IDENTICAL physical residue (the whole
+    sequence, not merely its own terminal predicate -- stricter than doc
+    103's own check on purpose), the Fallback is replaced by that one shared
+    physical sequence and goal_node_id is pointed at its own last node.
+    There is no longer a second branch to fail to reach, and no longer any
+    pre-authored TRUE/FALSE-dependent speech at all: the mission's own
+    genuine terminal outcome, and doc 88/91's own unmodified deterministic
+    mission-outcome renderer reading the real visual_check_result fact, are
+    the only remaining way this mission's answer ever reaches the caller --
+    exactly the "let the terminal-event channel carry the result" contract
+    this whole effort has always intended.
+
+    Deliberately content-blind: no node's text/args value is ever read to
+    decide whether to canonicalize, only type/skill/mode/children shape --
+    this is what makes it safe regardless of whether a branch's say text was
+    a direct restatement of the checked query or an unsupported inferential
+    leap beyond it (e.g. "standing next to a potted plant" vs "is watering
+    the plants"): both are deleted identically, never judged, never trusted
+    as evidence either way.
+
+    Any mismatch -- different targets, an extra enabling step in one branch,
+    an empty-residue branch, a nested Fallback, anything this function does
+    not have an exact, narrow answer for -- leaves the plan COMPLETELY
+    untouched (not even goal_node_id is read or written): falls through to
+    _compile_goal_spec_from_goal_node/_apply_deterministic_goal_spec exactly
+    as if this function had never run. Reuses the EXISTING, already-approved
+    P0.9 strict gate to perform the actual compile (via the goal_node_id it
+    sets) -- deliberately not a second compiler."""
+    found = _find_visualcheck_then_fallback(plan.get("root"))
+    if found is None:
+        return
+    parent_seq, vc_index, _vc_node, fallback_node = found
+    branches = fallback_node.get("children") or []
+    if len(branches) < 2:
+        return
+    residues = [_physical_residue_for_branch(b) for b in branches]
+    if any(r is None or len(r) == 0 for r in residues):
+        return
+    shared = residues[0]
+    if not all(_structurally_equal_ignoring_node_id(shared, r) for r in residues[1:]):
+        return
+    last_node_id = shared[-1].get("node_id") if isinstance(shared[-1], dict) else None
+    if not last_node_id:
+        return
+    parent_seq["children"] = parent_seq["children"][: vc_index + 1] + copy.deepcopy(shared)
+    plan["goal_node_id"] = last_node_id
+
+
+def _force_unresolved_goal(plan: dict[str, Any]) -> None:
+    """P0.9 (2026-09-15, GPT-approved CHANGE APPROVAL): overwrites goal_spec
+    with a canonical implicit/human shape -- never leaves whatever predicate
+    string the model itself typed in place. This is deliberately the SAME
+    shape PolicyGuard's own, unmodified _check_goal_alignment already knows
+    how to reject ("implicit/human success verification ... contains
+    physical skill(s)"): reusing that existing, proven rejection path rather
+    than inventing a new one. A plan with zero physical skills correctly
+    still passes as an ordinary implicit/human mission -- exactly the
+    fixed_say precedent (docs 94-97) that was never broken."""
+    plan["goal_spec"] = {
+        "type": "human",
+        "verification": {"mode": "implicit_conversation"},
+        "summary": _UNRESOLVED_GOAL_SUMMARY,
+    }
+
+
+def _compile_goal_spec_from_goal_node(plan: dict[str, Any]) -> bool:
+    """P0.7 (z-doc 94-97, Candidate D, GPT-approved CHANGE APPROVAL): the LLM
+    planner no longer authors goal_spec.predicate as a trusted free-form
+    string. Instead it marks goal_node_id -- which one of its OWN Action/
+    VisualCheck nodes is this mission's real terminal obligation -- and this
+    function deterministically compiles the actual predicate from that node's
+    own already-declared skill/check contract (result_predicates, dispatch,
+    VisualCheck.mode), the same ground truth _fill_search_then_approach_goal_
+    spec/_fill_enabling_sequence_goal_spec/BootstrapPlanner's own _goal_spec_
+    for already trust -- never a second, hand-typed mapping, and never the
+    model's own predicate string.
+
+    Doc 94/95's live benchmark evidence: a static per-skill "enabling-only"
+    field is not semantically valid (the identical skill is correctly
+    terminal in one plan and correctly enabling in another depending on what
+    follows it) -- eligibility here is purely positional/instance-level,
+    never a property of the skill in isolation.
+
+    Doc 96: a VisualCheck(mode="observe") is ineligible if a later non-voice
+    physical action still follows in the same unconditional continuation --
+    confirmed live (doc93/95's own obsret_05: a fully correct BT where the
+    model prematurely marked the observation itself as done, one step before
+    the required physical return) and re-confirmed safe (0 false-success
+    regressions) across a 156-item benchmark spanning every required shape.
+
+    Doc 97: if the marked node is itself voice-dispatch (the model reading
+    "tell me/report" as "the goal is that I speak", the single largest
+    coverage cost measured across both benchmarks) it is excluded and the
+    WHOLE tree is scanned once more for eligible candidates; adopted only if
+    EXACTLY ONE remains anywhere -- 0 or 2+ is left unresolved, never
+    guessed. This recovered 14/66 (21%) of the say-node cases with zero
+    added false-success across 156 benchmarked items.
+
+    P0.9 (2026-09-15, GPT-approved CHANGE APPROVAL, doc 101's own finding):
+    doc 98's live re-acceptance and doc 100/101's larger benchmarks found
+    that when this function could not resolve a predicate, the plan used to
+    fall through to _apply_deterministic_goal_spec below and/or silently
+    keep the model's own raw goal_spec.predicate -- reintroducing the exact
+    pre-Candidate-D risk this whole effort exists to close, and doing so at
+    a HIGHER rate for longer/harder utterances than the original small
+    benchmark measured (doc 101: 48-67% false-success-of-executed). Once a
+    plan carries a "goal_node_id" key AT ALL -- i.e. it came from a
+    goal-node-aware planner (LlmJsonPlanner, post P0.7) -- goal_node_id is
+    now the SOLE authority for that plan's goal_spec, full stop: resolves
+    cleanly -> use it; anything else (null, not found, ineligible node,
+    condition-mode VisualCheck, a later physical action still pending, an
+    ambiguous say-node fallback) -> _force_unresolved_goal, never a silent
+    return that would leave the model's own string in place. Returns True
+    whenever the key was present (regardless of whether compilation
+    succeeded), which PlanningPipeline.plan() uses to skip
+    _apply_deterministic_goal_spec ENTIRELY for this plan -- the older,
+    VisualCheck-blind fills must never get an uninvited second guess at a
+    plan whose own planner already had the chance to name its terminal node.
+
+    A plan with NO "goal_node_id" key at all (BootstrapPlanner, or any other
+    caller that never adopted this contract) is completely untouched --
+    returns False immediately, exactly as before P0.7 existed, so
+    _apply_deterministic_goal_spec's own already-proven-safe fills keep
+    running for that path unmodified. This is a precise path distinction,
+    not a global removal of those fills: they remain the correct, sole
+    mechanism for any planner that never had a goal_node_id concept.
+
+    No keyword/alias/demo-specific logic anywhere in this function."""
+    if "goal_node_id" not in plan:
+        return False
+    goal_node_id = plan.pop("goal_node_id", None)
+    if not goal_node_id:
+        _force_unresolved_goal(plan)
+        return True
+    root = plan.get("root")
+    nodes_in_order: list[dict[str, Any]] = []
+    _goal_relevant_nodes_in_order(root, nodes_in_order)
+    node = _find_node_by_goal_node_id(root, goal_node_id)
+    if node is None:
+        _force_unresolved_goal(plan)
+        return True
+
+    node_type = node.get("type")
+    if node_type == "Action":
+        skill = node.get("skill")
+        spec = DEFAULT_SKILLS.get(skill)
+        if spec is not None and spec.dispatch == "voice":
+            candidates = _eligible_goal_candidates(nodes_in_order)
+            if len(candidates) != 1:
+                _force_unresolved_goal(plan)
+                return True
+            chosen_node, predicate = candidates[0]
+            args = dict(chosen_node.get("args") or {}) if chosen_node.get("type") == "Action" else {}
+            plan["goal_spec"] = {
+                "type": "structured",
+                "predicate": predicate,
+                "args": args,
+                "verification": {"mode": "world_state"},
+            }
+            return True
+        predicate = _unique_result_predicate(skill)
+        if predicate is None:
+            _force_unresolved_goal(plan)
+            return True
+        plan["goal_spec"] = {
+            "type": "structured",
+            "predicate": predicate,
+            "args": dict(node.get("args") or {}),
+            "verification": {"mode": "world_state"},
+        }
+        return True
+
+    if node_type == "VisualCheck":
+        if node.get("mode") != "observe":
+            _force_unresolved_goal(plan)
+            return True
+        try:
+            index = nodes_in_order.index(node)
+        except ValueError:
+            _force_unresolved_goal(plan)
+            return True
+        if _has_later_eligible_action(nodes_in_order, index):
+            _force_unresolved_goal(plan)
+            return True
+        plan["goal_spec"] = {
+            "type": "structured",
+            "predicate": "visual_check_completed",
+            "args": {},
+            "verification": {"mode": "world_state"},
+        }
+        return True
+
+    _force_unresolved_goal(plan)
+    return True
 
 
 def _apply_deterministic_goal_spec(plan: dict[str, Any]) -> None:
@@ -1454,40 +1852,80 @@ class PlanningPipeline:
 
         state, entity_id, grounding_ref = _resolve_mission_target(
             target, context_json=context_json, reference_resolver=self._reference_resolver)
-        if state != "RESOLVED":
+
+        if state == "UNRESOLVED" and skill in _ALIAS_SCAN_CAPABLE_SKILLS:
+            # FOUND LIVE 2026-09-14: a known-but-currently-unresolved alias
+            # authorized ONLY for a skill that declares resolves_alias_with_
+            # scan (skill_registry.py's own field docstring) -- hand it the
+            # RAW ALIAS, never an entity_id (there isn't one yet), and let
+            # that skill's own execution re-resolve this SAME alias, turning
+            # to look if needed (mc_embodied_skills'
+            # _resolve_alias_position_with_scan). Still never a class/
+            # nearest-instance guess: every other combination (a skill that
+            # does NOT declare this, or a spatial_reference target, which
+            # has no alias to re-resolve in the first place) falls straight
+            # through to the same rejection as before, unchanged.
+            label = target["alias"]
+            args: dict[str, Any] = {"target": label, "alias": target["alias"]}
+            goal_spec_args: dict[str, Any] = {"target": label, "alias": target["alias"]}
+        elif state != "RESOLVED":
             return PlanningResult(
                 False, "target_resolution",
                 f"target {goal.target_id!r} resolution state is {state} -- no physical BT authorized "
                 "(no nearest/same-class fallback)",
                 context_json=context_json,
             )
-
-        if target["kind"] == "spatial_reference":
-            label = f"{target['relation']} {target['entity_class']}"
         else:
-            label = target["alias"]
-        args: dict[str, Any] = {"target": label, "entity_id": entity_id}
-        goal_spec_args: dict[str, Any] = {"target": label, "entity_id": entity_id}
+            if target["kind"] == "spatial_reference":
+                label = f"{target['relation']} {target['entity_class']}"
+            else:
+                label = target["alias"]
+            args = {"target": label, "entity_id": entity_id}
+            goal_spec_args = {"target": label, "entity_id": entity_id}
 
-        if skill in _SELF_LOCATING_TERMINAL_SKILLS:
-            if not goal.alias:
-                return PlanningResult(
-                    False, "mission_goal_contract",
-                    f"goal {goal.goal_id!r} (predicate {goal.predicate!r}) requires an alias, none provided",
-                    context_json=context_json,
-                )
-            name_key = "name" if skill == "remember_person" else "alias"
-            args[name_key] = goal.alias
-            goal_spec_args[name_key] = goal.alias
-            # Machine-owned evidence propagation (GPT-approved trust
-            # boundary): only the explicit-entity_id naming path, which
-            # today has no upstream decision evidence of its own to point
-            # to (seattle_lab/mc_embodied_skills/node.py's own
-            # _remember_entity_by_id, evidence_ref=""), consumes this.
-            # The normal relation/reference_constraint_id path is untouched
-            # and keeps producing its own fresher, execution-time evidence.
-            if target["kind"] == "spatial_reference" and grounding_ref:
-                args[_INTERNAL_GROUNDING_FIELD] = grounding_ref
+            if skill in _SELF_LOCATING_TERMINAL_SKILLS:
+                if not goal.alias:
+                    return PlanningResult(
+                        False, "mission_goal_contract",
+                        f"goal {goal.goal_id!r} (predicate {goal.predicate!r}) requires an alias, none provided",
+                        context_json=context_json,
+                    )
+                name_key = "name" if skill == "remember_person" else "alias"
+                args[name_key] = goal.alias
+                goal_spec_args[name_key] = goal.alias
+                if target["kind"] == "spatial_reference":
+                    # FOUND LIVE 2026-09-14 (TOCTOU trace, real acceptance-test
+                    # run): this branch used to also carry the entity_id/
+                    # grounding_ref this SAME _resolve_mission_target call just
+                    # produced -- a real, live-confirmed bug: remember_person/
+                    # remember_entity's own execution (a real, non-zero gap
+                    # later: mission acceptance + journaling + BT dispatch) then
+                    # only re-checked whether that PLANNING-TIME id was still
+                    # tracked, never re-resolved it, so a live tracker-identity
+                    # churn between planning and execution (the same already-
+                    # documented F-S continuity limitation) failed the bind even
+                    # when a real, currently-resolvable candidate existed the
+                    # whole time. Fixed at the seattle_lab/mc_embodied_skills
+                    # side (_remember_entity_skill's own 2026-09-14 comment) by
+                    # re-resolving fresh, right before binding, from the
+                    # validated CONSTRAINT rather than a cached id -- which means
+                    # this planning-time id must never be handed to that skill as
+                    # if it were authoritative. `entity_id` is therefore
+                    # deliberately REMOVED from both args dicts for this one
+                    # skill family + target kind (still present, unchanged, for
+                    # every other skill/target combination -- e.g. approach_entity
+                    # genuinely does navigate to a specific already-resolved
+                    # position, a different concern this fix does not touch).
+                    # goal_spec_args drops it too: _entity_alias_bound_result
+                    # (goal_check.py) treats a present expected entity_id as an
+                    # exact-match requirement -- keeping a stale one there would
+                    # make a correct fresh-resolved bind read back as FALSE.
+                    args.pop("entity_id", None)
+                    goal_spec_args.pop("entity_id", None)
+                    args["entity_class"] = target["entity_class"]
+                    args["relation"] = target["relation"]
+                    goal_spec_args["entity_class"] = target["entity_class"]
+                    goal_spec_args["relation"] = target["relation"]
 
         plan = {
             "root": {"type": "Action", "skill": skill, "args": args},
@@ -1609,7 +2047,23 @@ class PlanningPipeline:
                 plan_json=plan_json,
             )
 
-        _apply_deterministic_goal_spec(plan)
+        # P0.10 (2026-09-15, GPT-approved CHANGE APPROVAL): tried BEFORE the
+        # strict gate, and only ever a no-op unless the plan matches the
+        # exact doc92/104 broken VisualCheck-then-Fallback shape (see that
+        # function's own docstring) -- when it matches, it sets goal_node_id
+        # itself so the strict gate immediately below compiles from the
+        # shared physical sequence it just spliced in.
+        _canonicalize_visualcheck_fallback(plan)
+
+        # P0.9 (2026-09-15, GPT-approved CHANGE APPROVAL): a plan carrying a
+        # goal_node_id key at all is goal-node-gated -- _apply_deterministic_
+        # goal_spec must never get a second, uninvited guess at it, whether
+        # or not the goal-node compilation itself actually succeeded (see
+        # that function's own docstring). A plan with no goal_node_id key
+        # (e.g. BootstrapPlanner) is untouched, exactly as before.
+        was_goal_node_gated = _compile_goal_spec_from_goal_node(plan)
+        if not was_goal_node_gated:
+            _apply_deterministic_goal_spec(plan)
 
         policy = self._policy_guard.check(plan)
         if not policy.ok:

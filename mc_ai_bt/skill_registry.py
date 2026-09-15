@@ -71,6 +71,25 @@ class SkillSpec:
     # result_predicates), so the two can never disagree. See
     # internally_resolved_predicates() below.
     resolves_own_target_acquisition: bool = False
+    # FOUND LIVE 2026-09-14: a mission targeting a NAMED alias (kind=
+    # alias_reference) that is currently UNRESOLVED (a real, previously-
+    # bound identity, just not confirmed RIGHT NOW -- e.g. temporarily out
+    # of the camera's current view) used to be indistinguishable at
+    # planning time from a genuinely never-registered alias, both
+    # collapsing to the same immediate "no physical BT authorized"
+    # rejection -- even though the entity is real and perfectly
+    # findable by turning to look, exactly like locate_entity/
+    # search_for_entity already do for a class-based reference. True only
+    # for a skill whose OWN execution, given `args["alias"]` with no
+    # `entity_id` yet, actively re-resolves that SAME alias (never a
+    # class/nearest-instance guess -- see mc_embodied_skills'
+    # _resolve_alias_position_with_scan) while physically turning between
+    # attempts, exactly the way subsumes_locate_skills' own self-locating
+    # skills already turn to find a class-based reference. Declaring this
+    # here (not a hand-written skill-name set in planning_pipeline.py) is
+    # the same "one more place to forget" avoidance subsumes_locate_skills
+    # and resolves_own_target_acquisition already document above.
+    resolves_alias_with_scan: bool = False
 
 
 # Real clip names from the animation library (mc_one_codey/*/context/animations/clips/),
@@ -301,10 +320,17 @@ DEFAULT_SKILLS: dict[str, SkillSpec] = {
         "entity_id too (alongside `target` as a human-readable label) -- this makes the "
         "approach identity-aware: it navigates to and re-verifies that SPECIFIC tracked "
         "entity, never falling back to 'nearest same-class instance' the way a bare "
-        "`target` search does.",
+        "`target` search does. If the alias is currently UNRESOLVED (no live entity_id "
+        "yet -- e.g. temporarily out of view), pass `alias` instead of `entity_id`: this "
+        "skill re-resolves that SAME alias live, physically turning to look if needed, "
+        "before navigating -- still never a class/nearest-instance guess.",
         {"target": "human-readable label of the entity to walk to (never an id)",
-         "entity_id": "optional; ONLY a real id from grounded_entities or a prior locate result -- never a name/alias the user spoke"},
+         "entity_id": "optional; ONLY a real id from grounded_entities or a prior locate result -- never a name/alias the user spoke",
+         "alias": "optional; the registered alias to actively re-resolve (with scanning) when no "
+                  "entity_id is available yet -- mutually exclusive with entity_id in practice, "
+                  "since a resolved entity_id is always preferred when already known"},
         ("entity_approached",),
+        resolves_alias_with_scan=True,
     ),
     "face_entity": SkillSpec(
         "face_entity",

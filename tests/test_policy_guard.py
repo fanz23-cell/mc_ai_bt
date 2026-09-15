@@ -79,6 +79,11 @@ def test_policy_rejects_too_many_physical_actions():
 
 
 def test_policy_rejects_too_many_base_actions():
+    # P0.8 (2026-09-15, user-approved): max_base_actions raised 3 -> 6 -- a
+    # real live "observe then return" mission needed 4 (search+approach for
+    # each of two currently-unresolved aliases) and was being rejected
+    # outright. 7 actions here still exceeds the new limit, preserving this
+    # test's own purpose (the budget rejection itself still works).
     plan = _plan(
         {
             "type": "Sequence",
@@ -87,6 +92,9 @@ def test_policy_rejects_too_many_base_actions():
                 {"type": "Action", "skill": "simple_move", "args": {"action": "right", "value": 45}},
                 {"type": "Action", "skill": "simple_move", "args": {"action": "left", "value": 45}},
                 {"type": "Action", "skill": "simple_move", "args": {"action": "right", "value": 45}},
+                {"type": "Action", "skill": "simple_move", "args": {"action": "left", "value": 45}},
+                {"type": "Action", "skill": "simple_move", "args": {"action": "right", "value": 45}},
+                {"type": "Action", "skill": "simple_move", "args": {"action": "left", "value": 45}},
             ],
         }
     )
@@ -657,3 +665,151 @@ def test_policy_rejects_wait_budget_inside_timeout():
 
     assert not result.ok
     assert any("wait budget" in error for error in result.errors)
+
+
+# --- P0 safety fix (2026-09-15, GPT-approved CHANGE APPROVAL, z-doc 107/108):
+# Fallback branch gated by a never-resolves-false predicate -------------------
+
+def test_policy_rejects_visual_check_completed_as_fallback_branch_gate():
+    """The exact live shape z-doc 107 found via a real gpt-4o draw (long_02):
+    a VisualCheck(observe) feeding a Fallback whose "TRUE" branch is gated by
+    Condition(visual_check_completed) -- always true the instant the
+    VisualCheck merely finishes running, so that branch always wins
+    regardless of the real, distinct answer. Must be rejected before physical
+    execution, not merely produce a false-success later."""
+    plan = _plan(
+        {
+            "type": "Sequence",
+            "children": [
+                {"type": "Action", "skill": "approach_entity", "args": {"target": "fern"}},
+                {"type": "VisualCheck", "mode": "observe",
+                 "check": {"query": "Is Fern standing near the whiteboard?"}},
+                {
+                    "type": "Fallback",
+                    "children": [
+                        {
+                            "type": "Sequence",
+                            "children": [
+                                {"type": "Condition", "predicate": "visual_check_completed", "args": {}},
+                                {"type": "Action", "skill": "approach_entity", "args": {"target": "ivy"}},
+                                {"type": "Action", "skill": "say", "args": {"text": "Fern is near the whiteboard."}},
+                            ],
+                        },
+                        {
+                            "type": "Sequence",
+                            "children": [
+                                {"type": "Action", "skill": "approach_entity", "args": {"target": "ivy"}},
+                                {"type": "Action", "skill": "say", "args": {"text": "Fern is not near the whiteboard."}},
+                            ],
+                        },
+                    ],
+                },
+            ],
+        },
+        {
+            "type": "structured",
+            "predicate": "entity_approached",
+            "args": {"target": "ivy"},
+            "verification": {"mode": "world_state"},
+        },
+    )
+
+    result = PolicyGuard().check(plan)
+
+    assert not result.ok
+    assert any(
+        "never resolves FALSE" in error and "visual_check_completed" in error
+        for error in result.errors
+    )
+
+
+def test_policy_accepts_entity_located_as_fallback_branch_gate():
+    """entity_located is execution_only (evidence comes only from this
+    mission's own execution facts) but is NOT never_resolves_false -- its
+    generic checker can genuinely return TRUE or FALSE depending on whether
+    the search actually found the target. Using it to gate a Fallback branch
+    is a normal, legitimate, safe pattern and must still be accepted."""
+    plan = _plan(
+        {
+            "type": "Fallback",
+            "children": [
+                {
+                    "type": "Sequence",
+                    "children": [
+                        {"type": "Condition", "predicate": "entity_located", "args": {"target": "keys"}},
+                        {"type": "Action", "skill": "say", "args": {"text": "Found the keys."}},
+                    ],
+                },
+                {
+                    "type": "Sequence",
+                    "children": [
+                        {"type": "Action", "skill": "say", "args": {"text": "Could not find the keys."}},
+                    ],
+                },
+            ],
+        },
+    )
+
+    result = PolicyGuard().check(plan)
+
+    assert result.ok
+
+
+def test_policy_does_not_globally_reject_visual_check_completed_outside_a_fallback():
+    """The new check is scoped to Condition nodes gating a Fallback branch --
+    it must not become a blanket ban on the predicate everywhere. A plain,
+    non-branching Sequence using it (e.g. as a mid-plan gate before a single
+    onward step, no Fallback involved) is unaffected."""
+    plan = _plan(
+        {
+            "type": "Sequence",
+            "children": [
+                {"type": "VisualCheck", "mode": "observe", "check": {"query": "is the door open?"}},
+                {"type": "Condition", "predicate": "visual_check_completed", "args": {}},
+                {"type": "Action", "skill": "say", "args": {"text": "Checked the door."}},
+            ],
+        },
+    )
+
+    result = PolicyGuard().check(plan)
+
+    assert result.ok
+
+
+def test_policy_rejects_never_resolves_false_gate_nested_inside_a_branch():
+    """The offending Condition need not be the immediate first child of the
+    branch -- it is rejected wherever it appears inside a Fallback branch's
+    subtree, matching the conservative, fail-closed scan the CHANGE APPROVAL
+    called for."""
+    plan = _plan(
+        {
+            "type": "Fallback",
+            "children": [
+                {
+                    "type": "Sequence",
+                    "children": [
+                        {"type": "Action", "skill": "approach_entity", "args": {"target": "ivy"}},
+                        {
+                            "type": "Sequence",
+                            "children": [
+                                {"type": "Condition", "predicate": "visual_check_completed", "args": {}},
+                                {"type": "Action", "skill": "say", "args": {"text": "yes"}},
+                            ],
+                        },
+                    ],
+                },
+                {
+                    "type": "Sequence",
+                    "children": [
+                        {"type": "Action", "skill": "approach_entity", "args": {"target": "ivy"}},
+                        {"type": "Action", "skill": "say", "args": {"text": "no"}},
+                    ],
+                },
+            ],
+        },
+    )
+
+    result = PolicyGuard().check(plan)
+
+    assert not result.ok
+    assert any("never resolves FALSE" in error for error in result.errors)

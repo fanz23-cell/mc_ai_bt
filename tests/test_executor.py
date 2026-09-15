@@ -493,6 +493,159 @@ def test_visual_check_structured_unknown_falls_back_to_visual_service():
     assert checks.visual_requests == [({"query": "do you see the test_object?"}, {})]
 
 
+# --- P0.4 (z-doc 91): VisualCheck mode="observe" ---------------------------
+# CONFIRMED gap (z-doc 90): FALSE used to be indistinguishable from mission
+# failure. "condition" mode (the default, absent "mode") must remain
+# BYTE-FOR-BYTE unchanged (covered by every test above, none of which set
+# "mode" at all); "observe" mode instead completes successfully either way
+# and preserves the checked value separately in
+# facts["visual_check_result"].
+
+class FakeChecksWithVisualProvenance(FakeChecksWithVisual):
+    """Like FakeChecksWithVisual, but visual_check returns full provenance
+    fields too -- the real VisualCheckResult ROS message shape, post
+    z-doc 91's visual_client.py fix (confidence/observed_at/provider_name/
+    model_name/stale all genuinely populated, not discarded)."""
+
+    def visual_check(self, check, facts):
+        self.visual_requests.append((check, facts))
+        return CheckResult(
+            self.visual_state, f"{self.visual_state.value.lower()} visual",
+            confidence=0.87, observed_at=1700000000.5,
+            provider_name="langchain_openai", model_name="gpt-4o-mini", stale=False,
+        )
+
+
+def test_observe_mode_true_succeeds_and_records_the_value():
+    skills = FakeSkills()
+    checks = FakeChecksWithVisualProvenance(visual_state=TriState.TRUE)
+
+    result = BtExecutor().execute(
+        {"type": "VisualCheck", "mode": "observe",
+         "check": {"query": "is the room tidy?"}},
+        skills,
+        checks=checks,
+    )
+
+    assert result.success  # completing the observation IS the success, either way
+    entry = result.facts["visual_check_result"]
+    assert entry["completed"] is True
+    assert entry["value"] is True
+    assert entry["query"] == "is the room tidy?"
+    assert entry["confidence"] == 0.87
+    assert entry["observed_at"] == 1700000000.5
+    assert entry["provider_name"] == "langchain_openai"
+    assert entry["model_name"] == "gpt-4o-mini"
+
+
+def test_observe_mode_false_ALSO_succeeds_and_records_the_value():
+    # The exact defect this whole change fixes: FALSE must not become a
+    # BT/mission failure in observe mode.
+    skills = FakeSkills()
+    checks = FakeChecksWithVisualProvenance(visual_state=TriState.FALSE)
+
+    result = BtExecutor().execute(
+        {"type": "VisualCheck", "mode": "observe",
+         "check": {"query": "is the room tidy?"}},
+        skills,
+        checks=checks,
+    )
+
+    assert result.success
+    entry = result.facts["visual_check_result"]
+    assert entry["completed"] is True
+    assert entry["value"] is False
+
+
+def test_observe_mode_unknown_still_blocks_needing_a_decision():
+    # UNKNOWN semantics are completely untouched by this feature.
+    skills = FakeSkills()
+    checks = FakeChecksWithVisual(visual_state=TriState.UNKNOWN)
+
+    result = BtExecutor().execute(
+        {"type": "VisualCheck", "mode": "observe",
+         "check": {"query": "is the room tidy?"}},
+        skills,
+        checks=checks,
+    )
+
+    assert not result.success
+    assert result.blocked
+    assert result.needs_decision
+    assert "visual_check_result" not in result.facts
+
+
+def test_observe_mode_provider_not_configured_still_fails_not_succeeds():
+    # A genuine wiring/runtime failure (no visual_check callable at all) must
+    # remain a real failure in observe mode too -- never silently upgraded to
+    # "completed, value unknown".
+    skills = FakeSkills()
+    checks = FakeChecks(TriState.TRUE)  # no .visual_check attribute at all
+
+    result = BtExecutor().execute(
+        {"type": "VisualCheck", "mode": "observe",
+         "check": {"query": "is the room tidy?"}},
+        skills,
+        checks=checks,
+    )
+
+    assert not result.success
+    assert "visual_check_result" not in result.facts
+
+
+def test_observe_mode_structured_fallback_also_records_the_value():
+    # The query happens to map to an already-structured predicate
+    # (object_visible) that the FakeChecks fallback answers directly --
+    # observe mode must still record a (leaner, no-provenance) result.
+    skills = FakeSkills()
+    checks = FakeChecks(TriState.FALSE)
+
+    result = BtExecutor().execute(
+        {"type": "VisualCheck", "mode": "observe",
+         "check": {"query": "do you see the test_object?"}},
+        skills,
+        checks=checks,
+    )
+
+    assert result.success
+    entry = result.facts["visual_check_result"]
+    assert entry["completed"] is True
+    assert entry["value"] is False
+    assert "confidence" not in entry  # not available from this path -- never invented
+
+
+def test_condition_mode_is_the_default_and_unaffected_by_this_feature():
+    # No "mode" key at all -- the ORIGINAL contract: FALSE fails the node,
+    # nothing is recorded into facts.
+    skills = FakeSkills()
+    checks = FakeChecksWithVisualProvenance(visual_state=TriState.FALSE)
+
+    result = BtExecutor().execute(
+        {"type": "VisualCheck", "check": {"query": "is the room tidy?"}},
+        skills,
+        checks=checks,
+    )
+
+    assert not result.success
+    assert not result.blocked
+    assert "visual_check_result" not in result.facts
+
+
+def test_observe_mode_query_identity_is_preserved_exactly():
+    skills = FakeSkills()
+    checks = FakeChecksWithVisualProvenance(visual_state=TriState.TRUE)
+
+    result = BtExecutor().execute(
+        {"type": "VisualCheck", "mode": "observe",
+         "check": {"query": "is bob_live_test standing next to a potted plant?"}},
+        skills,
+        checks=checks,
+    )
+
+    assert result.facts["visual_check_result"]["query"] == (
+        "is bob_live_test standing next to a potted plant?")
+
+
 def test_needs_decision_propagates_through_sequence():
     skills = FakeSkills()
     checks = FakeChecks(TriState.UNKNOWN)

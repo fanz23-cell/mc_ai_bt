@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from .goal_check import PREDICATE_REGISTRY
 from .skill_registry import DEFAULT_SKILLS, SkillRegistry
 
 
@@ -102,7 +103,7 @@ class PolicyLimits:
     max_total_nodes: int = 32
     max_total_actions: int = 12
     max_physical_actions: int = 4
-    max_base_actions: int = 3
+    max_base_actions: int = 6
     max_body_actions: int = 3
     max_visual_checks: int = 4
     max_conditions: int = 8
@@ -178,6 +179,8 @@ class PolicyGuard:
         stats.total_nodes += retry_multiplier
         node_type = node.get("type")
         if node_type in {"Sequence", "Fallback", "Parallel"}:
+            if node_type == "Fallback":
+                self._check_fallback_branch_gates(node, path, errors)
             for idx, child in enumerate(node.get("children", []) or []):
                 self._walk(
                     child,
@@ -262,6 +265,39 @@ class PolicyGuard:
             predicate = str(check.get("predicate") or "")
             if predicate.startswith("__") or "." in predicate:
                 errors.append(f"{path}.check.predicate is not policy-safe: {predicate!r}")
+
+    def _check_fallback_branch_gates(
+        self,
+        node: dict[str, Any],
+        path: str,
+        errors: list[str],
+    ) -> None:
+        """P0 safety fix (2026-09-15, GPT-approved CHANGE APPROVAL, z-doc
+        107/108): reject a Fallback with a branch containing a Condition
+        whose predicate is registered in goal_check.PREDICATE_REGISTRY with
+        never_resolves_false=True. Such a predicate can only ever produce
+        TriState.TRUE or UNKNOWN, never FALSE -- so that branch can never be
+        RULED OUT by this Condition, and would win unconditionally the
+        instant the underlying check completes, regardless of the real,
+        distinct answer this Fallback exists to distinguish between (the
+        exact live shape z-doc 107 found via a real gpt-4o draw: a
+        VisualCheck(observe) feeding a Fallback whose "TRUE" branch was
+        gated by Condition(visual_check_completed) -- always true once the
+        VisualCheck merely finishes running, so that branch always won).
+        General and registry-driven -- no predicate name literal here, so it
+        automatically covers any current or future predicate marked this
+        way, not only visual_check_completed. Fails closed: rejects the
+        whole plan rather than trying to repair/drop the offending branch.
+        """
+        for idx, branch in enumerate(node.get("children", []) or []):
+            offender = _find_never_resolves_false_condition(branch)
+            if offender is not None:
+                errors.append(
+                    f"{path}.children[{idx}] is a Fallback branch gated by a Condition "
+                    f"using predicate {offender!r}, which never resolves FALSE -- this "
+                    "branch would always win regardless of the real, distinct outcome "
+                    "this Fallback exists to distinguish"
+                )
 
     def _check_action(
         self,
@@ -666,6 +702,32 @@ class PolicyGuard:
                 f"goal predicate {predicate!r} does not match physical action "
                 f"(expected one of {', '.join(expected)})"
             )
+
+
+def _find_never_resolves_false_condition(node: Any) -> str | None:
+    """Recursively scan a Fallback branch subtree for any Condition node
+    whose predicate is registered with never_resolves_false=True. Returns
+    the offending predicate name, or None if the branch contains none.
+    Walks the same shapes _walk above does (Sequence/Fallback/Parallel
+    children, Retry/Timeout child) -- duplicated rather than reusing _walk
+    itself since this is a pure, stats-free tree query, not a validation
+    pass with its own error accumulation."""
+    if not isinstance(node, dict):
+        return None
+    if node.get("type") == "Condition":
+        predicate = str(node.get("predicate") or "")
+        spec = PREDICATE_REGISTRY.get(predicate)
+        if spec is not None and spec.never_resolves_false:
+            return predicate
+        return None
+    for child in node.get("children", []) or []:
+        found = _find_never_resolves_false_condition(child)
+        if found is not None:
+            return found
+    child = node.get("child")
+    if isinstance(child, dict):
+        return _find_never_resolves_false_condition(child)
+    return None
 
 
 @dataclass

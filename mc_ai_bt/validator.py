@@ -44,6 +44,8 @@ EXECUTABLE_NODE_TYPES = {
 FUTURE_NODE_TYPES: set[str] = set()
 ALLOWED_NODE_TYPES = EXECUTABLE_NODE_TYPES | FUTURE_NODE_TYPES
 ALLOWED_GOAL_TYPES = {"structured", "visual", "human", "hybrid"}
+# P0.4 (z-doc 91): VisualCheck node's own optional "mode" field.
+VISUAL_CHECK_MODES = {"condition", "observe"}
 
 
 @dataclass(frozen=True)
@@ -219,6 +221,14 @@ class PlanValidator:
                 errors.append(f"{path}.check must be an object")
             elif not _looks_like_visual_check(check):
                 errors.append(f"{path}.check must include a query, goal type, or predicate")
+            # P0.4 observation mode (z-doc 91): OPTIONAL, absent means "condition" --
+            # today's exact, unchanged control-flow semantics (TRUE=success,
+            # FALSE=failure, UNKNOWN=blocked). "observe" additionally preserves the
+            # checked value as a structured fact instead of just pass/fail -- see
+            # executor.py's own _execute_visual_check for the real behavior split.
+            mode = node.get("mode", "condition")
+            if mode not in VISUAL_CHECK_MODES:
+                errors.append(f"{path}.mode must be one of {sorted(VISUAL_CHECK_MODES)}")
             return
 
     def _validate_parallel_resource_conflicts(

@@ -109,7 +109,7 @@ class AiBtNode(Node):
             self,
             settings=VisualCheckSettings(
                 action_name=str(self.get_parameter("visual_check_action").value or "/mc_multimodal/visual_check"),
-                camera_source=str(self.get_parameter("visual_check_camera_source").value or "head"),
+                camera_source=str(self.get_parameter("visual_check_camera_source").value or "codey_head"),
                 max_age_sec=float(self.get_parameter("visual_check_max_age_sec").value or 2.0),
                 timeout_sec=float(self.get_parameter("visual_check_timeout_sec").value or 15.0),
             ),
@@ -182,7 +182,11 @@ class AiBtNode(Node):
         self.declare_parameter("planner_timeout", 15.0)
         self.declare_parameter("mission_journal_path", "")
         self.declare_parameter("visual_check_action", "/mc_multimodal/visual_check")
-        self.declare_parameter("visual_check_camera_source", "head")
+        # FOUND LIVE 2026-09-12 (doc 91), fixed 2026-09-15: the live
+        # /mc_multimodal/visual_check node's own configured camera_source is
+        # "codey_head" -- "head" alone matched nothing, so every VisualCheck
+        # silently got zero frames ("no fresh camera frame available").
+        self.declare_parameter("visual_check_camera_source", "codey_head")
         self.declare_parameter("visual_check_max_age_sec", 2.0)
         self.declare_parameter("visual_check_timeout_sec", 15.0)
 
@@ -484,10 +488,19 @@ class AiBtNode(Node):
                 if escalate:
                     outcome = self._missions.pause(mission.identity.mission_id, message)
                 else:
+                    # P0.4 (z-doc 91): execution.facts is this SAME mission's
+                    # own just-completed terminal facts -- the real,
+                    # already-computed blackboard, never a fresh post-hoc
+                    # query. mark_terminal forwards it (bounded/allowlisted
+                    # there) into the mission_outcome envelope only when
+                    # something real and allowlisted (visual_check_result)
+                    # is actually present; every other mission's envelope is
+                    # unaffected.
                     outcome = self._missions.mark_terminal(
                         mission.identity.mission_id,
                         state=state,
                         message=message,
+                        result_facts=execution.facts,
                     )
             self._publish_event(outcome)
             # FOUND LIVE 2026-09-01 (D v1 correctness review): this used to skip

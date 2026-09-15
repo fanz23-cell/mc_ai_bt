@@ -4,7 +4,7 @@ import json
 import threading
 from dataclasses import dataclass, field
 from threading import Event
-from time import monotonic
+from time import monotonic, time
 from typing import Any, Callable, Protocol
 
 from .visual_check import visual_check_goal_spec
@@ -679,16 +679,55 @@ class BtExecutor:
         check = node.get("check")
         if not isinstance(check, dict):
             return ExecutionResult(False, "visual check requires check object")
+        # P0.4 (z-doc 91): OPTIONAL, additive "mode" field -- absent (or any
+        # value other than "observe") means "condition", the ORIGINAL,
+        # completely unchanged control-flow semantics below (TRUE=success,
+        # FALSE=failure, UNKNOWN=blocked/needs_decision). "observe" is handled
+        # entirely separately (see the branch below) so this default path can
+        # never regress: it is byte-for-byte what this function did before
+        # this feature existed.
+        observe = node.get("mode") == "observe"
+
         goal_spec = visual_check_goal_spec(check)
         if goal_spec and goal_spec.get("type") != "visual":
             structured = _check_as_execution_result(checks, goal_spec, facts, label="visual check")
             if not structured.blocked:
+                if observe:
+                    _record_visual_check_result(facts, check, value=structured.success)
+                    return ExecutionResult(True, structured.message, facts)
                 return structured
 
         visual_check = getattr(checks, "visual_check", None)
-        if callable(visual_check):
+        if not callable(visual_check):
+            return ExecutionResult(False, "visual check UNKNOWN: VisualCheck service is not configured", facts, True)
+
+        if not observe:
             return _visual_check_as_execution_result(visual_check, check, facts)
-        return ExecutionResult(False, "visual check UNKNOWN: VisualCheck service is not configured", facts, True)
+
+        # mode="observe": a definitive TRUE/FALSE completes the requested
+        # observation SUCCESSFULLY either way -- the checked value is
+        # preserved separately in facts[VISUAL_CHECK_RESULT_FACT], never
+        # conflated with whether the observation itself completed (the
+        # CONFIRMED gap z-doc 90 found: today, FALSE is indistinguishable
+        # from a genuine malfunction). UNKNOWN is untouched -- identical
+        # blocked/needs_decision pause path as condition mode.
+        result = visual_check(check, facts)
+        state = _tri_state_value(getattr(result, "state", "UNKNOWN"))
+        message = str(getattr(result, "message", ""))
+        if state == "UNKNOWN":
+            return ExecutionResult(False, f"visual check UNKNOWN: {message}", facts, True, needs_decision=True)
+        value = state == "TRUE"
+        _record_visual_check_result(
+            facts,
+            check,
+            value=value,
+            confidence=getattr(result, "confidence", None),
+            observed_at=getattr(result, "observed_at", None),
+            provider_name=getattr(result, "provider_name", "") or "",
+            model_name=getattr(result, "model_name", "") or "",
+            stale=bool(getattr(result, "stale", False)),
+        )
+        return ExecutionResult(True, f"visual check {'TRUE' if value else 'FALSE'}: {message}", facts)
 
 
 def _check_as_execution_result(
@@ -747,6 +786,50 @@ def _visual_check_as_execution_result(
         return ExecutionResult(False, f"visual check FALSE: {message}", facts)
     return ExecutionResult(
         False, f"visual check UNKNOWN: {message}", facts, True, needs_decision=True)
+
+
+# P0.4 (z-doc 91): the ONE bounded, allowlisted fact mode="observe" ever
+# writes. mission.py's own envelope builder re-validates this exact shape
+# again before letting any of it reach Omega (defense in depth, not
+# duplicated trust) -- see its own _bounded_result_facts.
+VISUAL_CHECK_RESULT_FACT = "visual_check_result"
+
+
+def _record_visual_check_result(
+    facts: dict[str, Any],
+    check: dict[str, Any],
+    *,
+    value: bool,
+    confidence: float | None = None,
+    observed_at: float | None = None,
+    provider_name: str = "",
+    model_name: str = "",
+    stale: bool = False,
+) -> None:
+    """Writes facts[VISUAL_CHECK_RESULT_FACT] in place -- `facts` is the same
+    mutable blackboard dict threaded through the whole BT execution (see
+    execute()'s own Sequence/Fallback `facts.update(result.facts)`), so this
+    write is visible to both a later BT node in the same plan and the
+    mission's own final goal_spec check, exactly like a real Action skill's
+    own facts already are. Only ever called with a DEFINITIVE (non-UNKNOWN)
+    result -- there is no code path that calls this with completed=False,
+    matching visual_check_completed's own "never resolves FALSE" contract
+    (goal_check.py)."""
+    entry: dict[str, Any] = {
+        "completed": True,
+        "value": bool(value),
+        "query": str(check.get("query") or ""),
+        "observed_at": float(observed_at) if observed_at is not None else time(),
+    }
+    if confidence is not None:
+        entry["confidence"] = float(confidence)
+    if provider_name:
+        entry["provider_name"] = str(provider_name)
+    if model_name:
+        entry["model_name"] = str(model_name)
+    if stale:
+        entry["stale"] = True
+    facts[VISUAL_CHECK_RESULT_FACT] = entry
 
 
 def _normalise_goal_check_spec(check: dict[str, Any]) -> dict[str, Any]:

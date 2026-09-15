@@ -770,6 +770,163 @@ def test_envelope_construction_never_raises_on_malformed_legacy_data():
     assert envelope["grounding_refs"] == []
 
 
+# --- P0.4 (z-doc 91): OPTIONAL result_facts on the mission outcome ---------
+# envelope. See mission.py's own _bounded_result_facts/_build_mission_outcome_
+# envelope docstrings: bounded, allowlisted re-projection of the mission's OWN
+# terminal ExecutionResult.facts -- visual_check_result only, never the raw
+# unbounded facts dict, and never anything when absent (byte-identical
+# envelope to before this field existed).
+
+def _visual_check_result_fact(**overrides):
+    fact = {
+        "completed": True, "value": True, "query": "is the plant nearby?",
+        "observed_at": 1234.5, "confidence": 0.91,
+        "provider_name": "langchain_openai", "model_name": "gpt-4o-mini", "stale": False,
+    }
+    fact.update(overrides)
+    return fact
+
+
+def test_envelope_includes_well_shaped_visual_check_result_when_present():
+    mission = _mission(
+        state=STATE_SUCCEEDED,
+        goal_spec_json=json.dumps({"predicate": "visual_check_completed", "args": {}}),
+    )
+    result_facts = {"visual_check_result": _visual_check_result_fact(value=True)}
+
+    envelope = json.loads(_build_mission_outcome_envelope(mission, result_facts))
+
+    assert envelope["result_facts"]["visual_check_result"]["completed"] is True
+    assert envelope["result_facts"]["visual_check_result"]["value"] is True
+    assert envelope["result_facts"]["visual_check_result"]["query"] == "is the plant nearby?"
+    assert envelope["result_facts"]["visual_check_result"]["confidence"] == 0.91
+
+
+def test_envelope_includes_a_definitively_false_visual_check_result_too():
+    # The whole point of this fix: FALSE is a real, transportable value, not
+    # something that gets dropped because it isn't a "success".
+    mission = _mission(state=STATE_SUCCEEDED)
+    result_facts = {"visual_check_result": _visual_check_result_fact(value=False)}
+
+    envelope = json.loads(_build_mission_outcome_envelope(mission, result_facts))
+
+    assert envelope["result_facts"]["visual_check_result"]["value"] is False
+
+
+def test_envelope_omits_result_facts_key_entirely_when_none_given():
+    # The default (no result_facts kwarg) -- every pre-existing caller/test
+    # of _build_mission_outcome_envelope must see a byte-identical envelope
+    # to before this field existed.
+    mission = _mission(state=STATE_SUCCEEDED)
+
+    envelope = json.loads(_build_mission_outcome_envelope(mission))
+
+    assert "result_facts" not in envelope
+
+
+def test_envelope_omits_result_facts_when_visual_check_result_missing_completed():
+    mission = _mission(state=STATE_SUCCEEDED)
+    incomplete = _visual_check_result_fact()
+    del incomplete["completed"]
+    result_facts = {"visual_check_result": incomplete}
+
+    envelope = json.loads(_build_mission_outcome_envelope(mission, result_facts))
+
+    assert "result_facts" not in envelope
+
+
+def test_envelope_omits_result_facts_when_value_is_not_a_bool():
+    mission = _mission(state=STATE_SUCCEEDED)
+    result_facts = {"visual_check_result": _visual_check_result_fact(value="yes")}
+
+    envelope = json.loads(_build_mission_outcome_envelope(mission, result_facts))
+
+    assert "result_facts" not in envelope
+
+
+def test_envelope_never_forwards_a_key_outside_the_allowlist():
+    # Do NOT serialize all ExecutionResult.facts -- an arbitrary, unrelated
+    # fact that happened to also be in the blackboard at terminal time must
+    # never reach Omega just because it was present.
+    mission = _mission(state=STATE_SUCCEEDED)
+    result_facts = {
+        "visual_check_result": _visual_check_result_fact(),
+        "some_other_internal_fact": {"anything": "at all"},
+        "entity_approached": True,
+    }
+
+    envelope = json.loads(_build_mission_outcome_envelope(mission, result_facts))
+
+    assert set(envelope["result_facts"].keys()) == {"visual_check_result"}
+
+
+def test_envelope_result_facts_excludes_fields_outside_the_bounded_shape():
+    mission = _mission(state=STATE_SUCCEEDED)
+    result_facts = {
+        "visual_check_result": _visual_check_result_fact(
+            raw_response_excerpt="the model's full raw text", debug_id="dbg-123",
+        ),
+    }
+
+    envelope = json.loads(_build_mission_outcome_envelope(mission, result_facts))
+
+    forwarded = envelope["result_facts"]["visual_check_result"]
+    assert "raw_response_excerpt" not in forwarded
+    assert "debug_id" not in forwarded
+
+
+def test_envelope_ignores_non_dict_result_facts_without_raising():
+    mission = _mission(state=STATE_SUCCEEDED)
+
+    envelope = json.loads(_build_mission_outcome_envelope(mission, "not a dict"))
+
+    assert "result_facts" not in envelope
+
+
+def test_mark_terminal_threads_result_facts_into_the_real_envelope():
+    manager = MissionManager()
+    _accepted, _message, mission, _event = manager.submit(
+        intent_text="check the plant", source="voice", operator_id="user",
+        parent_mission_id="", priority=10, allow_queue=True, context_json="{}",
+    )
+    manager.set_plan(
+        mission.identity.mission_id,
+        json.dumps({"type": "VisualCheck", "mode": "observe",
+                    "check": {"query": "is the plant nearby?"}}),
+        json.dumps({"predicate": "visual_check_completed", "args": {}}),
+    )
+
+    event = manager.mark_terminal(
+        mission.identity.mission_id, state=STATE_SUCCEEDED, message="goal check TRUE",
+        result_facts={"visual_check_result": _visual_check_result_fact(value=False)},
+    )
+
+    envelope = json.loads(event.payload_json)
+    assert envelope["result_facts"]["visual_check_result"]["value"] is False
+
+
+def test_mark_terminal_without_result_facts_kwarg_is_unaffected():
+    # Every pre-existing call site (planning failure, resource-authority
+    # trigger block) never passes this kwarg at all -- confirm the default
+    # still produces today's exact envelope shape.
+    manager = MissionManager()
+    _accepted, _message, mission, _event = manager.submit(
+        intent_text="go to 66", source="voice", operator_id="user",
+        parent_mission_id="", priority=10, allow_queue=True, context_json="{}",
+    )
+    manager.set_plan(
+        mission.identity.mission_id,
+        json.dumps({"type": "Action", "skill": "approach_entity", "args": {"entity_id": "person_x1"}}),
+        json.dumps({"predicate": "entity_approached", "args": {"entity_id": "person_x1"}}),
+    )
+
+    event = manager.mark_terminal(
+        mission.identity.mission_id, state=STATE_SUCCEEDED, message="goal check TRUE")
+
+    envelope = json.loads(event.payload_json)
+    assert "result_facts" not in envelope
+
+
 def test_mark_terminal_attaches_envelope_to_the_real_event_payload_json():
     manager = MissionManager()
     _accepted, _message, mission, _event = manager.submit(

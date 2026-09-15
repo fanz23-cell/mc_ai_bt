@@ -302,3 +302,350 @@ def test_planner_prompt_warns_sequential_steps_are_not_parallel():
 
     assert "is a Sequence, not" in system
     assert "Parallel means both children run at once" in system
+
+
+# --- P0.5 (z-doc 92): VisualCheck mode="observe" vs mode="condition" -------
+# CONFIRMED root cause: the planner's own capability guidance predates the
+# observe-mode/visual_check_completed contract (z-doc 91, already LIVE
+# VERIFIED at the runtime/GoalCheck/MissionOutcome/Bridge/Omega layer) -- the
+# model has no way to know this shape exists unless the prompt teaches it.
+# These tests check PROMPT CONTENT only (build_planner_messages is a pure,
+# static-per-catalog function of the skill registry, not of intent_text --
+# same convention every other test in this file already uses), since the
+# real LlmJsonPlanner's actual choice depends on a live LLM call this test
+# suite cannot make deterministically.
+
+def test_planner_prompt_teaches_observe_mode_for_an_observation_request():
+    messages = build_planner_messages(
+        "check whether the plant on the table is dry", "{}")
+    system = messages[0][1]
+
+    assert '"mode": "observe"' in system
+    assert "visual_check_completed" in system
+    assert "OBSERVE (mode=\"observe\")" in system
+
+
+def test_planner_prompt_covers_paraphrased_observation_requests():
+    # Different surface wording for the same underlying request shape --
+    # the prompt's own trigger-phrase list must cover more than one phrasing,
+    # not just the single canonical example.
+    messages = build_planner_messages(
+        "look and tell me whether the window is closed", "{}")
+    system = messages[0][1]
+
+    assert "'look and tell me whether X'" in system
+    assert "'verify whether X and report the answer'" in system
+
+
+def test_planner_prompt_teaches_false_is_a_valid_completed_observe_outcome():
+    messages = build_planner_messages(
+        "determine whether the delivery box is empty", "{}")
+    system = messages[0][1]
+
+    assert "a definitive FALSE is still a fully successful, completed mission" in system
+    assert "does NOT mean the answer was" in system
+
+
+def test_planner_prompt_teaches_condition_mode_for_a_conditional_branch():
+    messages = build_planner_messages(
+        "if the door is open, go through it", "{}")
+    system = messages[0][1]
+
+    assert 'CONDITION (mode absent, or mode="condition"' in system
+    assert "TRUE lets that branch succeed, FALSE fails it" in system
+    assert "there genuinely is no 'go through a closed door' outcome to report" in system
+
+
+def test_planner_prompt_still_reserves_search_for_entity_for_ordinary_search():
+    # An ordinary "find X" request is not a yes/no observation question at
+    # all -- the pre-existing search_for_entity guidance (unchanged by this
+    # round) must still be present and intact.
+    messages = build_planner_messages("find the red mug", "{}")
+    system = messages[0][1]
+
+    assert "search_for_entity/locate_entity's real target vocabulary is a closed" in system
+    assert "Do NOT substitute search_for_entity just because the query happens to name a class" in system
+
+
+def test_planner_prompt_still_reserves_check_relation_for_already_grounded_entities():
+    # Structured relation checks between two ALREADY-NAMED/tracked entities
+    # remain check_relation's job -- VisualCheck is for the open-ended/bare-
+    # class case only. Both halves of this distinction must survive intact.
+    messages = build_planner_messages("is the mug near the sink", "{}")
+    system = messages[0][1]
+
+    assert "Both sides must already be named, tracked world-state entities" in system
+    assert "check_relation cannot resolve it" in system
+    assert "use VisualCheck instead, with a query phrased as the relation itself" in system
+
+
+def test_planner_prompt_forbids_implicit_goal_spec_for_a_physical_observation_mission():
+    messages = build_planner_messages(
+        "go check whether the guest is holding a ticket and tell me", "{}")
+    system = messages[0][1]
+
+    assert "never fall back to a human-type/implicit goal_spec either" in system
+
+
+def test_planner_prompt_teaches_approach_then_observe_keeps_the_observation_as_terminal():
+    # 2a: an enabling approach (needed only to SEE the subject) precedes the
+    # observation, but nothing physical is asked for AFTER the answer -- the
+    # observation itself stays the mission's terminal criterion.
+    messages = build_planner_messages(
+        "go to the visitor and check whether they are wearing a badge, then tell me", "{}")
+    system = messages[0][1]
+
+    assert "OBSERVATION-TERMINAL" in system
+    assert "enabling actions, if any (e.g. approaching the subject so the camera can see " \
+        "them), go BEFORE the VisualCheck, which stays the LAST node" in system
+    assert "Never substitute an enabling action's own predicate (entity_approached, " \
+        "search_for_entity_completed, ...) as the goal_spec here" in system
+
+
+# --- P0.6 (z-doc 93): observation followed by a required physical post-action --
+# CONFIRMED root cause (z-doc 92's own live acceptance): the prior guidance treated
+# VisualCheck(mode="observe") as ALWAYS terminal, which is only correct when no
+# physical action is required after the answer -- a live replay of the original
+# compound request showed the model instead baking "if TRUE say .../if FALSE say
+# ..." into a broken Fallback rather than terminating on the required return.
+
+def test_planner_prompt_makes_visual_check_non_terminal_when_a_physical_return_is_required():
+    messages = build_planner_messages(
+        "check whether the parcel has arrived, then go back to the front desk and "
+        "tell them the result", "{}")
+    system = messages[0][1]
+
+    assert "OBSERVATION FOLLOWED BY A REQUIRED PHYSICAL POST-ACTION" in system
+    assert "Here the VisualCheck is NOT the last node" in system
+
+
+def test_planner_prompt_ties_the_final_goal_to_the_return_actions_own_predicate():
+    messages = build_planner_messages(
+        "check whether the parcel has arrived, then go back to the front desk and "
+        "tell them the result", "{}")
+    system = messages[0][1]
+
+    assert "goal_spec matches THAT FINAL physical action's own predicate instead " \
+        "(e.g. entity_approached for an approach_entity(target=Y) ending)" in system
+    assert "never visual_check_completed here" in system
+
+
+def test_planner_prompt_forbids_conditional_say_nodes_for_the_observed_answer():
+    messages = build_planner_messages(
+        "check whether the parcel has arrived, then go back to the front desk and "
+        "tell them the result", "{}")
+    system = messages[0][1]
+
+    assert "Do NOT pre-author the report as BT speech" in system
+    assert "'if TRUE say ...' / 'if FALSE say ...'" in system
+    assert "a bare say Action essentially always succeeds, so a Fallback built from " \
+        "two say nodes never actually branches on the real answer" in system
+
+
+def test_planner_prompt_true_false_wording_never_becomes_pre_authored_speech():
+    # The prohibition is against BAKING the answer into say text at plan-authoring
+    # time -- not against discussing TRUE/FALSE in prose. Confirms the actual
+    # forbidden pattern (quoted literally) appears only as a NEGATIVE example.
+    messages = build_planner_messages(
+        "check whether the parcel has arrived, then go back to the front desk and "
+        "tell them the result", "{}")
+    system = messages[0][1]
+
+    idx = system.find("'if TRUE say ...' / 'if FALSE say ...'")
+    assert idx != -1
+    # It must be introduced as something forbidden, not offered as a valid shape.
+    preceding = system[max(0, idx - 80):idx]
+    assert "never add a say node" in preceding
+
+
+def test_planner_prompt_preserves_execution_facts_carrying_the_visual_result_forward():
+    messages = build_planner_messages(
+        "check whether the parcel has arrived, then go back to the front desk and "
+        "tell them the result", "{}")
+    system = messages[0][1]
+
+    assert "already preserved as structured data in the mission's own execution facts" in system
+    assert "nothing extra needs to be authored to carry it forward" in system
+
+
+def test_planner_prompt_a_failed_return_is_not_success_even_with_a_real_visual_answer():
+    messages = build_planner_messages(
+        "check whether the parcel has arrived, then go back to the front desk and "
+        "tell them the result", "{}")
+    system = messages[0][1]
+
+    assert "the mission correctly is NOT successful merely because a visual answer " \
+        "already exists" in system
+    assert "goal_spec targets the return's own predicate precisely so a failed " \
+        "return still fails the mission" in system
+
+
+def test_planner_prompt_still_allows_a_say_node_for_genuinely_fixed_speech():
+    messages = build_planner_messages(
+        "check whether the parcel has arrived, then go back to the front desk and "
+        "tell them the result", "{}")
+    system = messages[0][1]
+
+    assert "A say node is still fine here for genuinely fixed speech that does not " \
+        "depend on the not-yet-executed observation" in system
+
+
+def test_planner_prompt_unknown_still_pauses_and_never_triggers_the_return():
+    messages = build_planner_messages(
+        "check whether the parcel has arrived, then go back to the front desk and "
+        "tell them the result", "{}")
+    system = messages[0][1]
+
+    assert "Both 2a and 2b: UNKNOWN is unchanged" in system
+    assert "never allowed to trigger the physical return as if the observation had " \
+        "already succeeded" in system
+
+
+def test_planner_prompt_condition_mode_still_covers_conditional_physical_branching():
+    # A genuinely different shape from 2b: here the branch itself (not a spoken
+    # report) depends on the answer -- condition mode, unchanged by this round.
+    messages = build_planner_messages(
+        "if the parcel has arrived, bring it to the front desk", "{}")
+    system = messages[0][1]
+
+    assert 'CONDITION (mode absent, or mode="condition"' in system
+    assert "TRUE lets that branch succeed, FALSE fails it" in system
+
+
+def test_planner_prompt_never_hardcodes_any_demo_alias_for_the_return_case():
+    messages = build_planner_messages(
+        "check whether the parcel has arrived, then go back to the front desk and "
+        "tell them the result", "{}")
+    system = messages[0][1]
+
+    assert "bob_live_test" not in system
+    assert "potted plant" not in system
+    assert "watering" not in system
+    assert "zzz_planner_test" not in system
+
+
+def test_planner_prompt_ties_mode_observe_to_visual_check_completed_as_one_decision():
+    # FOUND LIVE 2026-09-14: a real planner call correctly chose goal_spec.
+    # predicate=visual_check_completed for an approach-then-observe plan but
+    # omitted mode="observe" on the VisualCheck node itself -- silently
+    # reintroducing the exact bug this whole contract exists to fix (a plain
+    # VisualCheck defaults to condition mode, which never writes the fact
+    # visual_check_completed depends on, so it can only ever resolve
+    # UNKNOWN). Generalized (z-doc 93) to also cover 2b, where a plain
+    # VisualCheck's condition-mode default would silently cancel a required
+    # physical return on a real FALSE answer.
+    messages = build_planner_messages(
+        "check whether the guest is holding a ticket and tell me", "{}")
+    system = messages[0][1]
+
+    assert 'mode="observe" is required whenever EITHER' in system
+    assert "goal_spec.predicate is visual_check_completed (2a)" in system
+    assert "a required physical return (2b)" in system
+
+
+def test_planner_prompt_never_hardcodes_the_original_acceptance_scenario():
+    # z-doc 92's own explicit requirement: the generic capability contract
+    # must not name the specific acceptance utterance/entities it was
+    # motivated by.
+    messages = build_planner_messages("check whether the door is open", "{}")
+    system = messages[0][1]
+
+    assert "bob_live_test" not in system
+    assert "potted plant" not in system
+    assert "watering" not in system
+
+
+# --- P0.7 (z-doc 94-97, Candidate D, GPT-approved CHANGE APPROVAL): the
+# planner now teaches node_id/goal_node_id, and no longer relies solely on
+# the model's own free-typed goal_spec.predicate to determine success.
+
+def test_planner_prompt_declares_goal_node_id_as_a_top_level_key():
+    messages = build_planner_messages("go to the kitchen", "{}")
+    system = messages[0][1]
+
+    assert "Top-level keys: schema, root, goal_spec, goal_node_id." in system
+
+
+def test_planner_prompt_requires_node_id_on_action_and_visualcheck_nodes():
+    messages = build_planner_messages("go to the kitchen", "{}")
+    system = messages[0][1]
+
+    assert (
+        "Every Action node and every VisualCheck node must also carry a unique "
+        'string "node_id" field'
+    ) in system
+
+
+def test_planner_prompt_explains_goal_node_id_overrides_predicate_trust():
+    messages = build_planner_messages("go to the kitchen", "{}")
+    system = messages[0][1]
+
+    assert (
+        "goal_spec.predicate is no longer trusted as a free-form string for "
+        "deciding mission success"
+    ) in system
+    assert "compiles the real predicate from whichever node goal_node_id names" in system
+
+
+def test_planner_prompt_forbids_a_say_node_as_goal_node_id():
+    messages = build_planner_messages("go to the kitchen", "{}")
+    system = messages[0][1]
+
+    assert "never a say node" in system
+    assert (
+        "speaking the answer is not the same thing as the obligation the "
+        "answer is about"
+    ) in system
+
+
+def test_planner_prompt_forbids_an_earlier_enabling_step_as_goal_node_id():
+    messages = build_planner_messages("go to the kitchen", "{}")
+    system = messages[0][1]
+
+    assert "never an earlier enabling/orientation step if something else follows it" in system
+
+
+def test_planner_prompt_allows_null_goal_node_id_for_genuine_ambiguity():
+    messages = build_planner_messages("go to the kitchen", "{}")
+    system = messages[0][1]
+
+    assert "set goal_node_id to null" in system
+    assert "a null goal_node_id is a correct, safe answer" in system
+    assert "naming the wrong node is not" in system
+
+
+def test_planner_prompt_required_output_example_demonstrates_node_id_and_goal_node_id():
+    messages = build_planner_messages("say hi", "{}")
+    user = json.loads(messages[1][1])
+    example = user["required_output_example"]
+
+    assert example["root"]["node_id"] == "n1"
+    assert example["goal_node_id"] is None
+
+
+def test_planner_prompt_goal_node_instruction_never_hardcodes_any_demo_alias():
+    messages = build_planner_messages("go to the kitchen", "{}")
+    system = messages[0][1]
+
+    assert "bob_live_test" not in system
+    assert "obsret_05" not in system
+    assert "小W" not in system
+
+
+# --- Found live 2026-09-15: a real mission wrote {"type": "Action", "skill":
+# "VisualCheck"} -- a node TYPE used as a skill name, the same general
+# confusion class as the historical "stop"/"NoAction" rejections.
+
+def test_planner_prompt_forbids_node_type_names_as_action_skill_values():
+    messages = build_planner_messages("go to the kitchen", "{}")
+    system = messages[0][1]
+
+    assert "are BT node TYPES, never skill names" in system
+    assert (
+        '{"type": "Action", "skill": "VisualCheck", ...} is always wrong'
+    ) in system
+    for node_type in (
+        "Sequence", "Fallback", "Parallel", "Timeout", "Action", "Wait", "Retry",
+        "Condition", "GoalCheck", "VisualCheck", "NoAction", "WaitForEvent",
+    ):
+        assert node_type in system
