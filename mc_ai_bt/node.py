@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import json
+import time
 
 import rclpy
 from rclpy.callback_groups import ReentrantCallbackGroup
@@ -74,6 +75,7 @@ class AiBtNode(Node):
         self._skill_registry = SkillRegistry()
         self._declare_parameters()
         self._mission_journal = self._build_mission_journal()
+        self._tick_log_path = self._build_tick_log_path()
         recovered_missions = self._load_journal_missions()
         self._missions = MissionManager(recovered_missions)
         self._planner = self._build_planner()
@@ -181,6 +183,13 @@ class AiBtNode(Node):
         self.declare_parameter("planner_temperature", 0.0)
         self.declare_parameter("planner_timeout", 15.0)
         self.declare_parameter("mission_journal_path", "")
+        # Observability-only, additive: a per-leaf-node append log so an external
+        # monitor can replay a mission's actual tick sequence (today,
+        # `active_node`/TaskStatus are LIVE-only and get overwritten on every
+        # leaf -- no durable record of the sequence exists otherwise). Empty by
+        # default = fully disabled, identical to mission_journal_path's own
+        # opt-in pattern; never read by anything in this process itself.
+        self.declare_parameter("tick_log_path", "")
         self.declare_parameter("visual_check_action", "/mc_multimodal/visual_check")
         # FOUND LIVE 2026-09-12 (doc 91), fixed 2026-09-15: the live
         # /mc_multimodal/visual_check node's own configured camera_source is
@@ -195,6 +204,9 @@ class AiBtNode(Node):
         if not path:
             return None
         return MissionJournal(path)
+
+    def _build_tick_log_path(self) -> str:
+        return str(self.get_parameter("tick_log_path").value or "").strip()
 
     def _load_journal_missions(self) -> tuple[Mission, ...]:
         if self._mission_journal is None:
@@ -864,6 +876,30 @@ class AiBtNode(Node):
             except KeyError:
                 return
         self._publish_status(updated)
+        self._append_tick_log(updated, active_node, progress)
+
+    def _append_tick_log(self, mission: Mission, active_node: str, progress: float) -> None:
+        """Observability-only append; see tick_log_path's own declare_parameter
+        comment. Never allowed to affect mission execution -- any failure here
+        is swallowed exactly like _append_journal's own failure handling."""
+        if not self._tick_log_path:
+            return
+        try:
+            record = {
+                "schema": "mc_ai_bt.tick_log.v1",
+                "ts": time.time(),
+                "mission_id": mission.identity.mission_id,
+                "execution_id": mission.identity.execution_id,
+                "active_node": active_node,
+                "progress": progress,
+            }
+            with open(self._tick_log_path, "a", encoding="utf-8") as stream:
+                stream.write(json.dumps(record, sort_keys=True, separators=(",", ":")))
+                stream.write("\n")
+        except Exception as exc:  # noqa: BLE001 -- observability must never affect execution
+            self.get_logger().debug(
+                f"tick log append failed: {type(exc).__name__}: {exc}"
+            )
 
     def _append_journal(self, event: MissionEvent) -> None:
         if self._mission_journal is None:

@@ -34,6 +34,11 @@ def generate_launch_description():
                 description="Optional JSONL path for mission event snapshots.",
             ),
             DeclareLaunchArgument(
+                "tick_log_path",
+                default_value="",
+                description="Optional, observability-only JSONL path for per-leaf-node BT tick events.",
+            ),
+            DeclareLaunchArgument(
                 "start_embodied_skills",
                 default_value="true",
                 description="Start the closed-loop embodied skill action server from seattle_lab.",
@@ -84,6 +89,7 @@ def generate_launch_description():
                         "planner_temperature": LaunchConfiguration("planner_temperature"),
                         "planner_timeout": LaunchConfiguration("planner_timeout"),
                         "mission_journal_path": LaunchConfiguration("mission_journal_path"),
+                        "tick_log_path": LaunchConfiguration("tick_log_path"),
                     }
                 ],
             ),
